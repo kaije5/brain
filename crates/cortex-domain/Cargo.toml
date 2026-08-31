@@ -9,4 +9,5 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+chrono = { version = "0.4.44", default-features = false, features = ["std"] }
 uuid = { version = "1.24", features = ["v7"] }
