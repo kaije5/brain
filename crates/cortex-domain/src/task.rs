@@ -44,6 +44,33 @@ impl Task {
         })
     }
 
+    /// Restores a task from durable state while reapplying domain validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Validation`] if the title is blank.
+    pub fn rehydrate(
+        id: EntityId,
+        workspace_id: WorkspaceId,
+        title: String,
+        due_at: Option<DateTime<Utc>>,
+        status: TaskStatus,
+        revision: Revision,
+        lifecycle: Lifecycle,
+    ) -> Result<Self, DomainError> {
+        validate_text("title", &title)?;
+
+        Ok(Self {
+            id,
+            workspace_id,
+            title,
+            due_at,
+            status,
+            revision,
+            lifecycle,
+        })
+    }
+
     /// # Errors
     ///
     /// Returns [`DomainError::Validation`] when the task is already completed,

@@ -35,6 +35,32 @@ impl Note {
         })
     }
 
+    /// Restores a note from durable state while reapplying domain validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Validation`] if title or content is blank.
+    pub fn rehydrate(
+        id: EntityId,
+        workspace_id: WorkspaceId,
+        title: String,
+        content: String,
+        revision: Revision,
+        lifecycle: Lifecycle,
+    ) -> Result<Self, DomainError> {
+        validate_text("title", &title)?;
+        validate_text("content", &content)?;
+
+        Ok(Self {
+            id,
+            workspace_id,
+            title,
+            content,
+            revision,
+            lifecycle,
+        })
+    }
+
     #[must_use]
     pub const fn id(&self) -> EntityId {
         self.id

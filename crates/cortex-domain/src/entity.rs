@@ -27,6 +27,21 @@ impl Revision {
         Self(1)
     }
 
+    /// Restores a revision from validated durable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Validation`] when the persisted revision is zero.
+    pub fn rehydrate(value: u64) -> Result<Self, DomainError> {
+        if value == 0 {
+            return Err(DomainError::validation(
+                "revision",
+                "must be greater than zero",
+            ));
+        }
+        Ok(Self(value))
+    }
+
     /// # Errors
     ///
     /// Returns [`DomainError::RevisionOverflow`] when the revision cannot be incremented.

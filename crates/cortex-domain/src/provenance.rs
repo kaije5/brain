@@ -37,6 +37,29 @@ impl Source {
         })
     }
 
+    /// Restores immutable source evidence from durable state while reapplying validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Validation`] if the reference is blank.
+    pub fn rehydrate(
+        id: EntityId,
+        workspace_id: WorkspaceId,
+        reference: String,
+        revision: Revision,
+        lifecycle: Lifecycle,
+    ) -> Result<Self, DomainError> {
+        validate_text("reference", &reference)?;
+
+        Ok(Self {
+            id,
+            workspace_id,
+            reference,
+            revision,
+            lifecycle,
+        })
+    }
+
     #[must_use]
     pub const fn id(&self) -> EntityId {
         self.id

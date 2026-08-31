@@ -45,6 +45,56 @@ impl MemoryAssertion {
         Self::from_input(input, None)
     }
 
+    /// Restores a memory assertion from durable state while reapplying all
+    /// content and provenance validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Validation`] if assertion text or fact-key
+    /// fields are blank, provenance is empty, or an assertion supersedes itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rehydrate(
+        id: EntityId,
+        workspace_id: WorkspaceId,
+        statement: String,
+        normalized_subject: String,
+        normalized_predicate: String,
+        normalized_object: String,
+        sources: Vec<SourceRef>,
+        supersedes: Option<EntityId>,
+        status: MemoryStatus,
+        revision: Revision,
+        lifecycle: Lifecycle,
+    ) -> Result<Self, DomainError> {
+        validate_fields(
+            &statement,
+            &normalized_subject,
+            &normalized_predicate,
+            &normalized_object,
+            &sources,
+        )?;
+        if supersedes == Some(id) {
+            return Err(DomainError::validation(
+                "supersedes",
+                "assertion cannot supersede itself",
+            ));
+        }
+
+        Ok(Self {
+            id,
+            workspace_id,
+            statement,
+            normalized_subject,
+            normalized_predicate,
+            normalized_object,
+            sources,
+            supersedes,
+            status,
+            revision,
+            lifecycle,
+        })
+    }
+
     /// Creates a replacement assertion without altering this assertion.
     ///
     /// The application layer persists the predecessor's semantic status change
@@ -83,16 +133,13 @@ impl MemoryAssertion {
         input: MemoryAssertionInput,
         supersedes: Option<EntityId>,
     ) -> Result<Self, DomainError> {
-        validate_text("statement", &input.statement)?;
-        validate_text("normalized_subject", &input.normalized_subject)?;
-        validate_text("normalized_predicate", &input.normalized_predicate)?;
-        validate_text("normalized_object", &input.normalized_object)?;
-        if input.sources.is_empty() {
-            return Err(DomainError::validation(
-                "sources",
-                "at least one provenance source is required",
-            ));
-        }
+        validate_fields(
+            &input.statement,
+            &input.normalized_subject,
+            &input.normalized_predicate,
+            &input.normalized_object,
+            &input.sources,
+        )?;
 
         Ok(Self {
             id: EntityId::new(),
@@ -163,6 +210,26 @@ impl MemoryAssertion {
     pub const fn lifecycle(&self) -> Lifecycle {
         self.lifecycle
     }
+}
+
+fn validate_fields(
+    statement: &str,
+    normalized_subject: &str,
+    normalized_predicate: &str,
+    normalized_object: &str,
+    sources: &[SourceRef],
+) -> Result<(), DomainError> {
+    validate_text("statement", statement)?;
+    validate_text("normalized_subject", normalized_subject)?;
+    validate_text("normalized_predicate", normalized_predicate)?;
+    validate_text("normalized_object", normalized_object)?;
+    if sources.is_empty() {
+        return Err(DomainError::validation(
+            "sources",
+            "at least one provenance source is required",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
