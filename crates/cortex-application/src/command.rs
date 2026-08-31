@@ -33,7 +33,7 @@ impl CommandContext {
 /// Canonical evidence returned after a successful idempotent mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MutationResult {
-    pub id: EntityId,
+    pub entity_id: EntityId,
     pub revision: Revision,
     pub lifecycle: Lifecycle,
     pub audit_correlation_id: Uuid,

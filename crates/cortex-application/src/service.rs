@@ -35,12 +35,20 @@ pub trait PolicyPort: Send + Sync {
 }
 
 /// The append-only redacted audit boundary used by application commands.
+///
+/// This port is only for policy or diagnostic events that do not mutate state.
+/// State-mutation audit evidence is carried by [`crate::AtomicMutation`] and
+/// committed through [`crate::AtomicMutationPort`].
 #[allow(async_fn_in_trait)]
 pub trait AuditPort: Send + Sync {
     async fn append(&self, event: AuditEvent) -> Result<(), ApplicationError>;
 }
 
 /// The typed capability boundary made available to a local agent.
+///
+/// Consume this native-async trait through static dispatch, for example
+/// `AgentRunner<P, S>` where `S: AgentCapabilityExecutor`; do not place it in
+/// `Arc<dyn AgentCapabilityExecutor>`.
 #[allow(async_fn_in_trait)]
 pub trait AgentCapabilityExecutor: Send + Sync {
     async fn execute_agent_tool(
