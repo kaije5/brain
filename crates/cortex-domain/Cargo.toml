@@ -7,3 +7,6 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+uuid = { version = "1.24", features = ["v7"] }
