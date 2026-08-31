@@ -1,8 +1,8 @@
-use cortex_application::AuditPort;
+use cortex_application::{AuditPort, SecretRef, SecretStore};
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, OperationId, PolicyDecision, PrincipalId, WorkspaceId,
 };
-use cortex_storage::{SecretRef, SecretStore, SqliteDatabase};
+use cortex_storage::SqliteDatabase;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -39,27 +39,19 @@ async fn audit_port_round_trips_only_redacted_evidence_and_is_append_only() -> R
     audit.append(event.clone()).await.map_err(debug_error)?;
 
     assert_eq!(
-        audit.find(event.id).await.map_err(debug_error)?,
-        Some(event)
-    );
-    let columns: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM pragma_table_info('audit_event')")
-            .fetch_all(database.pool())
+        audit
+            .find(workspace_id, event.id)
             .await
-            .map_err(|error| format!("audit schema query failed: {error}"))?;
-    assert!(columns.iter().all(|column| {
-        !["content", "payload", "prompt", "secret"]
-            .iter()
-            .any(|sensitive| column.contains(sensitive))
-    }));
-    let update = sqlx::query("UPDATE audit_event SET result = 'failed'")
-        .execute(database.pool())
-        .await;
-    let delete = sqlx::query("DELETE FROM audit_event")
-        .execute(database.pool())
-        .await;
-    assert!(update.is_err());
-    assert!(delete.is_err());
+            .map_err(debug_error)?,
+        Some(event.clone())
+    );
+    assert_eq!(
+        audit
+            .find(WorkspaceId::new(), event.id)
+            .await
+            .map_err(debug_error)?,
+        None
+    );
     Ok(())
 }
 
@@ -95,8 +87,14 @@ async fn audit_port_rejects_unknown_capabilities_without_persisting_them() -> Re
     };
     let audit = database.audit_port();
 
-    assert!(audit.append(event).await.is_err());
-    assert_eq!(audit.event_count().await.map_err(debug_error)?, 0);
+    assert!(audit.append(event.clone()).await.is_err());
+    assert_eq!(
+        audit
+            .find(workspace_id, event.id)
+            .await
+            .map_err(debug_error)?,
+        None
+    );
     Ok(())
 }
 

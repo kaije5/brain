@@ -62,24 +62,6 @@ impl SqliteRepositories {
             .map_err(|_| storage_error("principal insert failed"))?;
         Ok(())
     }
-
-    /// Returns the number of durable notes.
-    ///
-    /// # Errors
-    ///
-    /// Returns a redacted storage error when `SQLite` cannot complete the query.
-    pub async fn note_count(&self) -> Result<u64, ApplicationError> {
-        table_count(&self.pool, "SELECT COUNT(*) FROM note").await
-    }
-
-    /// Returns the number of durable memories.
-    ///
-    /// # Errors
-    ///
-    /// Returns a redacted storage error when `SQLite` cannot complete the query.
-    pub async fn memory_count(&self) -> Result<u64, ApplicationError> {
-        table_count(&self.pool, "SELECT COUNT(*) FROM memory_assertion").await
-    }
 }
 
 impl NoteRepository for SqliteRepositories {
@@ -242,14 +224,6 @@ fn decode_memory(
         decode_lifecycle(&row_text(row, "lifecycle")?)?,
     )
     .map_err(ApplicationError::from)
-}
-
-async fn table_count(pool: &SqlitePool, query: &str) -> Result<u64, ApplicationError> {
-    let count: i64 = sqlx::query_scalar(query)
-        .fetch_one(pool)
-        .await
-        .map_err(|_| storage_error("repository count failed"))?;
-    u64::try_from(count).map_err(|_| storage_error("invalid repository count"))
 }
 
 fn validate_name(name: &str) -> Result<(), ApplicationError> {

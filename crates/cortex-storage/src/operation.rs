@@ -27,19 +27,6 @@ impl OperationStore {
         Self { pool }
     }
 
-    /// Returns the number of durable idempotency outcomes.
-    ///
-    /// # Errors
-    ///
-    /// Returns a redacted storage error when `SQLite` cannot complete the query.
-    pub async fn operation_count(&self) -> Result<u64, ApplicationError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM operation")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|_| storage_error("operation count failed"))?;
-        u64::try_from(count).map_err(|_| storage_error("invalid operation count"))
-    }
-
     async fn load_result(
         &self,
         workspace_id: WorkspaceId,

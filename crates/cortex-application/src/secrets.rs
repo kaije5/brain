@@ -1,6 +1,6 @@
 use std::fmt;
 
-use cortex_application::ApplicationError;
+use crate::ApplicationError;
 
 /// Opaque locator for credential material held by a platform secret store.
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -34,8 +34,8 @@ impl fmt::Debug for SecretRef {
     }
 }
 
-/// Platform boundary that canonicalizes opaque secret references without
-/// returning credential values to storage, application, model, or transport code.
+/// Storage-neutral platform boundary that resolves opaque secret references
+/// without returning credential values to application, model, or transport code.
 #[allow(async_fn_in_trait)]
 pub trait SecretStore: Send + Sync {
     async fn resolve(&self, reference: &SecretRef) -> Result<SecretRef, ApplicationError>;

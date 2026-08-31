@@ -15,29 +15,22 @@ impl SqliteAuditPort {
         Self { pool }
     }
 
-    /// Returns the number of durable redacted audit events.
-    ///
-    /// # Errors
-    ///
-    /// Returns a redacted storage error when `SQLite` cannot complete the query.
-    pub async fn event_count(&self) -> Result<u64, ApplicationError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_event")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|_| storage_error("audit count failed"))?;
-        u64::try_from(count).map_err(|_| storage_error("invalid audit count"))
-    }
-
     /// Loads one redacted audit event by its opaque identifier.
     ///
     /// # Errors
     ///
     /// Returns a redacted storage error for malformed durable state or query failure.
-    pub async fn find(&self, id: AuditEventId) -> Result<Option<AuditEvent>, ApplicationError> {
+    pub async fn find(
+        &self,
+        workspace_id: cortex_domain::WorkspaceId,
+        id: AuditEventId,
+    ) -> Result<Option<AuditEvent>, ApplicationError> {
         let row = sqlx::query(
             "SELECT id, workspace_id, principal_id, operation_id, correlation_id, \
-             capability, target_id, policy_decision, result FROM audit_event WHERE id = ?",
+             capability, target_id, policy_decision, result \
+             FROM audit_event WHERE workspace_id = ? AND id = ?",
         )
+        .bind(uuid_text(workspace_id))
         .bind(uuid_text(id))
         .fetch_optional(&self.pool)
         .await
@@ -197,5 +190,73 @@ fn canonical_capability(value: &str) -> Result<&'static str, ApplicationError> {
         "cortex_task_restore" => Ok("cortex_task_restore"),
         "cortex_task_update" => Ok("cortex_task_update"),
         _ => Err(storage_error("invalid audit capability")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cortex_application::AuditPort;
+    use cortex_domain::{
+        AuditEvent, AuditEventId, AuditResult, OperationId, PolicyDecision, PrincipalId,
+        WorkspaceId,
+    };
+    use tempfile::TempDir;
+    use uuid::Uuid;
+
+    use crate::SqliteDatabase;
+
+    #[tokio::test]
+    async fn audit_schema_is_redacted_and_append_only() -> Result<(), String> {
+        let temp = TempDir::new().map_err(|error| format!("temp directory failed: {error}"))?;
+        let database = SqliteDatabase::connect_and_migrate(temp.path().join("cortex.db"))
+            .await
+            .map_err(|error| format!("migration failed: {error:?}"))?;
+        let workspace_id = WorkspaceId::new();
+        let principal_id = PrincipalId::new();
+        let repositories = database.repositories();
+        repositories
+            .create_workspace(workspace_id, "owner")
+            .await
+            .map_err(|error| format!("workspace failed: {error:?}"))?;
+        repositories
+            .create_principal(workspace_id, principal_id, "owner")
+            .await
+            .map_err(|error| format!("principal failed: {error:?}"))?;
+        let event = AuditEvent {
+            id: AuditEventId::new(),
+            workspace_id,
+            principal_id,
+            operation_id: OperationId::new(),
+            correlation_id: Uuid::now_v7(),
+            capability: "cortex_note_search",
+            target_id: None,
+            policy_decision: PolicyDecision::Allow,
+            result: AuditResult::Succeeded,
+        };
+        let audit = database.audit_port();
+        audit
+            .append(event)
+            .await
+            .map_err(|error| format!("append failed: {error:?}"))?;
+
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('audit_event')")
+                .fetch_all(database.test_pool())
+                .await
+                .map_err(|error| format!("schema query failed: {error}"))?;
+        assert!(columns.iter().all(|column| {
+            !["content", "payload", "prompt", "secret"]
+                .iter()
+                .any(|sensitive| column.contains(sensitive))
+        }));
+        let update = sqlx::query("UPDATE audit_event SET result = 'failed'")
+            .execute(database.test_pool())
+            .await;
+        let delete = sqlx::query("DELETE FROM audit_event")
+            .execute(database.test_pool())
+            .await;
+        assert!(update.is_err());
+        assert!(delete.is_err());
+        Ok(())
     }
 }

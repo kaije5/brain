@@ -4,6 +4,7 @@ mod capability;
 mod command;
 mod error;
 mod query;
+mod secrets;
 mod service;
 
 pub use capability::{
@@ -17,6 +18,7 @@ pub use query::{
     AggregateChange, AtomicMutation, AtomicMutationPort, MemoryRepository, NoteRepository,
     SourceRepository, TaskRepository,
 };
+pub use secrets::{SecretRef, SecretStore};
 pub use service::{
     AgentCapabilityExecutor, AuditPort, CapabilityGrant, CortexService, GrantPolicy, PolicyPort,
 };

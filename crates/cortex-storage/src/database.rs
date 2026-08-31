@@ -42,11 +42,6 @@ impl SqliteDatabase {
     }
 
     #[must_use]
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
-    }
-
-    #[must_use]
     pub fn repositories(&self) -> SqliteRepositories {
         SqliteRepositories::new(self.pool.clone())
     }
@@ -60,8 +55,82 @@ impl SqliteDatabase {
     pub fn operation_store(&self) -> OperationStore {
         OperationStore::new(self.pool.clone())
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_pool(&self) -> &SqlitePool {
+        &self.pool
+    }
 }
 
 pub(crate) fn storage_error(category: &'static str) -> ApplicationError {
     ApplicationError::Storage(category.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use tempfile::TempDir;
+
+    use super::SqliteDatabase;
+
+    #[tokio::test]
+    async fn migration_enables_wal_foreign_keys_and_all_initial_tables() -> Result<(), String> {
+        let temp = TempDir::new().map_err(|error| format!("temp directory failed: {error}"))?;
+        let database = SqliteDatabase::connect_and_migrate(temp.path().join("cortex.db"))
+            .await
+            .map_err(|error| format!("migration failed: {error:?}"))?;
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&database.pool)
+            .await
+            .map_err(|error| format!("journal query failed: {error}"))?;
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&database.pool)
+            .await
+            .map_err(|error| format!("foreign key query failed: {error}"))?;
+        let actual: BTreeSet<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_schema WHERE type = 'table'")
+                .fetch_all(&database.pool)
+                .await
+                .map_err(|error| format!("schema query failed: {error}"))?
+                .into_iter()
+                .collect();
+        let expected = [
+            "workspace",
+            "principal",
+            "capability_grant",
+            "note",
+            "task",
+            "source",
+            "memory_assertion",
+            "memory_source",
+            "embedding",
+            "operation",
+            "audit_event",
+        ];
+
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(foreign_keys, 1);
+        assert!(expected.iter().all(|table| actual.contains(*table)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_foreign_keys_reject_orphans() -> Result<(), String> {
+        let temp = TempDir::new().map_err(|error| format!("temp directory failed: {error}"))?;
+        let database = SqliteDatabase::connect_and_migrate(temp.path().join("cortex.db"))
+            .await
+            .map_err(|error| format!("migration failed: {error:?}"))?;
+        let orphan = sqlx::query(
+            "INSERT INTO memory_source (workspace_id, memory_id, source_id) VALUES (?, ?, ?)",
+        )
+        .bind("01900000-0000-7000-8000-000000000001")
+        .bind("01900000-0000-7000-8000-000000000002")
+        .bind("01900000-0000-7000-8000-000000000003")
+        .execute(&database.pool)
+        .await;
+
+        assert!(orphan.is_err());
+        Ok(())
+    }
 }

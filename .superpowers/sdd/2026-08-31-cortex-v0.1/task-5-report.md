@@ -115,9 +115,9 @@ Fresh final commands, all exit 0:
 
 ## Commit
 
-Pending the final commit command after this report is added:
+Initial Task 5 implementation: `111ed94 feat(storage): add SQLite state, audit, and idempotency`.
 
-`feat(storage): add SQLite state, audit, and idempotency`
+The review fix-round commit follows after final staging.
 
 ## Concerns
 
@@ -126,3 +126,62 @@ rebuilt temporary test executable with Windows application-control `os error
 4551`; the restored final source passed all required final commands. Git also
 emits a non-fatal warning that the user-level global ignore file is
 inaccessible. Neither affected the final test or diff results.
+
+## Fix round 1/5: review-boundary and rollback corrections
+
+The review fixes preserve the application-owned `AtomicMutationPort` and make
+its storage ownership enforceable from downstream crates:
+
+- `SqliteDatabase` no longer publishes `SqlitePool`. Only crate-internal test
+  modules can use a `#[cfg(test)] pub(crate)` diagnostic accessor; external
+  integration tests exercise typed adapters only.
+- Raw migration pragma/schema/foreign-key checks now live in
+  `database.rs` unit tests, and the raw audit trigger/schema check lives in an
+  `audit.rs` unit test. Public integration tests cannot execute caller-supplied
+  SQL.
+- `SecretRef` and `SecretStore` moved to `cortex-application`, retaining the
+  same reference validation and redacted `Debug` implementation without adding
+  a secret value type. Storage consumes the inward application contract only.
+- Global test convenience counters were removed. `SqliteAuditPort::find` now
+  requires `WorkspaceId` and filters on both `workspace_id` and `id`; operation
+  tests assert typed aggregate/audit lookups instead of global database counts.
+- `audit_insert_failure_rolls_back_entity_audit_and_operation` uses a valid
+  note mutation with an audit event whose non-canonical capability is rejected
+  at audit insertion. It proves the note and audit are absent after failure;
+  reusing the same operation ID with a valid audit event succeeds, proving the
+  operation reservation also rolled back.
+- `concurrent_duplicate_operations_return_one_durable_result` starts two Tokio
+  tasks with the same operation ID, observes identical results, and verifies
+  that exactly the winning note exists. It passed three consecutive focused
+  runs.
+
+### Fix-round red/green evidence
+
+- Revised external audit test was first red with unresolved
+  `cortex_application::SecretRef` and `SecretStore`; it passed after the port
+  moved inward.
+- Removing the public count APIs made the old operation test red with six
+  missing-method errors; typed workspace-scoped assertions replaced those
+  checks and the suite passed.
+- For the inherited audit-failure behavior, temporarily removing
+  `canonical_capability` validation made
+  `audit_insert_failure_rolls_back_entity_audit_and_operation` fail because
+  the mutation incorrectly succeeded. The exact write-side validation was
+  restored before final verification.
+- The concurrent duplicate test passed three consecutive focused runs after it
+  was added.
+
+### Fix-round verification limitation
+
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace --no-run`, and `git diff --check` passed after the
+fixes. The focused audit and migration integration tests executed successfully
+in the final-gate attempt, but Windows application control then blocked the
+newly rebuilt `operations` test binary and subsequent workspace test binaries
+before execution with `os error 4551`. Retrying produced the same pre-execution
+policy error. Earlier in this fix round, the complete storage suite passed
+before the final concurrent test assertion was tightened, and the concurrent
+test itself passed three consecutive runs. No source or test assertion failure
+was observed after the final changes; runtime execution of the final full
+suite remains pending an approved Code Integrity policy, signed toolchain, or
+CI runner.
