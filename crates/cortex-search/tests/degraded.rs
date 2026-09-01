@@ -1,11 +1,11 @@
 use std::{num::NonZeroUsize, time::Duration};
 
-use cortex_application::ApplicationError;
-use cortex_domain::{EntityId, PrincipalId, SourceRef, WorkspaceId};
-use cortex_search::{
-    Embedding, EmbeddingProvider, EntityKind, HybridSearchService, IndexedVector, SearchCandidate,
-    SearchIndex, SearchRequest,
+use cortex_application::{
+    ApplicationError, Embedding, EmbeddingProvider, EntityKind, IndexedVector, SearchCandidate,
+    SearchIndex,
 };
+use cortex_domain::{EntityId, PrincipalId, SourceRef, WorkspaceId};
+use cortex_search::{HybridSearchService, SearchRequest};
 
 #[tokio::test]
 async fn unavailable_embeddings_return_lexical_results_with_degraded_flag() -> Result<(), String> {

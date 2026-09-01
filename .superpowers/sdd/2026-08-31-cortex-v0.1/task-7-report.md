@@ -129,3 +129,113 @@ cargo test --workspace
 - Search indexing is an explicit repository operation in Task 7. Later daemon
   composition must invoke it after canonical mutations; that orchestration is
   outside this task and must not bypass the same policy/audit boundary.
+
+## Review fix round 1 (2026-09-02)
+
+The four independent-review findings were addressed without starting Task 8:
+
+- `search_document` now stores the canonical SHA-256 digest of the exact UTF-8
+  searchable text. The document upsert computes the digest internally, and a
+  same-statement SQLite trigger deletes all entity embeddings when that digest
+  changes. Embedding writes select the current document hash inside the insert,
+  so callers cannot supply a mismatched hash; semantic reads additionally require
+  `embedding.content_hash = search_document.content_hash`.
+- Both lexical and semantic memory predicates now require an active
+  `memory_source -> source` relation. Candidate citation loading continues to
+  return only active sources.
+- The persistence boundary now decodes the exact declared little-endian `f32`
+  payload through the validated embedding contract before setting `ready`.
+  Empty/dimension-mismatched, NaN, infinity, and zero-norm payloads are rejected;
+  valid payloads round-trip unchanged.
+- `Embedding`, `EmbeddingProvider`, `EntityKind`, `SearchCandidate`,
+  `IndexedVector`, and `SearchIndex` are application-owned contracts.
+  `SqliteRepositories` implements the port in `cortex-storage`; the production
+  `cortex-search -> cortex-storage` edge is gone. Storage remains only a search
+  dev-dependency for SQLite integration tests.
+
+### Review-fix TDD evidence
+
+RED was observed for the inward contract before production changes:
+
+```text
+cargo test -p cortex-application --test search_contract
+FAIL E0432: unresolved import `cortex_application::Embedding`
+```
+
+The storage-backed regression tests were written before their storage changes
+and execution was attempted at RED. Cargo did not reach project compilation:
+
+```text
+cargo test -p cortex-storage --lib canonical_search_hash_is_sha256_of_exact_utf8_text
+BLOCKED compiling sqlx-core 0.8.6:
+E0463: can't find crate for `thiserror`
+
+cargo test -p cortex-search --test fts
+BLOCKED compiling sqlx-core 0.8.6:
+E0463: can't find crate for `thiserror`
+```
+
+The added storage-backed regressions cover:
+
+- content A -> ready A vector -> content B -> no semantic record -> ready B
+  vector and B snippet returned;
+- lexical and semantic memory candidates with zero active sources and with one
+  active source among multiple links;
+- malformed length, NaN, infinity, zero norm, and a valid little-endian
+  persistence round trip.
+
+Available GREEN evidence after implementation:
+
+```text
+cargo test -p cortex-application --test search_contract                 PASS (2 tests)
+cargo test -p cortex-application                                        PASS (25 tests)
+cargo clippy -p cortex-application --all-targets -- -D warnings         PASS
+cargo check -p cortex-search --lib                                      PASS
+cargo clippy -p cortex-search --lib -- -D warnings                      PASS
+cargo metadata --no-deps --format-version 1                             PASS
+  cortex-storage is a dev-dependency, not a production dependency, of cortex-search
+cargo fmt --check                                                       PASS
+git diff --check                                                        PASS
+SQLite in-memory execution of 0001_initial.sql                          PASS
+SQLite schema A -> B embedding-invalidation check                       PASS
+```
+
+`cargo test -p cortex-domain` ran 9 tests successfully before WDAC blocked the
+freshly linked `persistence_rehydration` executable with `os error 4551`; this is
+partial evidence, not a package pass.
+
+### Remaining environment gate
+
+The shared target cache still cannot compile SQLx because its `thiserror`
+artifact is missing. A non-destructive isolated-target retry confirmed that a
+fresh cache cannot replace the missing evidence on this host:
+
+```text
+$env:CARGO_TARGET_DIR='target-task7-fix'; cargo check -p cortex-storage
+BLOCKED while compiling icu_normalizer_data 2.3.0:
+could not execute ...\target-task7-fix\debug\build\icu_normalizer_data-...\build-script-build
+Dit bestand is geblokkeerd door een beleid voor toepassingsbeheer. (os error 4551)
+```
+
+No shared-cache deletion and no Code Integrity policy change was attempted.
+Consequently the new storage code and storage-backed regressions could not be
+compiled or run on this host. Acceptance still requires these clean-runner gates:
+
+```text
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Review-fix changed paths:
+
+- `Cargo.lock`
+- `crates/cortex-application/src/{lib,search}.rs`
+- `crates/cortex-application/tests/search_contract.rs`
+- `crates/cortex-search/Cargo.toml`
+- `crates/cortex-search/src/{embedding,lib}.rs` (`fts.rs` removed)
+- `crates/cortex-search/tests/{degraded,fts,vector}.rs`
+- `crates/cortex-storage/Cargo.toml`
+- `crates/cortex-storage/migrations/0001_initial.sql`
+- `crates/cortex-storage/src/{lib,repositories}.rs`
+- `.superpowers/sdd/2026-08-31-cortex-v0.1/task-7-report.md`

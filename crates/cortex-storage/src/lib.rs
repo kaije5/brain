@@ -8,6 +8,4 @@ mod repositories;
 pub use audit::SqliteAuditPort;
 pub use database::SqliteDatabase;
 pub use operation::OperationStore;
-pub use repositories::{
-    SearchEntityKind, SqliteRepositories, StoredEmbeddingCandidate, StoredSearchCandidate,
-};
+pub use repositories::SqliteRepositories;

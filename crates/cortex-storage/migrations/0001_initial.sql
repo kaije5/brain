@@ -101,6 +101,7 @@ CREATE TABLE search_document (
     entity_id TEXT NOT NULL,
     entity_kind TEXT NOT NULL CHECK (entity_kind IN ('note', 'task', 'memory', 'source')),
     snippet TEXT NOT NULL CHECK (length(trim(snippet)) > 0),
+    content_hash BLOB NOT NULL CHECK (length(content_hash) = 32),
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE (workspace_id, entity_id),
     FOREIGN KEY (workspace_id) REFERENCES workspace(id) ON DELETE CASCADE
@@ -140,7 +141,7 @@ CREATE TABLE embedding (
     model_id TEXT NOT NULL CHECK (length(trim(model_id)) > 0),
     model_version TEXT NOT NULL CHECK (length(trim(model_version)) > 0),
     dimensions INTEGER NOT NULL CHECK (dimensions > 0),
-    content_hash BLOB NOT NULL,
+    content_hash BLOB NOT NULL CHECK (length(content_hash) = 32),
     vector BLOB NOT NULL CHECK (length(vector) = dimensions * 4),
     index_state TEXT NOT NULL CHECK (index_state IN ('pending', 'ready', 'failed')),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -149,6 +150,14 @@ CREATE TABLE embedding (
     FOREIGN KEY (workspace_id, entity_id)
         REFERENCES search_document(workspace_id, entity_id) ON DELETE CASCADE
 ) STRICT;
+
+CREATE TRIGGER search_document_embedding_invalidate
+AFTER UPDATE OF content_hash ON search_document
+WHEN old.content_hash <> new.content_hash
+BEGIN
+    DELETE FROM embedding
+    WHERE workspace_id = new.workspace_id AND entity_id = new.entity_id;
+END;
 
 CREATE TABLE operation (
     workspace_id TEXT NOT NULL,

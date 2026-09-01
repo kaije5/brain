@@ -1,14 +1,14 @@
 use std::num::NonZeroUsize;
 
 use cortex_application::{
-    AggregateChange, AtomicMutation, AtomicMutationPort, Capability, CommandContext, MutationResult,
+    AggregateChange, AtomicMutation, AtomicMutationPort, Capability, CommandContext, Embedding,
+    EntityKind, MutationResult, SearchIndex,
 };
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, Lifecycle, MemoryAssertion, MemoryAssertionInput,
     OperationId, PolicyDecision, PrincipalId, Revision, Source, SourceInput, SourceRef,
     WorkspaceId,
 };
-use cortex_search::{EntityKind, SearchIndex};
 use cortex_storage::SqliteDatabase;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -63,6 +63,192 @@ async fn fts_filters_workspace_grant_lifecycle_and_returns_provenance() -> Resul
     Ok(())
 }
 
+#[tokio::test]
+async fn lexical_memory_candidates_require_at_least_one_active_source() -> Result<(), String> {
+    let (_temp, database, workspace_id, principal_id) = authorized_database().await?;
+    let no_active = vec![source(workspace_id, "deleted-only", Lifecycle::Deleted)?];
+    let active = source(workspace_id, "active", Lifecycle::Active)?;
+    let one_active = vec![
+        source(workspace_id, "also-deleted", Lifecycle::Deleted)?,
+        active.clone(),
+    ];
+    let hidden = index_memory_with_sources(
+        &database,
+        workspace_id,
+        principal_id,
+        "Provenance sentinel hidden",
+        no_active,
+    )
+    .await?;
+    let visible = index_memory_with_sources(
+        &database,
+        workspace_id,
+        principal_id,
+        "Provenance sentinel visible",
+        one_active,
+    )
+    .await?;
+
+    let hits = SearchIndex::lexical_candidates(
+        &database.repositories(),
+        workspace_id,
+        principal_id,
+        "Provenance sentinel",
+        NonZeroUsize::new(10).ok_or("non-zero limit required")?,
+    )
+    .await
+    .map_err(debug_error)?;
+
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].entity_id, visible.id());
+    assert_ne!(hits[0].entity_id, hidden.id());
+    assert_eq!(
+        hits[0].sources,
+        vec![SourceRef {
+            source_id: active.id()
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn semantic_memory_candidates_require_at_least_one_active_source() -> Result<(), String> {
+    let (_temp, database, workspace_id, principal_id) = authorized_database().await?;
+    let no_active = vec![source(workspace_id, "deleted-only", Lifecycle::Deleted)?];
+    let active = source(workspace_id, "active", Lifecycle::Active)?;
+    let one_active = vec![
+        source(workspace_id, "also-deleted", Lifecycle::Deleted)?,
+        active.clone(),
+    ];
+    let hidden = index_memory_with_sources(
+        &database,
+        workspace_id,
+        principal_id,
+        "Semantic provenance hidden",
+        no_active,
+    )
+    .await?;
+    let visible = index_memory_with_sources(
+        &database,
+        workspace_id,
+        principal_id,
+        "Semantic provenance visible",
+        one_active,
+    )
+    .await?;
+    let embedding = Embedding::new("nomic", "1", vec![1.0, 0.0]).map_err(debug_error)?;
+    for memory in [&hidden, &visible] {
+        database
+            .repositories()
+            .upsert_embedding(
+                workspace_id,
+                memory.id(),
+                embedding.model_id(),
+                embedding.model_version(),
+                embedding.dimensions(),
+                &embedding.to_le_bytes(),
+            )
+            .await
+            .map_err(debug_error)?;
+    }
+
+    let records = SearchIndex::semantic_records(
+        &database.repositories(),
+        workspace_id,
+        principal_id,
+        &embedding,
+        NonZeroUsize::new(10).ok_or("non-zero limit required")?,
+    )
+    .await
+    .map_err(debug_error)?;
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].candidate.entity_id, visible.id());
+    assert_ne!(records[0].candidate.entity_id, hidden.id());
+    assert_eq!(
+        records[0].candidate.sources,
+        vec![SourceRef {
+            source_id: active.id()
+        }]
+    );
+    Ok(())
+}
+
+async fn authorized_database() -> Result<(TempDir, SqliteDatabase, WorkspaceId, PrincipalId), String>
+{
+    let temp = TempDir::new().map_err(debug_error)?;
+    let path = temp.path().join("cortex.db");
+    let database = SqliteDatabase::connect_and_migrate(path)
+        .await
+        .map_err(debug_error)?;
+    let workspace_id = WorkspaceId::new();
+    let principal_id = PrincipalId::new();
+    let repositories = database.repositories();
+    repositories
+        .create_workspace(workspace_id, "workspace")
+        .await
+        .map_err(debug_error)?;
+    repositories
+        .create_principal(workspace_id, principal_id, "principal")
+        .await
+        .map_err(debug_error)?;
+    repositories
+        .grant_capability(workspace_id, principal_id, Capability::KnowledgeRetrieve)
+        .await
+        .map_err(debug_error)?;
+    Ok((temp, database, workspace_id, principal_id))
+}
+
+fn source(
+    workspace_id: WorkspaceId,
+    reference: &str,
+    lifecycle: Lifecycle,
+) -> Result<Source, String> {
+    Source::rehydrate(
+        cortex_domain::EntityId::new(),
+        workspace_id,
+        reference.to_owned(),
+        Revision::initial(),
+        lifecycle,
+    )
+    .map_err(debug_error)
+}
+
+async fn index_memory_with_sources(
+    database: &SqliteDatabase,
+    workspace_id: WorkspaceId,
+    principal_id: PrincipalId,
+    statement: &str,
+    sources: Vec<Source>,
+) -> Result<MemoryAssertion, String> {
+    let memory = MemoryAssertion::create(MemoryAssertionInput {
+        workspace_id,
+        statement: statement.to_owned(),
+        normalized_subject: "provenance".to_owned(),
+        normalized_predicate: "requires".to_owned(),
+        normalized_object: statement.to_ascii_lowercase(),
+        sources: sources
+            .iter()
+            .map(|source| SourceRef {
+                source_id: source.id(),
+            })
+            .collect(),
+    })
+    .map_err(debug_error)?;
+    persist_memory(database, principal_id, sources, memory.clone()).await?;
+    database
+        .repositories()
+        .upsert_search_document(
+            workspace_id,
+            memory.id(),
+            EntityKind::Memory,
+            memory.statement(),
+        )
+        .await
+        .map_err(debug_error)?;
+    Ok(memory)
+}
+
 async fn index_active_memory(
     database: &SqliteDatabase,
     workspace_id: WorkspaceId,
@@ -78,7 +264,7 @@ async fn index_active_memory(
         "Cortex uses Nemotron as its local AI.",
         &source,
     )?;
-    persist_memory(database, principal_id, source.clone(), memory.clone()).await?;
+    persist_memory(database, principal_id, vec![source.clone()], memory.clone()).await?;
     database
         .repositories()
         .upsert_search_document(
@@ -118,7 +304,7 @@ async fn index_deleted_memory(
         Lifecycle::Deleted,
     )
     .map_err(debug_error)?;
-    persist_memory(database, principal_id, source, memory.clone()).await?;
+    persist_memory(database, principal_id, vec![source], memory.clone()).await?;
     database
         .repositories()
         .upsert_search_document(
@@ -132,7 +318,7 @@ async fn index_deleted_memory(
 }
 
 fn assert_visible_memory(
-    hits: &[cortex_search::SearchCandidate],
+    hits: &[cortex_application::SearchCandidate],
     memory: &MemoryAssertion,
     source: &Source,
 ) {
@@ -208,7 +394,7 @@ fn memory(
 async fn persist_memory(
     database: &SqliteDatabase,
     principal_id: PrincipalId,
-    source: Source,
+    sources: Vec<Source>,
     memory: MemoryAssertion,
 ) -> Result<(), String> {
     let context = CommandContext::from_authenticated(
@@ -223,18 +409,25 @@ async fn persist_memory(
         lifecycle: memory.lifecycle(),
         audit_correlation_id: context.correlation_id,
     };
+    let mut changes = sources
+        .iter()
+        .cloned()
+        .map(AggregateChange::InsertSource)
+        .collect::<Vec<_>>();
+    changes.push(AggregateChange::InsertMemory(memory.clone()));
+    changes.extend(
+        sources
+            .iter()
+            .map(|source| AggregateChange::LinkMemorySource {
+                memory_id: memory.id(),
+                source_id: source.id(),
+            }),
+    );
     let mutation = AtomicMutation::new(
         context,
         Capability::MemoryCreate,
         None,
-        vec![
-            AggregateChange::InsertSource(source.clone()),
-            AggregateChange::InsertMemory(memory.clone()),
-            AggregateChange::LinkMemorySource {
-                memory_id: memory.id(),
-                source_id: source.id(),
-            },
-        ],
+        changes,
         result,
         AuditEvent {
             id: AuditEventId::new(),

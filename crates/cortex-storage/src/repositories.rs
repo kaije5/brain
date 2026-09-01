@@ -1,62 +1,17 @@
 use chrono::{DateTime, Utc};
 use cortex_application::{
-    ApplicationError, Capability, MemoryRepository, NoteRepository, SourceRepository,
-    TaskRepository,
+    ApplicationError, Capability, Embedding, EntityKind, IndexedVector, MemoryRepository,
+    NoteRepository, SearchCandidate, SearchIndex, SourceRepository, TaskRepository,
 };
 use cortex_domain::{
     EntityId, Lifecycle, MemoryAssertion, MemoryStatus, Note, PrincipalId, Revision, Source,
     SourceRef, Task, TaskStatus, WorkspaceId,
 };
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::database::storage_error;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SearchEntityKind {
-    Note,
-    Task,
-    Memory,
-    Source,
-}
-
-impl SearchEntityKind {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Note => "note",
-            Self::Task => "task",
-            Self::Memory => "memory",
-            Self::Source => "source",
-        }
-    }
-
-    fn decode(value: &str) -> Result<Self, ApplicationError> {
-        match value {
-            "note" => Ok(Self::Note),
-            "task" => Ok(Self::Task),
-            "memory" => Ok(Self::Memory),
-            "source" => Ok(Self::Source),
-            _ => Err(storage_error("invalid search entity kind")),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredSearchCandidate {
-    pub entity_id: EntityId,
-    pub kind: SearchEntityKind,
-    pub snippet: String,
-    pub sources: Vec<SourceRef>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredEmbeddingCandidate {
-    pub candidate: StoredSearchCandidate,
-    pub model_id: String,
-    pub model_version: String,
-    pub dimensions: usize,
-    pub vector: Vec<u8>,
-}
 
 #[derive(Clone)]
 pub struct SqliteRepositories {
@@ -156,7 +111,8 @@ impl SqliteRepositories {
         .map_err(|_| storage_error("capability grant lookup failed"))
     }
 
-    /// Upserts searchable content only for an existing canonical entity.
+    /// Upserts searchable content and its canonical SHA-256 hash only for an
+    /// existing canonical entity. A changed hash atomically invalidates vectors.
     ///
     /// # Errors
     /// Returns a validation error for blank text, not-found for a missing entity,
@@ -165,7 +121,7 @@ impl SqliteRepositories {
         &self,
         workspace_id: WorkspaceId,
         entity_id: EntityId,
-        kind: SearchEntityKind,
+        kind: EntityKind,
         snippet: &str,
     ) -> Result<(), ApplicationError> {
         if snippet.trim().is_empty() {
@@ -177,17 +133,21 @@ impl SqliteRepositories {
         {
             return Err(ApplicationError::NotFound { entity: "entity" });
         }
+        let content_hash = search_content_hash(snippet);
         sqlx::query(
-            "INSERT INTO search_document (workspace_id, entity_id, entity_kind, snippet) \
-             VALUES (?, ?, ?, ?) \
+            "INSERT INTO search_document \
+             (workspace_id, entity_id, entity_kind, snippet, content_hash) \
+             VALUES (?, ?, ?, ?, ?) \
              ON CONFLICT (workspace_id, entity_id) DO UPDATE SET \
              entity_kind = excluded.entity_kind, snippet = excluded.snippet, \
+             content_hash = excluded.content_hash, \
              updated_at = CURRENT_TIMESTAMP",
         )
         .bind(id_text(workspace_id))
         .bind(id_text(entity_id))
         .bind(kind.as_str())
         .bind(snippet)
+        .bind(content_hash.to_vec())
         .execute(&self.pool)
         .await
         .map_err(|_| storage_error("search document upsert failed"))?;
@@ -205,7 +165,7 @@ impl SqliteRepositories {
         principal_id: PrincipalId,
         query: &str,
         limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<StoredSearchCandidate>, ApplicationError> {
+    ) -> Result<Vec<SearchCandidate>, ApplicationError> {
         let fts_query = phrase_query(query)?;
         let rows = sqlx::query(
             "SELECT d.entity_id, d.entity_kind, d.snippet \
@@ -223,7 +183,14 @@ impl SqliteRepositories {
                      AND t.lifecycle = 'active')) \
                  OR (d.entity_kind = 'memory' AND EXISTS (SELECT 1 FROM memory_assertion AS m \
                      WHERE m.workspace_id = d.workspace_id AND m.id = d.entity_id \
-                     AND m.lifecycle = 'active' AND m.status = 'active')) \
+                     AND m.lifecycle = 'active' AND m.status = 'active') \
+                     AND EXISTS (SELECT 1 FROM memory_source AS ms \
+                         JOIN source AS provenance_source \
+                           ON provenance_source.workspace_id = ms.workspace_id \
+                          AND provenance_source.id = ms.source_id \
+                         WHERE ms.workspace_id = d.workspace_id \
+                           AND ms.memory_id = d.entity_id \
+                           AND provenance_source.lifecycle = 'active')) \
                  OR (d.entity_kind = 'source' AND EXISTS (SELECT 1 FROM source AS s \
                      WHERE s.workspace_id = d.workspace_id AND s.id = d.entity_id \
                      AND s.lifecycle = 'active'))) \
@@ -240,11 +207,12 @@ impl SqliteRepositories {
         let mut candidates = Vec::with_capacity(rows.len());
         for row in rows {
             let entity_id = row_id(&row, "entity_id")?;
-            let kind = SearchEntityKind::decode(&row_text(&row, "entity_kind")?)?;
+            let kind = EntityKind::parse(&row_text(&row, "entity_kind")?)
+                .ok_or_else(|| storage_error("invalid search entity kind"))?;
             let sources = self
                 .load_search_sources(workspace_id, entity_id, kind)
                 .await?;
-            candidates.push(StoredSearchCandidate {
+            candidates.push(SearchCandidate {
                 entity_id,
                 kind,
                 snippet: row_text(&row, "snippet")?,
@@ -257,8 +225,8 @@ impl SqliteRepositories {
     /// Stores one ready fixed-length little-endian `f32` embedding.
     ///
     /// # Errors
-    /// Returns a validation error for inconsistent metadata/blob length, or a
-    /// redacted storage error if the indexed entity does not exist.
+    /// Returns a validation error for inconsistent metadata or vector content,
+    /// not-found if the indexed entity does not exist, or a redacted storage error.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_embedding(
         &self,
@@ -266,7 +234,6 @@ impl SqliteRepositories {
         entity_id: EntityId,
         model_id: &str,
         model_version: &str,
-        content_hash: &[u8],
         dimensions: usize,
         vector: &[u8],
     ) -> Result<(), ApplicationError> {
@@ -274,49 +241,35 @@ impl SqliteRepositories {
             i64::try_from(dimensions).map_err(|_| ApplicationError::Validation {
                 field: "embedding_dimensions",
             })?;
-        let expected_len =
-            dimensions
-                .checked_mul(size_of::<f32>())
-                .ok_or(ApplicationError::Validation {
-                    field: "embedding_dimensions",
-                })?;
-        if dimensions == 0 || vector.len() != expected_len {
-            return Err(ApplicationError::Validation {
-                field: "embedding_dimensions",
-            });
-        }
-        if model_id.trim().is_empty() || model_version.trim().is_empty() {
-            return Err(ApplicationError::Validation {
-                field: "embedding_model",
-            });
-        }
-        if content_hash.is_empty() {
-            return Err(ApplicationError::Validation {
-                field: "content_hash",
-            });
-        }
-        sqlx::query(
+        let embedding = Embedding::from_le_bytes(model_id, model_version, dimensions, vector)?;
+        let result = sqlx::query(
             "INSERT INTO embedding (workspace_id, entity_id, model_id, model_version, \
-             dimensions, content_hash, vector, index_state) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready') \
+             dimensions, content_hash, vector, index_state) \
+             SELECT ?, ?, ?, ?, ?, d.content_hash, ?, 'ready' \
+             FROM search_document AS d WHERE d.workspace_id = ? AND d.entity_id = ? \
              ON CONFLICT (workspace_id, entity_id, model_id, model_version) DO UPDATE SET \
              dimensions = excluded.dimensions, content_hash = excluded.content_hash, \
              vector = excluded.vector, index_state = 'ready', updated_at = CURRENT_TIMESTAMP",
         )
         .bind(id_text(workspace_id))
         .bind(id_text(entity_id))
-        .bind(model_id)
-        .bind(model_version)
+        .bind(embedding.model_id())
+        .bind(embedding.model_version())
         .bind(dimensions_i64)
-        .bind(content_hash)
-        .bind(vector)
+        .bind(embedding.to_le_bytes())
+        .bind(id_text(workspace_id))
+        .bind(id_text(entity_id))
         .execute(&self.pool)
         .await
         .map_err(|_| storage_error("embedding upsert failed"))?;
+        if result.rows_affected() == 0 {
+            return Err(ApplicationError::NotFound { entity: "entity" });
+        }
         Ok(())
     }
 
     /// Loads a bounded, deterministic set of authorized active vectors for one
-    /// embedding model. Dimension compatibility is validated by the search layer.
+    /// embedding model after requiring the ready vector's hash to match current text.
     ///
     /// # Errors
     /// Returns a redacted storage error for invalid persisted data or query failure.
@@ -327,14 +280,14 @@ impl SqliteRepositories {
         model_id: &str,
         model_version: &str,
         max_records: std::num::NonZeroUsize,
-    ) -> Result<Vec<StoredEmbeddingCandidate>, ApplicationError> {
+    ) -> Result<Vec<IndexedVector>, ApplicationError> {
         let rows = sqlx::query(
             "SELECT d.entity_id, d.entity_kind, d.snippet, e.model_id, e.model_version, \
              e.dimensions, e.vector FROM embedding AS e \
              JOIN search_document AS d ON d.workspace_id = e.workspace_id \
                  AND d.entity_id = e.entity_id \
              WHERE e.workspace_id = ? AND e.model_id = ? AND e.model_version = ? \
-             AND e.index_state = 'ready' \
+             AND e.index_state = 'ready' AND e.content_hash = d.content_hash \
              AND EXISTS (SELECT 1 FROM capability_grant AS grant_row \
                  WHERE grant_row.workspace_id = d.workspace_id \
                  AND grant_row.principal_id = ? AND grant_row.capability = ?) \
@@ -346,7 +299,14 @@ impl SqliteRepositories {
                      AND t.lifecycle = 'active')) \
                  OR (d.entity_kind = 'memory' AND EXISTS (SELECT 1 FROM memory_assertion AS m \
                      WHERE m.workspace_id = d.workspace_id AND m.id = d.entity_id \
-                     AND m.lifecycle = 'active' AND m.status = 'active')) \
+                     AND m.lifecycle = 'active' AND m.status = 'active') \
+                     AND EXISTS (SELECT 1 FROM memory_source AS ms \
+                         JOIN source AS provenance_source \
+                           ON provenance_source.workspace_id = ms.workspace_id \
+                          AND provenance_source.id = ms.source_id \
+                         WHERE ms.workspace_id = d.workspace_id \
+                           AND ms.memory_id = d.entity_id \
+                           AND provenance_source.lifecycle = 'active')) \
                  OR (d.entity_kind = 'source' AND EXISTS (SELECT 1 FROM source AS s \
                      WHERE s.workspace_id = d.workspace_id AND s.id = d.entity_id \
                      AND s.lifecycle = 'active'))) \
@@ -364,7 +324,8 @@ impl SqliteRepositories {
         let mut candidates = Vec::with_capacity(rows.len());
         for row in rows {
             let entity_id = row_id(&row, "entity_id")?;
-            let kind = SearchEntityKind::decode(&row_text(&row, "entity_kind")?)?;
+            let kind = EntityKind::parse(&row_text(&row, "entity_kind")?)
+                .ok_or_else(|| storage_error("invalid search entity kind"))?;
             let dimensions: i64 = row
                 .try_get("dimensions")
                 .map_err(|_| storage_error("invalid embedding row"))?;
@@ -373,8 +334,12 @@ impl SqliteRepositories {
             let vector: Vec<u8> = row
                 .try_get("vector")
                 .map_err(|_| storage_error("invalid embedding row"))?;
-            candidates.push(StoredEmbeddingCandidate {
-                candidate: StoredSearchCandidate {
+            let model_id = row_text(&row, "model_id")?;
+            let model_version = row_text(&row, "model_version")?;
+            let embedding = Embedding::from_le_bytes(model_id, model_version, dimensions, &vector)
+                .map_err(|_| storage_error("invalid embedding row"))?;
+            candidates.push(IndexedVector {
+                candidate: SearchCandidate {
                     entity_id,
                     kind,
                     snippet: row_text(&row, "snippet")?,
@@ -382,10 +347,7 @@ impl SqliteRepositories {
                         .load_search_sources(workspace_id, entity_id, kind)
                         .await?,
                 },
-                model_id: row_text(&row, "model_id")?,
-                model_version: row_text(&row, "model_version")?,
-                dimensions,
-                vector,
+                embedding,
             });
         }
         Ok(candidates)
@@ -395,19 +357,19 @@ impl SqliteRepositories {
         &self,
         workspace_id: WorkspaceId,
         entity_id: EntityId,
-        kind: SearchEntityKind,
+        kind: EntityKind,
     ) -> Result<bool, ApplicationError> {
         let statement = match kind {
-            SearchEntityKind::Note => {
+            EntityKind::Note => {
                 "SELECT EXISTS(SELECT 1 FROM note WHERE workspace_id = ? AND id = ?)"
             }
-            SearchEntityKind::Task => {
+            EntityKind::Task => {
                 "SELECT EXISTS(SELECT 1 FROM task WHERE workspace_id = ? AND id = ?)"
             }
-            SearchEntityKind::Memory => {
+            EntityKind::Memory => {
                 "SELECT EXISTS(SELECT 1 FROM memory_assertion WHERE workspace_id = ? AND id = ?)"
             }
-            SearchEntityKind::Source => {
+            EntityKind::Source => {
                 "SELECT EXISTS(SELECT 1 FROM source WHERE workspace_id = ? AND id = ?)"
             }
         };
@@ -423,10 +385,10 @@ impl SqliteRepositories {
         &self,
         workspace_id: WorkspaceId,
         entity_id: EntityId,
-        kind: SearchEntityKind,
+        kind: EntityKind,
     ) -> Result<Vec<SourceRef>, ApplicationError> {
         match kind {
-            SearchEntityKind::Memory => {
+            EntityKind::Memory => {
                 let ids: Vec<String> = sqlx::query_scalar(
                     "SELECT ms.source_id FROM memory_source AS ms \
                      JOIN source AS s ON s.workspace_id = ms.workspace_id AND s.id = ms.source_id \
@@ -442,11 +404,50 @@ impl SqliteRepositories {
                     .map(|source_id| parse_id(source_id).map(|source_id| SourceRef { source_id }))
                     .collect()
             }
-            SearchEntityKind::Source => Ok(vec![SourceRef {
+            EntityKind::Source => Ok(vec![SourceRef {
                 source_id: entity_id,
             }]),
-            SearchEntityKind::Note | SearchEntityKind::Task => Ok(Vec::new()),
+            EntityKind::Note | EntityKind::Task => Ok(Vec::new()),
         }
+    }
+}
+
+impl SearchIndex for SqliteRepositories {
+    async fn is_authorized(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> Result<bool, ApplicationError> {
+        self.has_capability(workspace_id, principal_id, Capability::KnowledgeRetrieve)
+            .await
+    }
+
+    async fn lexical_candidates(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        query: &str,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<SearchCandidate>, ApplicationError> {
+        self.lexical_search_candidates(workspace_id, principal_id, query, limit)
+            .await
+    }
+
+    async fn semantic_records(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        query: &Embedding,
+        max_records: std::num::NonZeroUsize,
+    ) -> Result<Vec<IndexedVector>, ApplicationError> {
+        self.embedding_search_candidates(
+            workspace_id,
+            principal_id,
+            query.model_id(),
+            query.model_version(),
+            max_records,
+        )
+        .await
     }
 }
 
@@ -460,6 +461,30 @@ fn phrase_query(query: &str) -> Result<String, ApplicationError> {
 
 fn limit_i64(limit: std::num::NonZeroUsize) -> i64 {
     i64::try_from(limit.get()).unwrap_or(i64::MAX)
+}
+
+fn search_content_hash(snippet: &str) -> [u8; 32] {
+    let digest = Sha256::digest(snippet.as_bytes());
+    let mut hash = [0_u8; 32];
+    hash.copy_from_slice(&digest);
+    hash
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::search_content_hash;
+
+    #[test]
+    fn canonical_search_hash_is_sha256_of_exact_utf8_text() {
+        assert_eq!(
+            search_content_hash("hello world"),
+            [
+                0xb9, 0x4d, 0x27, 0xb9, 0x93, 0x4d, 0x3e, 0x08, 0xa5, 0x2e, 0x52, 0xd7, 0xda, 0x7d,
+                0xab, 0xfa, 0xc4, 0x84, 0xef, 0xe3, 0x7a, 0x53, 0x80, 0xee, 0x90, 0x88, 0xf7, 0xac,
+                0xe2, 0xef, 0xcd, 0xe9,
+            ]
+        );
+    }
 }
 
 impl NoteRepository for SqliteRepositories {
