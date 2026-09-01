@@ -235,6 +235,14 @@ impl Capability {
             Self::KnowledgeRetrieve => KNOWLEDGE_RETRIEVE,
         }
     }
+
+    #[must_use]
+    pub fn from_mcp_name(name: &str) -> Option<Self> {
+        CapabilityCatalog::all()
+            .iter()
+            .copied()
+            .find(|capability| capability.metadata().mcp_name == name)
+    }
 }
 
 /// The canonical enumeration of operations available to adapters and agents.

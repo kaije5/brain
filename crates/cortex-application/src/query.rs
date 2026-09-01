@@ -2,7 +2,7 @@ use cortex_domain::{
     AuditEvent, EntityId, MemoryAssertion, Note, OperationId, Revision, Source, Task, WorkspaceId,
 };
 
-use crate::{ApplicationError, MutationResult};
+use crate::{ApplicationError, Capability, MutationResult};
 
 /// Application-owned persistence port for note aggregates.
 #[allow(async_fn_in_trait)]
@@ -79,7 +79,37 @@ pub trait OperationResultRepository: Send + Sync {
         &self,
         workspace_id: WorkspaceId,
         operation_id: OperationId,
-    ) -> Result<Option<MutationResult>, ApplicationError>;
+    ) -> Result<Option<RecordedOperation>, ApplicationError>;
+}
+
+/// Authenticated command identity retained with a durable idempotency result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationIdentity {
+    pub principal_id: cortex_domain::PrincipalId,
+    pub capability: Capability,
+    pub target_id: Option<EntityId>,
+}
+
+impl OperationIdentity {
+    #[must_use]
+    pub const fn new(
+        principal_id: cortex_domain::PrincipalId,
+        capability: Capability,
+        target_id: Option<EntityId>,
+    ) -> Self {
+        Self {
+            principal_id,
+            capability,
+            target_id,
+        }
+    }
+}
+
+/// A replayable mutation result together with the command identity that created it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecordedOperation {
+    pub identity: OperationIdentity,
+    pub result: MutationResult,
 }
 
 /// One aggregate change staged for a single atomic mutation transaction.
@@ -139,6 +169,7 @@ pub enum AggregateChange {
 pub struct AtomicMutation {
     pub workspace_id: WorkspaceId,
     pub operation_id: OperationId,
+    pub identity: OperationIdentity,
     pub changes: Vec<AggregateChange>,
     pub result: MutationResult,
     pub audit_event: AuditEvent,
@@ -154,6 +185,8 @@ impl AtomicMutation {
     /// its audit evidence does not match the trusted command context/result.
     pub fn new(
         context: crate::CommandContext,
+        capability: Capability,
+        target_id: Option<EntityId>,
         changes: Vec<AggregateChange>,
         result: MutationResult,
         audit_event: AuditEvent,
@@ -162,6 +195,7 @@ impl AtomicMutation {
             && audit_event.principal_id == context.principal_id
             && audit_event.operation_id == context.operation_id
             && audit_event.correlation_id == context.correlation_id
+            && audit_event.capability == capability.metadata().mcp_name
             && audit_event.target_id == Some(result.entity_id)
             && result.audit_correlation_id == context.correlation_id;
 
@@ -172,6 +206,7 @@ impl AtomicMutation {
         Ok(Self {
             workspace_id: context.workspace_id,
             operation_id: context.operation_id,
+            identity: OperationIdentity::new(context.principal_id, capability, target_id),
             changes,
             result,
             audit_event,

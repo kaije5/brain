@@ -1,6 +1,6 @@
 use cortex_application::{
-    AggregateChange, AtomicMutation, AtomicMutationPort, CommandContext, MemoryRepository,
-    MutationResult, NoteRepository,
+    AggregateChange, ApplicationError, AtomicMutation, AtomicMutationPort, AuditPort, Capability,
+    CommandContext, MemoryRepository, MutationResult, NoteRepository,
 };
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, MemoryAssertion, MemoryAssertionInput, Note, NoteInput,
@@ -67,6 +67,131 @@ async fn repeated_operation_id_returns_original_result_without_second_effects() 
         database
             .audit_port()
             .find(workspace_id, duplicate_audit_id)
+            .await
+            .map_err(debug_error)?,
+        None
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_replay_rejects_a_different_principal() -> Result<(), String> {
+    let (database, _temp, workspace_id, principal_id) = database().await?;
+    let operations = database.operation_store();
+    let operation_id = OperationId::new();
+    let note = Note::create(NoteInput {
+        workspace_id,
+        title: "principal bound".to_owned(),
+        content: "one actor only".to_owned(),
+    })
+    .map_err(debug_error)?;
+    let original = context(workspace_id, principal_id, operation_id);
+    operations
+        .execute_once(note_mutation(original, note.clone())?)
+        .await
+        .map_err(debug_error)?;
+    let different_principal = context(workspace_id, PrincipalId::new(), operation_id);
+
+    let replay = operations
+        .execute_once(note_mutation(different_principal, note)?)
+        .await;
+
+    assert_eq!(
+        replay,
+        Err(ApplicationError::Conflict {
+            entity: "operation"
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_replay_rejects_a_different_capability() -> Result<(), String> {
+    let (database, _temp, workspace_id, principal_id) = database().await?;
+    let operations = database.operation_store();
+    let context = context(workspace_id, principal_id, OperationId::new());
+    let note = Note::create(NoteInput {
+        workspace_id,
+        title: "capability bound".to_owned(),
+        content: "one command only".to_owned(),
+    })
+    .map_err(debug_error)?;
+    operations
+        .execute_once(note_mutation(context, note.clone())?)
+        .await
+        .map_err(debug_error)?;
+    let result = MutationResult {
+        entity_id: note.id(),
+        revision: note.revision(),
+        lifecycle: note.lifecycle(),
+        audit_correlation_id: context.correlation_id,
+    };
+    let different_capability = AtomicMutation::new(
+        context,
+        Capability::TaskCreate,
+        None,
+        vec![AggregateChange::InsertNote(note)],
+        result,
+        audit(&context, result.entity_id, "cortex_task_create"),
+    )
+    .map_err(debug_error)?;
+
+    let replay = operations.execute_once(different_capability).await;
+
+    assert_eq!(
+        replay,
+        Err(ApplicationError::Conflict {
+            entity: "operation"
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn durable_replay_rejects_a_different_target() -> Result<(), String> {
+    let (database, _temp, workspace_id, principal_id) = database().await?;
+    let operations = database.operation_store();
+    let context = context(workspace_id, principal_id, OperationId::new());
+    let first = Note::create(NoteInput {
+        workspace_id,
+        title: "first target".to_owned(),
+        content: "persisted".to_owned(),
+    })
+    .map_err(debug_error)?;
+    let first_id = first.id();
+    operations
+        .execute_once(bound_note_mutation(
+            context,
+            first,
+            Capability::NoteUpdate,
+            Some(first_id),
+        )?)
+        .await
+        .map_err(debug_error)?;
+    let second = Note::create(NoteInput {
+        workspace_id,
+        title: "second target".to_owned(),
+        content: "must not persist".to_owned(),
+    })
+    .map_err(debug_error)?;
+
+    let replay = operations
+        .execute_once(bound_note_mutation(
+            context,
+            second.clone(),
+            Capability::NoteUpdate,
+            Some(second.id()),
+        )?)
+        .await;
+
+    assert_eq!(
+        replay,
+        Err(ApplicationError::Conflict {
+            entity: "operation"
+        })
+    );
+    assert_eq!(
+        NoteRepository::find(&database.repositories(), workspace_id, second.id())
             .await
             .map_err(debug_error)?,
         None
@@ -154,6 +279,8 @@ async fn failed_mutation_rolls_back_entity_audit_and_operation() -> Result<(), S
     };
     let mutation = AtomicMutation::new(
         context,
+        Capability::MemoryCreate,
+        None,
         vec![AggregateChange::InsertMemory(memory)],
         result,
         audit(&context, result.entity_id, "cortex_memory_create"),
@@ -189,17 +316,27 @@ async fn audit_insert_failure_rolls_back_entity_audit_and_operation() -> Result<
         content: "the aggregate must not survive a failed audit write".to_owned(),
     })
     .map_err(debug_error)?;
-    let context = context(workspace_id, principal_id, OperationId::new());
+    let command_context = context(workspace_id, principal_id, OperationId::new());
     let result = MutationResult {
         entity_id: note.id(),
         revision: note.revision(),
         lifecycle: note.lifecycle(),
-        audit_correlation_id: context.correlation_id,
+        audit_correlation_id: command_context.correlation_id,
     };
-    let failed_audit = audit(&context, note.id(), "cortex_unknown_capability");
+    let existing_context = context(workspace_id, principal_id, OperationId::new());
+    let existing_audit = audit(&existing_context, note.id(), "cortex_note_create");
+    database
+        .audit_port()
+        .append(existing_audit.clone())
+        .await
+        .map_err(debug_error)?;
+    let mut failed_audit = audit(&command_context, note.id(), "cortex_note_create");
+    failed_audit.id = existing_audit.id;
     let failed_audit_id = failed_audit.id;
     let failed_mutation = AtomicMutation::new(
-        context,
+        command_context,
+        Capability::NoteCreate,
+        None,
         vec![AggregateChange::InsertNote(note.clone())],
         result,
         failed_audit,
@@ -219,13 +356,15 @@ async fn audit_insert_failure_rolls_back_entity_audit_and_operation() -> Result<
             .find(workspace_id, failed_audit_id)
             .await
             .map_err(debug_error)?,
-        None
+        Some(existing_audit)
     );
 
-    let retry_audit = audit(&context, note.id(), "cortex_note_create");
+    let retry_audit = audit(&command_context, note.id(), "cortex_note_create");
     let retry_audit_id = retry_audit.id;
     let retry = AtomicMutation::new(
-        context,
+        command_context,
+        Capability::NoteCreate,
+        None,
         vec![AggregateChange::InsertNote(note.clone())],
         result,
         retry_audit,
@@ -280,6 +419,15 @@ fn context(
 }
 
 fn note_mutation(context: CommandContext, note: Note) -> Result<AtomicMutation, String> {
+    bound_note_mutation(context, note, Capability::NoteCreate, None)
+}
+
+fn bound_note_mutation(
+    context: CommandContext,
+    note: Note,
+    capability: Capability,
+    target_id: Option<cortex_domain::EntityId>,
+) -> Result<AtomicMutation, String> {
     let result = MutationResult {
         entity_id: note.id(),
         revision: note.revision(),
@@ -288,9 +436,11 @@ fn note_mutation(context: CommandContext, note: Note) -> Result<AtomicMutation, 
     };
     AtomicMutation::new(
         context,
+        capability,
+        target_id,
         vec![AggregateChange::InsertNote(note)],
         result,
-        audit(&context, result.entity_id, "cortex_note_create"),
+        audit(&context, result.entity_id, capability.metadata().mcp_name),
     )
     .map_err(debug_error)
 }

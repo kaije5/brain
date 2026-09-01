@@ -1,6 +1,6 @@
 use cortex_application::{
-    AggregateChange, ApplicationError, AtomicMutation, AtomicMutationPort, MutationResult,
-    OperationResultRepository,
+    AggregateChange, ApplicationError, AtomicMutation, AtomicMutationPort, Capability,
+    MutationResult, OperationIdentity, OperationResultRepository, RecordedOperation,
 };
 use cortex_domain::{
     EntityId, Lifecycle, MemoryAssertion, Note, Revision, Source, Task, WorkspaceId,
@@ -32,7 +32,7 @@ impl OperationStore {
         &self,
         workspace_id: WorkspaceId,
         operation_id: cortex_domain::OperationId,
-    ) -> Result<Option<MutationResult>, ApplicationError> {
+    ) -> Result<Option<RecordedOperation>, ApplicationError> {
         let outcome: Option<String> = sqlx::query_scalar(
             "SELECT outcome_json FROM operation WHERE workspace_id = ? AND operation_id = ?",
         )
@@ -41,7 +41,7 @@ impl OperationStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(|_| storage_error("operation lookup failed"))?;
-        outcome.map(|value| decode_result(&value)).transpose()
+        outcome.map(|value| decode_operation(&value)).transpose()
     }
 }
 
@@ -50,7 +50,7 @@ impl OperationResultRepository for OperationStore {
         &self,
         workspace_id: WorkspaceId,
         operation_id: cortex_domain::OperationId,
-    ) -> Result<Option<MutationResult>, ApplicationError> {
+    ) -> Result<Option<RecordedOperation>, ApplicationError> {
         self.load_result(workspace_id, operation_id).await
     }
 }
@@ -60,14 +60,14 @@ impl AtomicMutationPort for OperationStore {
         &self,
         mutation: AtomicMutation,
     ) -> Result<MutationResult, ApplicationError> {
-        if let Some(result) = self
+        if let Some(recorded) = self
             .load_result(mutation.workspace_id, mutation.operation_id)
             .await?
         {
-            return Ok(result);
+            return replay_result(recorded, mutation.identity);
         }
 
-        let outcome_json = encode_result(mutation.result)?;
+        let outcome_json = encode_operation(&mutation)?;
         let mut transaction = self
             .pool
             .begin()
@@ -87,11 +87,11 @@ impl AtomicMutationPort for OperationStore {
                 .rollback()
                 .await
                 .map_err(|_| storage_error("transaction rollback failed"))?;
-            if let Some(result) = self
+            if let Some(recorded) = self
                 .load_result(mutation.workspace_id, mutation.operation_id)
                 .await?
             {
-                return Ok(result);
+                return replay_result(recorded, mutation.identity);
             }
             return Err(storage_error("operation reservation failed"));
         }
@@ -601,15 +601,22 @@ fn revision_i64(revision: Revision) -> Result<i64, ApplicationError> {
 #[derive(Serialize, Deserialize)]
 struct StoredMutationResult {
     version: u8,
+    principal_id: String,
+    capability: String,
+    target_id: Option<String>,
     entity_id: String,
     revision: u64,
     lifecycle: String,
     audit_correlation_id: String,
 }
 
-fn encode_result(result: MutationResult) -> Result<String, ApplicationError> {
+fn encode_operation(mutation: &AtomicMutation) -> Result<String, ApplicationError> {
+    let result = mutation.result;
     let stored = StoredMutationResult {
-        version: 1,
+        version: 2,
+        principal_id: id_text(mutation.identity.principal_id),
+        capability: mutation.identity.capability.metadata().mcp_name.to_owned(),
+        target_id: mutation.identity.target_id.map(id_text),
         entity_id: id_text(result.entity_id),
         revision: result.revision.get(),
         lifecycle: encode_lifecycle(result.lifecycle).to_owned(),
@@ -618,17 +625,39 @@ fn encode_result(result: MutationResult) -> Result<String, ApplicationError> {
     serde_json::to_string(&stored).map_err(|_| storage_error("operation outcome encoding failed"))
 }
 
-fn decode_result(value: &str) -> Result<MutationResult, ApplicationError> {
+fn decode_operation(value: &str) -> Result<RecordedOperation, ApplicationError> {
     let stored: StoredMutationResult = serde_json::from_str(value)
         .map_err(|_| storage_error("operation outcome decoding failed"))?;
-    if stored.version != 1 {
+    if stored.version != 2 {
         return Err(storage_error("unsupported operation outcome version"));
     }
-    Ok(MutationResult {
-        entity_id: parse_id(&stored.entity_id)?,
-        revision: Revision::rehydrate(stored.revision).map_err(ApplicationError::from)?,
-        lifecycle: decode_lifecycle(&stored.lifecycle)?,
-        audit_correlation_id: Uuid::parse_str(&stored.audit_correlation_id)
-            .map_err(|_| storage_error("invalid operation correlation id"))?,
+    let capability = Capability::from_mcp_name(&stored.capability)
+        .ok_or_else(|| storage_error("invalid operation capability"))?;
+    Ok(RecordedOperation {
+        identity: OperationIdentity::new(
+            parse_id(&stored.principal_id)?,
+            capability,
+            stored.target_id.as_deref().map(parse_id).transpose()?,
+        ),
+        result: MutationResult {
+            entity_id: parse_id(&stored.entity_id)?,
+            revision: Revision::rehydrate(stored.revision).map_err(ApplicationError::from)?,
+            lifecycle: decode_lifecycle(&stored.lifecycle)?,
+            audit_correlation_id: Uuid::parse_str(&stored.audit_correlation_id)
+                .map_err(|_| storage_error("invalid operation correlation id"))?,
+        },
     })
+}
+
+fn replay_result(
+    recorded: RecordedOperation,
+    requested: OperationIdentity,
+) -> Result<MutationResult, ApplicationError> {
+    if recorded.identity == requested {
+        Ok(recorded.result)
+    } else {
+        Err(ApplicationError::Conflict {
+            entity: "operation",
+        })
+    }
 }

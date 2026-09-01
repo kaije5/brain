@@ -1,5 +1,5 @@
 use cortex_application::{
-    AggregateChange, ApplicationError, AtomicMutation, CommandContext, MutationResult,
+    AggregateChange, ApplicationError, AtomicMutation, Capability, CommandContext, MutationResult,
 };
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, Note, NoteInput, OperationId, PolicyDecision,
@@ -36,6 +36,8 @@ fn atomic_mutation_binds_changes_result_and_matching_audit_evidence_to_one_opera
             operation_id,
             correlation_id,
         ),
+        Capability::NoteCreate,
+        None,
         vec![AggregateChange::InsertNote(note)],
         result,
         audit_event,
@@ -73,6 +75,8 @@ fn atomic_mutation_rejects_audit_evidence_from_another_operation() -> Result<(),
             operation_id,
             correlation_id,
         ),
+        Capability::NoteCreate,
+        None,
         vec![AggregateChange::InsertNote(note)],
         result,
         audit_event,

@@ -8,7 +8,8 @@ use std::{
 use cortex_application::{
     AggregateChange, ApplicationError, ApplicationService, AtomicMutation, AtomicMutationPort,
     AuditPort, Capability, CapabilityGrant, CommandContext, GrantPolicy, MemoryRepository,
-    MutationResult, NoteRepository, OperationResultRepository, SourceRepository, TaskRepository,
+    MutationResult, NoteRepository, OperationResultRepository, RecordedOperation, SourceRepository,
+    TaskRepository,
 };
 use cortex_domain::{
     AuditEvent, EntityId, Lifecycle, MemoryAssertion, MemoryStatus, Note, OperationId, PrincipalId,
@@ -29,7 +30,7 @@ struct State {
     tasks: BTreeMap<(WorkspaceId, EntityId), Task>,
     memories: BTreeMap<(WorkspaceId, EntityId), MemoryAssertion>,
     sources: BTreeMap<(WorkspaceId, EntityId), Source>,
-    operations: BTreeMap<(WorkspaceId, OperationId), MutationResult>,
+    operations: BTreeMap<(WorkspaceId, OperationId), RecordedOperation>,
     audits: Vec<AuditEvent>,
 }
 
@@ -102,6 +103,28 @@ impl Fixture {
             .insert((self.workspace_id, id), source);
         Ok(id)
     }
+
+    pub fn seed_deleted_source(&self, reference: &str) -> Result<EntityId, String> {
+        let active = Source::create(SourceInput {
+            workspace_id: self.workspace_id,
+            reference: reference.to_owned(),
+        })
+        .map_err(debug_error)?;
+        let source = Source::rehydrate(
+            active.id(),
+            self.workspace_id,
+            active.reference().to_owned(),
+            active.revision().next().map_err(debug_error)?,
+            Lifecycle::Deleted,
+        )
+        .map_err(debug_error)?;
+        let id = source.id();
+        self.state
+            .lock()?
+            .sources
+            .insert((self.workspace_id, id), source);
+        Ok(id)
+    }
 }
 
 impl FakeState {
@@ -113,6 +136,14 @@ impl FakeState {
 
     pub fn audits(&self) -> Result<Vec<AuditEvent>, String> {
         Ok(self.lock()?.audits.clone())
+    }
+
+    pub fn memory_count(&self) -> Result<usize, String> {
+        Ok(self.lock()?.memories.len())
+    }
+
+    pub fn task_count(&self) -> Result<usize, String> {
+        Ok(self.lock()?.tasks.len())
     }
 }
 
@@ -205,13 +236,14 @@ impl SourceRepository for FakeState {
         workspace_id: WorkspaceId,
         entity_id: EntityId,
     ) -> Result<Option<Source>, ApplicationError> {
+        // Deliberately expose history here to exercise the service's defensive lifecycle check.
+        // The SQLite adapter has a separate contract test requiring active-only lookup.
         Ok(self
             .inner
             .lock()
             .map_err(|_| ApplicationError::Internal)?
             .sources
             .get(&(workspace_id, entity_id))
-            .filter(|source| source.lifecycle() == Lifecycle::Active)
             .cloned())
     }
 }
@@ -221,7 +253,7 @@ impl OperationResultRepository for FakeState {
         &self,
         workspace_id: WorkspaceId,
         operation_id: OperationId,
-    ) -> Result<Option<MutationResult>, ApplicationError> {
+    ) -> Result<Option<RecordedOperation>, ApplicationError> {
         Ok(self
             .inner
             .lock()
@@ -249,11 +281,17 @@ impl AtomicMutationPort for FakeState {
         mutation: AtomicMutation,
     ) -> Result<MutationResult, ApplicationError> {
         let mut state = self.inner.lock().map_err(|_| ApplicationError::Internal)?;
-        if let Some(result) = state
+        if let Some(recorded) = state
             .operations
             .get(&(mutation.workspace_id, mutation.operation_id))
         {
-            return Ok(*result);
+            return if recorded.identity == mutation.identity {
+                Ok(recorded.result)
+            } else {
+                Err(ApplicationError::Conflict {
+                    entity: "operation",
+                })
+            };
         }
         for change in mutation.changes {
             apply_change(&mut state, mutation.workspace_id, change)?;
@@ -261,7 +299,10 @@ impl AtomicMutationPort for FakeState {
         state.audits.push(mutation.audit_event);
         state.operations.insert(
             (mutation.workspace_id, mutation.operation_id),
-            mutation.result,
+            RecordedOperation {
+                identity: mutation.identity,
+                result: mutation.result,
+            },
         );
         Ok(mutation.result)
     }

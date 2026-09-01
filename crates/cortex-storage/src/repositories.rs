@@ -144,7 +144,7 @@ impl SourceRepository for SqliteRepositories {
     ) -> Result<Option<Source>, ApplicationError> {
         let row = sqlx::query(
             "SELECT id, workspace_id, reference, revision, lifecycle \
-             FROM source WHERE workspace_id = ? AND id = ?",
+             FROM source WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'",
         )
         .bind(id_text(workspace_id))
         .bind(id_text(entity_id))

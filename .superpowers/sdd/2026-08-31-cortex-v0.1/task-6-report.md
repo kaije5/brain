@@ -161,3 +161,95 @@ signed toolchain, or CI runner before release completion.
 
 Git also emits a non-fatal warning that the user-level global ignore file is
 inaccessible. It does not affect the repository diff or build/test results.
+
+## Review fix round 1: replay binding and source lifecycle
+
+The independent Task 6 review found two related defense-in-depth gaps. Durable
+operation results were keyed only by workspace and operation ID, so a currently
+granted principal or a different allowed command could receive another
+command's result. Ordinary SQLite source lookup also returned tombstones, and
+the application validation trusted every source returned by its repository.
+
+The fix remains inside Task 6 and preserves the accepted atomic boundary:
+
+- `OperationIdentity` binds every recorded result to the authenticated
+  principal, typed `Capability`, and original command target (`None` for create,
+  `Some(entity_id)` for targeted commands). `RecordedOperation` carries that
+  identity with the canonical `MutationResult` across the application-owned
+  read port.
+- `ApplicationService::preflight` still evaluates current policy first, then
+  returns a replay only when principal, capability, and target all match. A
+  mismatch returns the fixed client-safe `Conflict { entity: "operation" }`.
+- `OperationStore` persists a version-2 replay envelope containing principal,
+  canonical capability name, target, and result. Both its initial replay path
+  and reservation-race loser path call the same identity validator before
+  returning a result.
+- `AtomicMutation::new` requires the typed capability and command target and
+  verifies the success audit uses the canonical capability name. The existing
+  mutation/result/audit transaction boundary is otherwise unchanged.
+- Ordinary SQLite `SourceRepository::find` now requires `lifecycle = 'active'`.
+  `validate_sources` independently requires `Lifecycle::Active`, so a faulty or
+  history-returning adapter cannot authorize tombstoned provenance.
+- No Task 7 search, FTS, embedding, ranker, inference, daemon, CLI, or MCP work
+  was introduced. No unsafe code or production `unwrap`/`expect` was added.
+
+### Fix-round red evidence
+
+Each regression was written and executed before its production fix:
+
+1. `cargo test -p cortex-application --test memories` ran five tests and failed
+   the two new tombstoned-source cases. Both failures returned `Ok(MutationResult
+   { .. })` where `Err(NotFound { entity: "source" })` was required; the other
+   three tests passed.
+2. `cargo test -p cortex-application --test revision_conflicts` ran six tests
+   and failed the three new granted-principal, allowed-capability, and target
+   mismatch cases. Each returned the original `Ok(MutationResult { .. })`
+   instead of `Err(Conflict { entity: "operation" })`; the existing three tests
+   passed.
+3. `cargo test -p cortex-storage --test operations` ran seven tests and failed
+   the three durable principal/capability/target mismatch cases for the same
+   reason. The existing four storage operation tests passed.
+4. `cargo test -p cortex-storage --test repositories` failed its one test
+   because ordinary source lookup returned `Some(Source { lifecycle: Deleted,
+   .. })` instead of `None`.
+
+### Fix-round green and gate evidence
+
+Fresh successful checks after the fix:
+
+- `cargo fmt --check` — PASS.
+- `cargo clippy --workspace --all-targets -- -D warnings` — PASS.
+- `cargo test --workspace --no-run` — PASS; every workspace unit and
+  integration target compiled.
+- `cargo test -p cortex-application --test atomic_mutation_contract` — 2 passed.
+- `cargo test -p cortex-application --test memories` — 5 passed, including both
+  tombstoned create/correct rejection cases with no mutation and one redacted
+  rejected audit decision.
+- `cargo test -p cortex-application --test revision_conflicts` — 6 passed,
+  including different granted principal, different allowed capability, and
+  different target conflicts.
+- `cargo test -p cortex-application --test notes` — 2 passed.
+- `cargo test -p cortex-application --test capability_contract` — 4 passed.
+- `cargo test -p cortex-storage --test repositories` — 1 passed, including the
+  active-only ordinary source lookup assertion.
+- `cargo test -p cortex-storage --lib` — 3 passed.
+- `git diff --check` — PASS (only the pre-existing inaccessible global-ignore
+  warning was emitted).
+
+The first post-fix `operations` execution reached runtime and passed all three
+new durable replay mismatch tests plus three existing tests. Its only failure
+was the audit-rollback test after that test had been changed to induce an audit
+primary-key collision: the assertion incorrectly expected the deliberately
+pre-seeded audit row to be absent. That test-only expectation was corrected to
+require the pre-seeded row to remain intact. After this correction,
+`cargo test -p cortex-storage --test operations` compiled but Windows
+application control blocked the test executable before execution with `os error
+4551`. A release-profile retry was also blocked while launching the `quote`
+build script. Therefore the final seven-test operations binary is compile-green
+but not claimed runtime-green in this fix round.
+
+The combined `cargo test -p cortex-application` run passed the unit target,
+atomic contract (2), capability contract (4), and memories (5), then WDAC
+blocked the notes binary. Individual retries made notes green, while tasks and
+policy were blocked before execution. These environmental blocks are reported
+as blocks, not passing results.

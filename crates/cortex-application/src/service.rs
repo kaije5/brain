@@ -189,9 +189,8 @@ where
         self.commit(
             context,
             capability,
-            note.id(),
-            note.revision(),
-            note.lifecycle(),
+            None,
+            mutation_result(&context, note.id(), note.revision(), note.lifecycle()),
             vec![AggregateChange::InsertNote(note)],
         )
         .await
@@ -260,9 +259,8 @@ where
         self.commit(
             context,
             capability,
-            entity_id,
-            revision,
-            Lifecycle::Active,
+            Some(entity_id),
+            mutation_result(&context, entity_id, revision, Lifecycle::Active),
             vec![AggregateChange::ReplaceNote {
                 entity_id,
                 expected_revision,
@@ -323,9 +321,8 @@ where
         self.commit(
             context,
             capability,
-            task.id(),
-            task.revision(),
-            task.lifecycle(),
+            None,
+            mutation_result(&context, task.id(), task.revision(), task.lifecycle()),
             vec![AggregateChange::InsertTask(task)],
         )
         .await
@@ -378,9 +375,8 @@ where
         self.commit(
             context,
             capability,
-            entity_id,
-            revision,
-            completed.lifecycle(),
+            Some(entity_id),
+            mutation_result(&context, entity_id, revision, completed.lifecycle()),
             vec![AggregateChange::ReplaceTask {
                 entity_id,
                 expected_revision,
@@ -446,9 +442,8 @@ where
         self.commit(
             context,
             capability,
-            memory.id(),
-            memory.revision(),
-            memory.lifecycle(),
+            None,
+            mutation_result(&context, memory.id(), memory.revision(), memory.lifecycle()),
             vec![AggregateChange::InsertMemory(memory)],
         )
         .await
@@ -530,9 +525,8 @@ where
         self.commit(
             context,
             capability,
-            result_id,
-            result_revision,
-            result_lifecycle,
+            Some(entity_id),
+            mutation_result(&context, result_id, result_revision, result_lifecycle),
             vec![
                 AggregateChange::ReplaceMemory {
                     entity_id,
@@ -631,9 +625,8 @@ where
         self.commit(
             context,
             capability,
-            entity_id,
-            revision,
-            target,
+            Some(entity_id),
+            mutation_result(&context, entity_id, revision, target),
             vec![change],
         )
         .await
@@ -701,9 +694,8 @@ where
         self.commit(
             context,
             capability,
-            entity_id,
-            revision,
-            target,
+            Some(entity_id),
+            mutation_result(&context, entity_id, revision, target),
             vec![change],
         )
         .await
@@ -771,9 +763,8 @@ where
         self.commit(
             context,
             capability,
-            entity_id,
-            revision,
-            target,
+            Some(entity_id),
+            mutation_result(&context, entity_id, revision, target),
             vec![change],
         )
         .await
@@ -791,7 +782,22 @@ where
             .find_result(context.workspace_id, context.operation_id)
             .await?;
         match decision {
-            PolicyDecision::Allow => Ok(previous),
+            PolicyDecision::Allow => match previous {
+                Some(recorded)
+                    if recorded.identity
+                        == crate::OperationIdentity::new(
+                            context.principal_id,
+                            capability,
+                            target_id,
+                        ) =>
+                {
+                    Ok(Some(recorded.result))
+                }
+                Some(_) => Err(ApplicationError::Conflict {
+                    entity: "operation",
+                }),
+                None => Ok(None),
+            },
             PolicyDecision::Deny(deny) => {
                 let error = ApplicationError::PolicyDenied(deny);
                 // A completed operation already has its one canonical atomic audit row.
@@ -826,7 +832,7 @@ where
             let found = self
                 .audit_result(context, capability, target_id, found)
                 .await?;
-            if found.is_none() {
+            if !matches!(found, Some(source) if source.lifecycle() == Lifecycle::Active) {
                 return Err(self
                     .record_error(
                         context,
@@ -845,30 +851,25 @@ where
         &self,
         context: CommandContext,
         capability: Capability,
-        entity_id: EntityId,
-        revision: Revision,
-        lifecycle: Lifecycle,
+        target_id: Option<EntityId>,
+        result: MutationResult,
         changes: Vec<AggregateChange>,
     ) -> Result<MutationResult, ApplicationError> {
-        let result = MutationResult {
-            entity_id,
-            revision,
-            lifecycle,
-            audit_correlation_id: context.correlation_id,
-        };
         let mutation = self
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(result.entity_id),
                 AtomicMutation::new(
                     context,
+                    capability,
+                    target_id,
                     changes,
                     result,
                     audit_event(
                         &context,
                         capability,
-                        Some(entity_id),
+                        Some(result.entity_id),
                         PolicyDecision::Allow,
                         AuditResult::Succeeded,
                     ),
@@ -876,7 +877,7 @@ where
             )
             .await?;
         let executed = self.mutations.execute_once(mutation).await;
-        self.audit_result(&context, capability, Some(entity_id), executed)
+        self.audit_result(&context, capability, Some(result.entity_id), executed)
             .await
     }
 
@@ -1018,5 +1019,19 @@ fn audit_event(
         target_id,
         policy_decision,
         result,
+    }
+}
+
+fn mutation_result(
+    context: &CommandContext,
+    entity_id: EntityId,
+    revision: Revision,
+    lifecycle: Lifecycle,
+) -> MutationResult {
+    MutationResult {
+        entity_id,
+        revision,
+        lifecycle,
+        audit_correlation_id: context.correlation_id,
     }
 }

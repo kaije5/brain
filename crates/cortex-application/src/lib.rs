@@ -19,7 +19,8 @@ pub use cortex_domain::{PolicyDecision, PolicyDeny};
 pub use error::ApplicationError;
 pub use query::{
     AggregateChange, AtomicMutation, AtomicMutationPort, MemoryRepository, NoteRepository,
-    OperationResultRepository, SourceRepository, TaskRepository,
+    OperationIdentity, OperationResultRepository, RecordedOperation, SourceRepository,
+    TaskRepository,
 };
 pub use secrets::{SecretRef, SecretStore};
 pub use service::{
