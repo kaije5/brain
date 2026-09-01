@@ -104,6 +104,8 @@ mod tests {
             "source",
             "memory_assertion",
             "memory_source",
+            "search_document",
+            "search_document_fts",
             "embedding",
             "operation",
             "audit_event",

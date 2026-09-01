@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/cortex-domain", "crates/cortex-application", "crates/cortex-storage"]
+members = [
+    "crates/cortex-domain",
+    "crates/cortex-application",
+    "crates/cortex-search",
+    "crates/cortex-storage",
+]
 resolver = "3"
 
 [workspace.package]

@@ -95,6 +95,45 @@ CREATE TABLE memory_source (
         REFERENCES source(workspace_id, id) ON DELETE RESTRICT
 ) STRICT;
 
+CREATE TABLE search_document (
+    row_id INTEGER PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    entity_kind TEXT NOT NULL CHECK (entity_kind IN ('note', 'task', 'memory', 'source')),
+    snippet TEXT NOT NULL CHECK (length(trim(snippet)) > 0),
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (workspace_id, entity_id),
+    FOREIGN KEY (workspace_id) REFERENCES workspace(id) ON DELETE CASCADE
+) STRICT;
+
+CREATE VIRTUAL TABLE search_document_fts USING fts5(
+    snippet,
+    content = 'search_document',
+    content_rowid = 'row_id',
+    tokenize = 'unicode61'
+);
+
+CREATE TRIGGER search_document_fts_insert
+AFTER INSERT ON search_document
+BEGIN
+    INSERT INTO search_document_fts(rowid, snippet) VALUES (new.row_id, new.snippet);
+END;
+
+CREATE TRIGGER search_document_fts_delete
+AFTER DELETE ON search_document
+BEGIN
+    INSERT INTO search_document_fts(search_document_fts, rowid, snippet)
+    VALUES ('delete', old.row_id, old.snippet);
+END;
+
+CREATE TRIGGER search_document_fts_update
+AFTER UPDATE ON search_document
+BEGIN
+    INSERT INTO search_document_fts(search_document_fts, rowid, snippet)
+    VALUES ('delete', old.row_id, old.snippet);
+    INSERT INTO search_document_fts(rowid, snippet) VALUES (new.row_id, new.snippet);
+END;
+
 CREATE TABLE embedding (
     workspace_id TEXT NOT NULL,
     entity_id TEXT NOT NULL,
@@ -102,12 +141,13 @@ CREATE TABLE embedding (
     model_version TEXT NOT NULL CHECK (length(trim(model_version)) > 0),
     dimensions INTEGER NOT NULL CHECK (dimensions > 0),
     content_hash BLOB NOT NULL,
-    vector BLOB NOT NULL,
+    vector BLOB NOT NULL CHECK (length(vector) = dimensions * 4),
     index_state TEXT NOT NULL CHECK (index_state IN ('pending', 'ready', 'failed')),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (workspace_id, entity_id, model_id, model_version),
-    FOREIGN KEY (workspace_id) REFERENCES workspace(id) ON DELETE CASCADE
+    FOREIGN KEY (workspace_id, entity_id)
+        REFERENCES search_document(workspace_id, entity_id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE operation (

@@ -122,6 +122,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortex-search"
+version = "0.1.0"
+dependencies = [
+ "cortex-application",
+ "cortex-domain",
+ "cortex-storage",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "cortex-storage"
 version = "0.1.0"
 dependencies = [
