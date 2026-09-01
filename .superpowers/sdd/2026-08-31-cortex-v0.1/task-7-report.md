@@ -239,3 +239,61 @@ Review-fix changed paths:
 - `crates/cortex-storage/migrations/0001_initial.sql`
 - `crates/cortex-storage/src/{lib,repositories}.rs`
 - `.superpowers/sdd/2026-08-31-cortex-v0.1/task-7-report.md`
+
+## Review fix round 1 verification continuation (2026-09-02)
+
+The SQLx cache blocker was traced to stale local build artifacts for
+`thiserror`/`thiserror-impl`. After those scoped artifacts were cleaned outside
+the source change, a fresh strict workspace Clippy run reached Cortex code and
+reported one source lint:
+
+```text
+cargo clippy --workspace --all-targets -- -D warnings
+FAIL clippy::items-after-test-module
+crates/cortex-storage/src/repositories.rs:474
+```
+
+Root cause: the SHA-256 unit-test module added in the first review-fix commit
+preceded the existing repository port implementations and decode helpers. The
+test module was moved unchanged to the end of `repositories.rs`. No production
+behavior changed and no lint suppression was added.
+
+Fresh verification after the move:
+
+```text
+cargo fmt --check                                                       PASS
+cargo clippy --workspace --all-targets -- -D warnings                  PASS
+cargo test --workspace                                                  PARTIAL
+  all crates and SQLx compiled successfully
+  11 application tests passed
+  newly linked application `notes` executable blocked before main:
+  Dit bestand is geblokkeerd door een beleid voor toepassingsbeheer. (os error 4551)
+cargo test -p cortex-search                                             PARTIAL
+  degraded: 4 passed
+  fts: 3 passed, including both active-provenance regressions
+  newly linked rank executable blocked before main with os error 4551
+cargo test -p cortex-search --test vector                              BLOCKED
+  newly linked vector executable blocked before main with os error 4551
+cargo test -p cortex-storage --lib canonical_search_hash_is_sha256_of_exact_utf8_text
+                                                                          PASS (1 test)
+```
+
+The stale-cache failure is resolved: the full workspace now compiles and strict
+workspace Clippy passes. The remaining incomplete runtime gate is solely the
+previously documented Windows application-control restriction on selected newly
+linked test executables. No Code Integrity policy was changed.
+
+An immediate final rerun after the selected executables became runnable
+supersedes that partial runtime result:
+
+```text
+cargo test --workspace                                                  PASS (77 tests)
+  cortex-application: 25 passed
+  cortex-domain: 22 passed
+  cortex-search: 13 passed
+  cortex-storage: 17 passed
+```
+
+All Task 7 acceptance gates now pass on the committed source plus this narrow
+test-module-ordering fix: formatting, strict workspace Clippy, the full workspace
+test suite, and diff checks.

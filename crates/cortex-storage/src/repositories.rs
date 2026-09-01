@@ -470,23 +470,6 @@ fn search_content_hash(snippet: &str) -> [u8; 32] {
     hash
 }
 
-#[cfg(test)]
-mod search_tests {
-    use super::search_content_hash;
-
-    #[test]
-    fn canonical_search_hash_is_sha256_of_exact_utf8_text() {
-        assert_eq!(
-            search_content_hash("hello world"),
-            [
-                0xb9, 0x4d, 0x27, 0xb9, 0x93, 0x4d, 0x3e, 0x08, 0xa5, 0x2e, 0x52, 0xd7, 0xda, 0x7d,
-                0xab, 0xfa, 0xc4, 0x84, 0xef, 0xe3, 0x7a, 0x53, 0x80, 0xee, 0x90, 0x88, 0xf7, 0xac,
-                0xe2, 0xef, 0xcd, 0xe9,
-            ]
-        );
-    }
-}
-
 impl NoteRepository for SqliteRepositories {
     async fn find(
         &self,
@@ -812,5 +795,22 @@ fn decode_memory_status(value: &str) -> Result<MemoryStatus, ApplicationError> {
         "superseded" => Ok(MemoryStatus::Superseded),
         "forgotten" => Ok(MemoryStatus::Forgotten),
         _ => Err(storage_error("invalid memory status")),
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::search_content_hash;
+
+    #[test]
+    fn canonical_search_hash_is_sha256_of_exact_utf8_text() {
+        assert_eq!(
+            search_content_hash("hello world"),
+            [
+                0xb9, 0x4d, 0x27, 0xb9, 0x93, 0x4d, 0x3e, 0x08, 0xa5, 0x2e, 0x52, 0xd7, 0xda, 0x7d,
+                0xab, 0xfa, 0xc4, 0x84, 0xef, 0xe3, 0x7a, 0x53, 0x80, 0xee, 0x90, 0x88, 0xf7, 0xac,
+                0xe2, 0xef, 0xcd, 0xe9,
+            ]
+        );
     }
 }
