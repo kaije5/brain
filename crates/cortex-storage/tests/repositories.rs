@@ -3,9 +3,9 @@ use cortex_application::{
     MutationResult, NoteRepository, SourceRepository, TaskRepository,
 };
 use cortex_domain::{
-    AuditEvent, AuditEventId, AuditResult, MemoryAssertion, MemoryAssertionInput, Note, NoteInput,
-    OperationId, PolicyDecision, PrincipalId, Source, SourceInput, SourceRef, Task, TaskInput,
-    WorkspaceId,
+    AuditEvent, AuditEventId, AuditResult, Lifecycle, MemoryAssertion, MemoryAssertionInput, Note,
+    NoteInput, OperationId, PolicyDecision, PrincipalId, Source, SourceInput, SourceRef, Task,
+    TaskInput, WorkspaceId,
 };
 use cortex_storage::{SqliteDatabase, SqliteRepositories};
 use tempfile::TempDir;
@@ -50,16 +50,16 @@ async fn repositories_round_trip_each_aggregate_without_crossing_workspaces() ->
         }],
     })
     .map_err(debug_error)?;
-    let context = context(workspace_id, principal_id);
-    let audit = audit(&context, note.id());
+    let create_context = context(workspace_id, principal_id);
+    let create_audit = audit(&create_context, note.id(), "cortex_note_create");
     let result = MutationResult {
         entity_id: note.id(),
         revision: note.revision(),
         lifecycle: note.lifecycle(),
-        audit_correlation_id: context.correlation_id,
+        audit_correlation_id: create_context.correlation_id,
     };
     let mutation = AtomicMutation::new(
-        context,
+        create_context,
         vec![
             AggregateChange::InsertNote(note.clone()),
             AggregateChange::InsertTask(task.clone()),
@@ -67,7 +67,7 @@ async fn repositories_round_trip_each_aggregate_without_crossing_workspaces() ->
             AggregateChange::InsertMemory(memory.clone()),
         ],
         result,
-        audit,
+        create_audit,
     )
     .map_err(debug_error)?;
     operations
@@ -105,6 +105,56 @@ async fn repositories_round_trip_each_aggregate_without_crossing_workspaces() ->
             .map_err(debug_error)?,
         None
     );
+
+    assert_note_tombstone_visibility(
+        &operations,
+        &repositories,
+        workspace_id,
+        principal_id,
+        &note,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn assert_note_tombstone_visibility(
+    operations: &impl AtomicMutationPort,
+    repositories: &SqliteRepositories,
+    workspace_id: WorkspaceId,
+    principal_id: PrincipalId,
+    note: &Note,
+) -> Result<(), String> {
+    let delete_context = context(workspace_id, principal_id);
+    let delete_revision = note.revision().next().map_err(debug_error)?;
+    let delete_result = MutationResult {
+        entity_id: note.id(),
+        revision: delete_revision,
+        lifecycle: Lifecycle::Deleted,
+        audit_correlation_id: delete_context.correlation_id,
+    };
+    let delete = AtomicMutation::new(
+        delete_context,
+        vec![AggregateChange::DeleteNote {
+            entity_id: note.id(),
+            expected_revision: note.revision(),
+        }],
+        delete_result,
+        audit(&delete_context, note.id(), "cortex_note_delete"),
+    )
+    .map_err(debug_error)?;
+    operations.execute_once(delete).await.map_err(debug_error)?;
+    assert_eq!(
+        NoteRepository::find(repositories, workspace_id, note.id())
+            .await
+            .map_err(debug_error)?,
+        None
+    );
+    let tombstone = NoteRepository::find_history(repositories, workspace_id, note.id())
+        .await
+        .map_err(debug_error)?
+        .ok_or("note tombstone missing")?;
+    assert_eq!(tombstone.lifecycle(), Lifecycle::Deleted);
+    assert_eq!(tombstone.revision(), delete_revision);
     Ok(())
 }
 
@@ -138,14 +188,18 @@ fn context(workspace_id: WorkspaceId, principal_id: PrincipalId) -> CommandConte
     )
 }
 
-fn audit(context: &CommandContext, target_id: cortex_domain::EntityId) -> AuditEvent {
+fn audit(
+    context: &CommandContext,
+    target_id: cortex_domain::EntityId,
+    capability: &'static str,
+) -> AuditEvent {
     AuditEvent {
         id: AuditEventId::new(),
         workspace_id: context.workspace_id,
         principal_id: context.principal_id,
         operation_id: context.operation_id,
         correlation_id: context.correlation_id,
-        capability: "cortex_note_create",
+        capability,
         target_id: Some(target_id),
         policy_decision: PolicyDecision::Allow,
         result: AuditResult::Succeeded,

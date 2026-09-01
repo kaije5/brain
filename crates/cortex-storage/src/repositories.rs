@@ -72,13 +72,30 @@ impl NoteRepository for SqliteRepositories {
     ) -> Result<Option<Note>, ApplicationError> {
         let row = sqlx::query(
             "SELECT id, workspace_id, title, content, revision, lifecycle \
-              FROM note WHERE workspace_id = ? AND id = ?",
+              FROM note WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'",
         )
         .bind(id_text(workspace_id))
         .bind(id_text(entity_id))
         .fetch_optional(&self.pool)
         .await
         .map_err(|_| storage_error("note lookup failed"))?;
+        row.map(|row| decode_note(&row)).transpose()
+    }
+
+    async fn find_history(
+        &self,
+        workspace_id: WorkspaceId,
+        entity_id: EntityId,
+    ) -> Result<Option<Note>, ApplicationError> {
+        let row = sqlx::query(
+            "SELECT id, workspace_id, title, content, revision, lifecycle \
+             FROM note WHERE workspace_id = ? AND id = ?",
+        )
+        .bind(id_text(workspace_id))
+        .bind(id_text(entity_id))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| storage_error("note history lookup failed"))?;
         row.map(|row| decode_note(&row)).transpose()
     }
 }
@@ -91,13 +108,30 @@ impl TaskRepository for SqliteRepositories {
     ) -> Result<Option<Task>, ApplicationError> {
         let row = sqlx::query(
             "SELECT id, workspace_id, title, due_at, status, revision, lifecycle \
-             FROM task WHERE workspace_id = ? AND id = ?",
+             FROM task WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'",
         )
         .bind(id_text(workspace_id))
         .bind(id_text(entity_id))
         .fetch_optional(&self.pool)
         .await
         .map_err(|_| storage_error("task lookup failed"))?;
+        row.map(|row| decode_task(&row)).transpose()
+    }
+
+    async fn find_history(
+        &self,
+        workspace_id: WorkspaceId,
+        entity_id: EntityId,
+    ) -> Result<Option<Task>, ApplicationError> {
+        let row = sqlx::query(
+            "SELECT id, workspace_id, title, due_at, status, revision, lifecycle \
+             FROM task WHERE workspace_id = ? AND id = ?",
+        )
+        .bind(id_text(workspace_id))
+        .bind(id_text(entity_id))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| storage_error("task history lookup failed"))?;
         row.map(|row| decode_task(&row)).transpose()
     }
 }
@@ -130,7 +164,8 @@ impl MemoryRepository for SqliteRepositories {
         let row = sqlx::query(
             "SELECT id, workspace_id, statement, normalized_subject, normalized_predicate, \
              normalized_object, supersedes_id, status, revision, lifecycle \
-             FROM memory_assertion WHERE workspace_id = ? AND id = ?",
+             FROM memory_assertion WHERE workspace_id = ? AND id = ? \
+             AND lifecycle = 'active' AND status = 'active'",
         )
         .bind(id_text(workspace_id))
         .bind(id_text(entity_id))
@@ -155,6 +190,48 @@ impl MemoryRepository for SqliteRepositories {
             .collect::<Result<Vec<_>, _>>()?;
         decode_memory(&row, sources).map(Some)
     }
+
+    async fn find_history(
+        &self,
+        workspace_id: WorkspaceId,
+        entity_id: EntityId,
+    ) -> Result<Option<MemoryAssertion>, ApplicationError> {
+        let row = sqlx::query(
+            "SELECT id, workspace_id, statement, normalized_subject, normalized_predicate, \
+             normalized_object, supersedes_id, status, revision, lifecycle \
+             FROM memory_assertion WHERE workspace_id = ? AND id = ?",
+        )
+        .bind(id_text(workspace_id))
+        .bind(id_text(entity_id))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| storage_error("memory history lookup failed"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let sources = load_memory_sources(&self.pool, workspace_id, entity_id).await?;
+        decode_memory(&row, sources).map(Some)
+    }
+}
+
+async fn load_memory_sources(
+    pool: &SqlitePool,
+    workspace_id: WorkspaceId,
+    entity_id: EntityId,
+) -> Result<Vec<SourceRef>, ApplicationError> {
+    let source_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT source_id FROM memory_source \
+         WHERE workspace_id = ? AND memory_id = ? ORDER BY source_id",
+    )
+    .bind(id_text(workspace_id))
+    .bind(id_text(entity_id))
+    .fetch_all(pool)
+    .await
+    .map_err(|_| storage_error("memory provenance lookup failed"))?;
+    source_ids
+        .iter()
+        .map(|source_id| parse_id(source_id).map(|source_id| SourceRef { source_id }))
+        .collect()
 }
 
 fn decode_note(row: &sqlx::sqlite::SqliteRow) -> Result<Note, ApplicationError> {

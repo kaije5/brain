@@ -7,7 +7,15 @@ use crate::{ApplicationError, MutationResult};
 /// Application-owned persistence port for note aggregates.
 #[allow(async_fn_in_trait)]
 pub trait NoteRepository: Send + Sync {
+    /// Loads only an active note for ordinary query paths.
     async fn find(
+        &self,
+        workspace_id: WorkspaceId,
+        entity_id: EntityId,
+    ) -> Result<Option<Note>, ApplicationError>;
+
+    /// Explicit history access used by lifecycle commands and future history APIs.
+    async fn find_history(
         &self,
         workspace_id: WorkspaceId,
         entity_id: EntityId,
@@ -17,7 +25,15 @@ pub trait NoteRepository: Send + Sync {
 /// Application-owned persistence port for task aggregates.
 #[allow(async_fn_in_trait)]
 pub trait TaskRepository: Send + Sync {
+    /// Loads only an active task for ordinary query paths.
     async fn find(
+        &self,
+        workspace_id: WorkspaceId,
+        entity_id: EntityId,
+    ) -> Result<Option<Task>, ApplicationError>;
+
+    /// Explicit history access used by lifecycle commands and future history APIs.
+    async fn find_history(
         &self,
         workspace_id: WorkspaceId,
         entity_id: EntityId,
@@ -27,7 +43,15 @@ pub trait TaskRepository: Send + Sync {
 /// Application-owned persistence port for memory assertion aggregates.
 #[allow(async_fn_in_trait)]
 pub trait MemoryRepository: Send + Sync {
+    /// Loads only an active, non-superseded memory for ordinary query paths.
     async fn find(
+        &self,
+        workspace_id: WorkspaceId,
+        entity_id: EntityId,
+    ) -> Result<Option<MemoryAssertion>, ApplicationError>;
+
+    /// Explicit history access used by correction/lifecycle commands and history APIs.
+    async fn find_history(
         &self,
         workspace_id: WorkspaceId,
         entity_id: EntityId,
@@ -42,6 +66,20 @@ pub trait SourceRepository: Send + Sync {
         workspace_id: WorkspaceId,
         entity_id: EntityId,
     ) -> Result<Option<Source>, ApplicationError>;
+}
+
+/// Read side of operation idempotency.
+///
+/// This preflight lookup lets retries return their original result before
+/// re-validating now-stale aggregate state. [`AtomicMutationPort`] remains the
+/// authoritative race-safe lookup-and-record boundary.
+#[allow(async_fn_in_trait)]
+pub trait OperationResultRepository: Send + Sync {
+    async fn find_result(
+        &self,
+        workspace_id: WorkspaceId,
+        operation_id: OperationId,
+    ) -> Result<Option<MutationResult>, ApplicationError>;
 }
 
 /// One aggregate change staged for a single atomic mutation transaction.

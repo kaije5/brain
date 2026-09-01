@@ -1,5 +1,6 @@
 use cortex_application::{
     AggregateChange, ApplicationError, AtomicMutation, AtomicMutationPort, MutationResult,
+    OperationResultRepository,
 };
 use cortex_domain::{
     EntityId, Lifecycle, MemoryAssertion, Note, Revision, Source, Task, WorkspaceId,
@@ -41,6 +42,16 @@ impl OperationStore {
         .await
         .map_err(|_| storage_error("operation lookup failed"))?;
         outcome.map(|value| decode_result(&value)).transpose()
+    }
+}
+
+impl OperationResultRepository for OperationStore {
+    async fn find_result(
+        &self,
+        workspace_id: WorkspaceId,
+        operation_id: cortex_domain::OperationId,
+    ) -> Result<Option<MutationResult>, ApplicationError> {
+        self.load_result(workspace_id, operation_id).await
     }
 }
 
