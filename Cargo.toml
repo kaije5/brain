@@ -2,6 +2,7 @@
 members = [
     "crates/cortex-domain",
     "crates/cortex-application",
+    "crates/cortex-inference",
     "crates/cortex-search",
     "crates/cortex-storage",
 ]

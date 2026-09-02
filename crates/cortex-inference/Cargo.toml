@@ -1,0 +1,22 @@
+[package]
+name = "cortex-inference"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { version = "0.4.44", default-features = false, features = ["serde", "std"] }
+cortex-application = { path = "../cortex-application" }
+cortex-domain = { path = "../cortex-domain" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["time"] }
+uuid = { version = "1.24", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
