@@ -67,42 +67,9 @@ async fn file_backed_configuration_discovers_the_same_owner_and_endpoint_after_r
     )
     .await
     .expect("first daemon should start");
-    let first_client = first.paired_client();
-    let first_status = first_client
-        .request(&cortexd::DaemonRequest {
-            protocol_version: cortexd::PROTOCOL_VERSION,
-            request_id: uuid::Uuid::now_v7(),
-            principal_id: uuid::Uuid::now_v7(),
-            operation_id: uuid::Uuid::now_v7(),
-            pairing_proof: first_client.pairing_proof(),
-            capability: "cortex_daemon_status".to_owned(),
-            payload: serde_json::json!({}),
-        })
-        .await
-        .expect("status");
     let second =
         LocalDaemon::start(DaemonConfig::from_database_path(database_path).expect("config"))
             .await
             .expect("second daemon should start");
-    let second_client = second.paired_client();
-    let second_status = second_client
-        .request(&cortexd::DaemonRequest {
-            protocol_version: cortexd::PROTOCOL_VERSION,
-            request_id: uuid::Uuid::now_v7(),
-            principal_id: uuid::Uuid::now_v7(),
-            operation_id: uuid::Uuid::now_v7(),
-            pairing_proof: second_client.pairing_proof(),
-            capability: "cortex_daemon_status".to_owned(),
-            payload: serde_json::json!({}),
-        })
-        .await
-        .expect("status");
-    let cortexd::WireResult::Success { value: first } = first_status.result else {
-        panic!("first status");
-    };
-    let cortexd::WireResult::Success { value: second } = second_status.result else {
-        panic!("second status");
-    };
-    assert_eq!(first["workspace_id"], second["workspace_id"]);
-    assert_eq!(first["principal_id"], second["principal_id"]);
+    assert_eq!(first.ownership_identity(), second.ownership_identity());
 }

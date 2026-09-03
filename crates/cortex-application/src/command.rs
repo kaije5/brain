@@ -63,6 +63,13 @@ pub struct TaskCreateInput {
     pub due_at: Option<DateTime<Utc>>,
 }
 
+/// Replacement task fields; identity and concurrency data are separate command arguments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskUpdateInput {
+    pub title: String,
+    pub due_at: Option<DateTime<Utc>>,
+}
+
 /// Client-safe fields required to create a sourced memory assertion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MemoryCreateInput {

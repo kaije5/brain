@@ -67,6 +67,7 @@ impl Fixture {
             Capability::NoteDelete,
             Capability::NoteRestore,
             Capability::TaskCreate,
+            Capability::TaskUpdate,
             Capability::TaskComplete,
             Capability::TaskDelete,
             Capability::TaskRestore,

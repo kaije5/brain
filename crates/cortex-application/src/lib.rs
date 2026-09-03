@@ -14,7 +14,7 @@ pub use capability::{
 };
 pub use command::{
     CommandContext, MemoryCorrectInput, MemoryCreateInput, MutationResult, NoteCreateInput,
-    NoteUpdateInput, TaskCreateInput,
+    NoteUpdateInput, TaskCreateInput, TaskUpdateInput,
 };
 pub use cortex_domain::{PolicyDecision, PolicyDeny};
 pub use error::ApplicationError;

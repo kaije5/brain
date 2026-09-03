@@ -10,7 +10,7 @@ use crate::{
     AggregateChange, ApplicationError, AtomicMutation, AtomicMutationPort, Capability,
     CommandContext, MemoryCorrectInput, MemoryCreateInput, MemoryRepository, MutationResult,
     NoteCreateInput, NoteRepository, NoteUpdateInput, OperationResultRepository, SourceRepository,
-    TaskCreateInput, TaskRepository,
+    TaskCreateInput, TaskRepository, TaskUpdateInput,
 };
 
 /// A workspace-scoped capability grant issued by Cortex-owned configuration.
@@ -96,6 +96,13 @@ pub trait CortexService: AgentCapabilityExecutor {
         context: CommandContext,
         entity_id: EntityId,
         expected_revision: Revision,
+    ) -> Result<MutationResult, ApplicationError>;
+    async fn update_task(
+        &self,
+        context: CommandContext,
+        entity_id: EntityId,
+        expected_revision: Revision,
+        input: TaskUpdateInput,
     ) -> Result<MutationResult, ApplicationError>;
     async fn delete_task(
         &self,
@@ -381,6 +388,81 @@ where
                 entity_id,
                 expected_revision,
                 task: completed,
+            }],
+        )
+        .await
+    }
+
+    /// # Errors
+    /// Returns not-found, conflict, policy, validation, audit, or storage errors.
+    pub async fn update_task(
+        &self,
+        context: CommandContext,
+        entity_id: EntityId,
+        expected_revision: Revision,
+        input: TaskUpdateInput,
+    ) -> Result<MutationResult, ApplicationError> {
+        let capability = Capability::TaskUpdate;
+        if let Some(result) = self
+            .preflight(&context, capability, Some(entity_id))
+            .await?
+        {
+            return Ok(result);
+        }
+        let loaded =
+            TaskRepository::find_history(&self.repositories, context.workspace_id, entity_id)
+                .await
+                .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "task" }));
+        let task = self
+            .audit_result(&context, capability, Some(entity_id), loaded)
+            .await?;
+        self.audit_result(
+            &context,
+            capability,
+            Some(entity_id),
+            require_state(
+                task.revision(),
+                expected_revision,
+                task.lifecycle(),
+                Lifecycle::Active,
+                "task",
+            ),
+        )
+        .await?;
+        let revision = self
+            .audit_result(
+                &context,
+                capability,
+                Some(entity_id),
+                expected_revision.next().map_err(ApplicationError::from),
+            )
+            .await?;
+        let updated = self
+            .audit_result(
+                &context,
+                capability,
+                Some(entity_id),
+                Task::rehydrate(
+                    entity_id,
+                    context.workspace_id,
+                    input.title,
+                    input.due_at,
+                    task.status(),
+                    revision,
+                    Lifecycle::Active,
+                )
+                .map_err(ApplicationError::from),
+            )
+            .await?;
+        self.commit(
+            context,
+            capability,
+            Some(entity_id),
+            mutation_result(&context, entity_id, revision, Lifecycle::Active),
+            vec![AggregateChange::ReplaceTask {
+                entity_id,
+                expected_revision,
+                task: updated,
             }],
         )
         .await

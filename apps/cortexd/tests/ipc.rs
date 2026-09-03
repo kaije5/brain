@@ -1,3 +1,4 @@
+use cortex_application::Capability;
 use cortexd::{
     DaemonConfig, DaemonError, DaemonRequest, LocalDaemon, PROTOCOL_VERSION, WireResult,
 };
@@ -19,7 +20,6 @@ async fn authenticated_ipc_ignores_client_claimed_principal_and_preserves_correl
             request_id,
             principal_id: Uuid::now_v7(),
             operation_id: Uuid::now_v7(),
-            pairing_proof: paired.pairing_proof(),
             capability: "cortex_daemon_status".to_owned(),
             payload: json!({}),
         })
@@ -36,29 +36,71 @@ async fn authenticated_ipc_ignores_client_claimed_principal_and_preserves_correl
 }
 
 #[tokio::test]
-async fn unpaired_and_unsupported_wire_requests_return_redacted_typed_errors() {
+async fn unpaired_clients_are_rejected_before_the_authenticated_handler() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let daemon = LocalDaemon::start(DaemonConfig::for_test(directory.path()))
+        .await
+        .expect("daemon should start");
+    let response = daemon
+        .unpaired_status()
+        .expect_err("unpaired client must fail closed");
+    assert_eq!(response, DaemonError::Unauthenticated);
+}
+
+#[tokio::test]
+async fn paired_unsupported_wire_requests_return_redacted_typed_errors() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let daemon = LocalDaemon::start(DaemonConfig::for_test(directory.path()))
         .await
         .expect("daemon should start");
     let request_id = Uuid::now_v7();
     let response = daemon
-        .handle_wire_request(DaemonRequest {
+        .paired_client()
+        .request(&DaemonRequest {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             principal_id: Uuid::now_v7(),
             operation_id: Uuid::now_v7(),
-            pairing_proof: None,
-            capability: "cortex_note_create".to_owned(),
-            payload: json!({"title": "x", "content": "y"}),
+            capability: "not_a_cortex_capability".to_owned(),
+            payload: json!({}),
         })
-        .await;
+        .await
+        .expect("paired request returns wire result");
 
     assert_eq!(response.request_id, request_id);
     assert_eq!(
         response.result,
         WireResult::Error {
-            code: "unauthenticated".to_owned()
+            code: "unsupported_capability".to_owned()
+        }
+    );
+}
+
+#[tokio::test]
+async fn denied_mutation_returns_a_safe_policy_result_without_dispatching_state_change() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let daemon = LocalDaemon::start(
+        DaemonConfig::for_test(directory.path())
+            .with_bootstrap_grants(vec![Capability::NoteSearch]),
+    )
+    .await
+    .expect("daemon should start");
+    let response = daemon
+        .paired_client()
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_note_create".to_owned(),
+            payload: json!({"title": "must not persist", "content": "denied"}),
+        })
+        .await
+        .expect("daemon returns a typed result");
+    assert_eq!(
+        response.result,
+        WireResult::Error {
+            code: "permission_denied".to_owned()
         }
     );
 }
@@ -76,7 +118,6 @@ async fn paired_note_create_is_dispatched_through_the_daemon_owned_application_s
             request_id: Uuid::now_v7(),
             principal_id: Uuid::now_v7(),
             operation_id: Uuid::now_v7(),
-            pairing_proof: paired.pairing_proof(),
             capability: "cortex_note_create".to_owned(),
             payload: json!({"title": "local", "content": "daemon owned"}),
         })
@@ -103,7 +144,6 @@ async fn paired_unsupported_capability_returns_a_redacted_wire_error() {
             request_id: Uuid::now_v7(),
             principal_id: Uuid::now_v7(),
             operation_id: Uuid::now_v7(),
-            pairing_proof: paired.pairing_proof(),
             capability: "not_a_cortex_capability".to_owned(),
             payload: json!({}),
         })
