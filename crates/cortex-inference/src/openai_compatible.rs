@@ -7,14 +7,65 @@ use serde_json::{Value, json};
 use crate::{InferenceMessage, InferenceProvider, InferenceRequest, InferenceResponse, ToolCall};
 
 const MAX_MODEL_NAME_BYTES: usize = 256;
+const MAX_CONFIGURED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONFIGURED_EMBEDDING_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_CONFIGURED_EMBEDDING_DIMENSIONS: usize = 1024 * 1024;
 
-/// Validated configuration for a loopback OpenAI-compatible chat endpoint.
+/// Allocation limits enforced by the OpenAI-compatible boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderLimits {
+    response_bytes: usize,
+    embedding_input_bytes: usize,
+    embedding_dimensions: usize,
+}
+
+impl ProviderLimits {
+    /// Validates finite non-zero provider allocation limits.
+    ///
+    /// # Errors
+    /// Returns a validation error when a limit is zero or exceeds the v0.1 ceiling.
+    pub const fn new(
+        max_response_bytes: usize,
+        max_embedding_input_bytes: usize,
+        max_embedding_dimensions: usize,
+    ) -> Result<Self, ApplicationError> {
+        if max_response_bytes == 0 || max_response_bytes > MAX_CONFIGURED_RESPONSE_BYTES {
+            return Err(ApplicationError::Validation {
+                field: "max_response_bytes",
+            });
+        }
+        if max_embedding_input_bytes == 0
+            || max_embedding_input_bytes > MAX_CONFIGURED_EMBEDDING_INPUT_BYTES
+        {
+            return Err(ApplicationError::Validation {
+                field: "max_embedding_input_bytes",
+            });
+        }
+        if max_embedding_dimensions == 0
+            || max_embedding_dimensions > MAX_CONFIGURED_EMBEDDING_DIMENSIONS
+        {
+            return Err(ApplicationError::Validation {
+                field: "max_embedding_dimensions",
+            });
+        }
+        Ok(Self {
+            response_bytes: max_response_bytes,
+            embedding_input_bytes: max_embedding_input_bytes,
+            embedding_dimensions: max_embedding_dimensions,
+        })
+    }
+}
+
+/// Validated configuration for loopback OpenAI-compatible operation routes.
 #[derive(Clone, Debug)]
 pub struct OpenAiCompatibleConfig {
-    endpoint: reqwest::Url,
+    base_url: reqwest::Url,
+    chat_endpoint: reqwest::Url,
+    embedding_endpoint: reqwest::Url,
     model: String,
     secret_reference: Option<SecretRef>,
     timeout: Duration,
+    limits: ProviderLimits,
 }
 
 impl OpenAiCompatibleConfig {
@@ -23,19 +74,36 @@ impl OpenAiCompatibleConfig {
     /// # Errors
     /// Returns a safe validation error for malformed or non-loopback configuration.
     pub fn new(
-        endpoint: impl AsRef<str>,
+        base_url: impl AsRef<str>,
         model: impl Into<String>,
         secret_reference: Option<SecretRef>,
         timeout: Duration,
+        limits: ProviderLimits,
     ) -> Result<Self, ApplicationError> {
-        let endpoint = reqwest::Url::parse(endpoint.as_ref())
+        let mut base_url = reqwest::Url::parse(base_url.as_ref())
             .map_err(|_| ApplicationError::Validation { field: "endpoint" })?;
-        let valid_scheme = matches!(endpoint.scheme(), "http" | "https");
-        let valid_authority = endpoint.username().is_empty() && endpoint.password().is_none();
-        let loopback = endpoint.host_str().is_some_and(is_loopback_host);
-        if !valid_scheme || !valid_authority || !loopback {
+        let valid_scheme = matches!(base_url.scheme(), "http" | "https");
+        let valid_authority = base_url.username().is_empty() && base_url.password().is_none();
+        let loopback = base_url.host_str().is_some_and(is_loopback_host);
+        if !valid_scheme
+            || !valid_authority
+            || !loopback
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
             return Err(ApplicationError::Validation { field: "endpoint" });
         }
+        if !base_url.path().ends_with('/') {
+            let mut path = base_url.path().to_owned();
+            path.push('/');
+            base_url.set_path(&path);
+        }
+        let chat_endpoint = base_url
+            .join("chat/completions")
+            .map_err(|_| ApplicationError::Validation { field: "endpoint" })?;
+        let embedding_endpoint = base_url
+            .join("embeddings")
+            .map_err(|_| ApplicationError::Validation { field: "endpoint" })?;
 
         let model = model.into();
         if model.trim().is_empty()
@@ -49,16 +117,29 @@ impl OpenAiCompatibleConfig {
         }
 
         Ok(Self {
-            endpoint,
+            base_url,
+            chat_endpoint,
+            embedding_endpoint,
             model,
             secret_reference,
             timeout,
+            limits,
         })
     }
 
     #[must_use]
-    pub fn endpoint(&self) -> &str {
-        self.endpoint.as_str()
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_str()
+    }
+
+    #[must_use]
+    pub fn chat_endpoint(&self) -> &str {
+        self.chat_endpoint.as_str()
+    }
+
+    #[must_use]
+    pub fn embedding_endpoint(&self) -> &str {
+        self.embedding_endpoint.as_str()
     }
 
     #[must_use]
@@ -75,6 +156,11 @@ impl OpenAiCompatibleConfig {
     pub const fn timeout(&self) -> Duration {
         self.timeout
     }
+
+    #[must_use]
+    pub const fn limits(&self) -> ProviderLimits {
+        self.limits
+    }
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -89,6 +175,7 @@ fn is_loopback_host(host: &str) -> bool {
 pub enum TransportError {
     Timeout,
     Unavailable,
+    ResponseTooLarge,
 }
 
 /// Injectable JSON transport boundary for deterministic adapter tests.
@@ -99,7 +186,8 @@ pub trait OpenAiTransport: Send + Sync {
         endpoint: &str,
         body: Value,
         timeout: Duration,
-    ) -> Result<Value, TransportError>;
+        max_response_bytes: usize,
+    ) -> Result<Vec<u8>, TransportError>;
 }
 
 /// Reusable Reqwest transport for a configured local model server.
@@ -122,8 +210,9 @@ impl OpenAiTransport for ReqwestOpenAiTransport {
         endpoint: &str,
         body: Value,
         timeout: Duration,
-    ) -> Result<Value, TransportError> {
-        let response = self
+        max_response_bytes: usize,
+    ) -> Result<Vec<u8>, TransportError> {
+        let mut response = self
             .client
             .post(endpoint)
             .timeout(timeout)
@@ -133,10 +222,28 @@ impl OpenAiTransport for ReqwestOpenAiTransport {
             .map_err(|error| classify_reqwest_error(&error))?
             .error_for_status()
             .map_err(|error| classify_reqwest_error(&error))?;
-        response
-            .json()
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_response_bytes as u64)
+        {
+            return Err(TransportError::ResponseTooLarge);
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|error| classify_reqwest_error(&error))
+            .map_err(|error| classify_reqwest_error(&error))?
+        {
+            let next_len = body
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(TransportError::ResponseTooLarge)?;
+            if next_len > max_response_bytes {
+                return Err(TransportError::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
     }
 }
 
@@ -187,10 +294,15 @@ where
         let body = encode_request(&self.config.model, request)?;
         let response = self
             .transport
-            .post_json(self.config.endpoint(), body, self.config.timeout)
+            .post_json(
+                self.config.chat_endpoint(),
+                body,
+                self.config.timeout,
+                self.config.limits.response_bytes,
+            )
             .await
             .map_err(map_transport_error)?;
-        decode_response(response)
+        decode_response(&response)
     }
 }
 
@@ -199,7 +311,7 @@ where
     T: OpenAiTransport,
 {
     async fn embed(&self, text: &str) -> Result<Embedding, ApplicationError> {
-        if text.trim().is_empty() {
+        if text.trim().is_empty() || text.len() > self.config.limits.embedding_input_bytes {
             return Err(ApplicationError::Validation {
                 field: "embedding_text",
             });
@@ -207,16 +319,21 @@ where
         let response = self
             .transport
             .post_json(
-                self.config.endpoint(),
+                self.config.embedding_endpoint(),
                 json!({
                     "model": self.config.model,
                     "input": text,
                 }),
                 self.config.timeout,
+                self.config.limits.response_bytes,
             )
             .await
             .map_err(map_transport_error)?;
-        decode_embedding(&self.config.model, response)
+        decode_embedding(
+            &self.config.model,
+            &response,
+            self.config.limits.embedding_dimensions,
+        )
     }
 }
 
@@ -224,6 +341,9 @@ fn map_transport_error(error: TransportError) -> ApplicationError {
     match error {
         TransportError::Timeout => ApplicationError::InferenceTimeout,
         TransportError::Unavailable => ApplicationError::InferenceUnavailable,
+        TransportError::ResponseTooLarge => ApplicationError::MalformedModelOutput {
+            reason: "provider response exceeded configured byte limit",
+        },
     }
 }
 
@@ -336,9 +456,9 @@ struct OpenAiEmbeddingData {
     embedding: Vec<f32>,
 }
 
-fn decode_response(response: Value) -> Result<InferenceResponse, ApplicationError> {
+fn decode_response(response: &[u8]) -> Result<InferenceResponse, ApplicationError> {
     let response: OpenAiResponse =
-        serde_json::from_value(response).map_err(|_| ApplicationError::MalformedModelOutput {
+        serde_json::from_slice(response).map_err(|_| ApplicationError::MalformedModelOutput {
             reason: "invalid OpenAI-compatible response",
         })?;
     let choice =
@@ -364,9 +484,13 @@ fn decode_response(response: Value) -> Result<InferenceResponse, ApplicationErro
     })
 }
 
-fn decode_embedding(model: &str, response: Value) -> Result<Embedding, ApplicationError> {
+fn decode_embedding(
+    model: &str,
+    response: &[u8],
+    max_dimensions: usize,
+) -> Result<Embedding, ApplicationError> {
     let response: OpenAiEmbeddingResponse =
-        serde_json::from_value(response).map_err(|_| ApplicationError::MalformedModelOutput {
+        serde_json::from_slice(response).map_err(|_| ApplicationError::MalformedModelOutput {
             reason: "invalid OpenAI-compatible embedding response",
         })?;
     let values =
@@ -377,6 +501,11 @@ fn decode_embedding(model: &str, response: Value) -> Result<Embedding, Applicati
             .ok_or(ApplicationError::MalformedModelOutput {
                 reason: "embedding response contained no data",
             })?;
+    if values.embedding.len() > max_dimensions {
+        return Err(ApplicationError::MalformedModelOutput {
+            reason: "embedding response exceeded configured dimension limit",
+        });
+    }
     Embedding::new(model, model, values.embedding).map_err(|_| {
         ApplicationError::MalformedModelOutput {
             reason: "embedding response contained an invalid vector",

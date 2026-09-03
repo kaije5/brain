@@ -1,16 +1,14 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     num::{NonZeroU64, NonZeroUsize},
     sync::Arc,
     time::Duration,
 };
 
 use chrono::{DateTime, Utc};
-use cortex_application::{
-    AgentCapabilityExecutor, ApplicationError, Capability, CapabilityCatalog, CommandContext,
-};
+use cortex_application::{AgentCapabilityExecutor, ApplicationError, Capability, CommandContext};
 use cortex_domain::OperationId;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
 use serde_json::{Value, json};
 use uuid::{Uuid, Version};
 
@@ -24,6 +22,8 @@ const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_TOOL_CALLS_PER_RESPONSE: usize = 32;
 const MAX_TOOL_CALL_ID_BYTES: usize = 256;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
+const MAX_CONFIGURED_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_CONFIGURED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
 /// Hard limits applied to one local agent run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +32,8 @@ pub struct AgentLimits {
     pub timeout: Duration,
     /// Maximum permitted occurrences of one call ID. A value of one rejects repeats.
     pub max_duplicate_calls: u8,
+    pub max_message_bytes: usize,
+    pub max_request_bytes: usize,
 }
 
 impl AgentLimits {
@@ -43,6 +45,8 @@ impl AgentLimits {
         max_iterations: u8,
         timeout: Duration,
         max_duplicate_calls: u8,
+        max_message_bytes: usize,
+        max_request_bytes: usize,
     ) -> Result<Self, ApplicationError> {
         if max_iterations == 0 {
             return Err(ApplicationError::Validation {
@@ -57,11 +61,59 @@ impl AgentLimits {
                 field: "max_duplicate_calls",
             });
         }
+        if max_message_bytes == 0 || max_message_bytes > MAX_CONFIGURED_MESSAGE_BYTES {
+            return Err(ApplicationError::Validation {
+                field: "max_message_bytes",
+            });
+        }
+        if max_request_bytes == 0 || max_request_bytes > MAX_CONFIGURED_REQUEST_BYTES {
+            return Err(ApplicationError::Validation {
+                field: "max_request_bytes",
+            });
+        }
         Ok(Self {
             max_iterations,
             timeout,
             max_duplicate_calls,
+            max_message_bytes,
+            max_request_bytes,
         })
+    }
+}
+
+/// The exact capability set authorized for one agent run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthorizedCapabilities {
+    capabilities: BTreeSet<Capability>,
+}
+
+impl AuthorizedCapabilities {
+    /// Builds an authorization set while rejecting ambiguous duplicate grants.
+    ///
+    /// # Errors
+    /// Returns a validation error when a capability occurs more than once.
+    pub fn new(
+        capabilities: impl IntoIterator<Item = Capability>,
+    ) -> Result<Self, ApplicationError> {
+        let mut validated = BTreeSet::new();
+        for capability in capabilities {
+            if !validated.insert(capability) {
+                return Err(ApplicationError::Validation {
+                    field: "allowed_capabilities",
+                });
+            }
+        }
+        Ok(Self {
+            capabilities: validated,
+        })
+    }
+
+    fn contains(&self, capability: Capability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
+        self.capabilities.iter().copied()
     }
 }
 
@@ -72,7 +124,6 @@ where
     S: AgentCapabilityExecutor,
 {
     provider: Arc<P>,
-    catalog: CapabilityCatalog,
     service: Arc<S>,
     limits: AgentLimits,
 }
@@ -86,7 +137,6 @@ where
     pub const fn new(provider: Arc<P>, service: Arc<S>, limits: AgentLimits) -> Self {
         Self {
             provider,
-            catalog: CapabilityCatalog,
             service,
             limits,
         }
@@ -100,79 +150,134 @@ where
         &self,
         context: CommandContext,
         prompt: &str,
+        allowed_capabilities: AuthorizedCapabilities,
     ) -> Result<String, ApplicationError> {
         if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES {
             return Err(ApplicationError::Validation { field: "prompt" });
         }
-        tokio::time::timeout(self.limits.timeout, self.run_inner(context, prompt))
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.limits.timeout)
+            .ok_or(ApplicationError::Validation { field: "timeout" })?;
+        self.run_inner(context, prompt, &allowed_capabilities, deadline)
             .await
-            .map_err(|_| ApplicationError::InferenceTimeout)?
     }
 
     async fn run_inner(
         &self,
         context: CommandContext,
         prompt: &str,
+        allowed_capabilities: &AuthorizedCapabilities,
+        deadline: tokio::time::Instant,
     ) -> Result<String, ApplicationError> {
-        let tools: Vec<InferenceTool> = catalog_capabilities(&self.catalog)
-            .iter()
-            .copied()
-            .map(inference_tool)
-            .collect();
+        let tools: Vec<InferenceTool> = allowed_capabilities.iter().map(inference_tool).collect();
         let mut messages = vec![InferenceMessage::User {
             content: prompt.to_owned(),
         }];
-        let mut seen_call_ids = BTreeSet::new();
+        let mut call_states = BTreeMap::<String, CallState>::new();
 
         for _ in 0..self.limits.max_iterations {
-            let response = self
-                .provider
-                .complete(InferenceRequest {
-                    messages: messages.clone(),
-                    tools: tools.clone(),
-                })
-                .await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ApplicationError::InferenceTimeout);
+            }
+            let request = InferenceRequest {
+                messages: messages.clone(),
+                tools: tools.clone(),
+            };
+            enforce_serialized_limit(
+                &request,
+                self.limits.max_request_bytes,
+                "agent request exceeded configured byte limit",
+            )?;
+            let response = tokio::time::timeout_at(deadline, self.provider.complete(request))
+                .await
+                .map_err(|_| ApplicationError::InferenceTimeout)??;
             if response.tool_calls.is_empty() {
-                return final_content(response);
+                return final_content(response, self.limits.max_message_bytes);
             }
             if response.tool_calls.len() > MAX_TOOL_CALLS_PER_RESPONSE {
                 return malformed("too many tool calls in one response");
             }
 
-            messages.push(InferenceMessage::Assistant {
+            let assistant_message = InferenceMessage::Assistant {
                 content: response.content,
                 tool_calls: response.tool_calls.clone(),
-            });
+            };
+            enforce_serialized_limit(
+                &assistant_message,
+                self.limits.max_message_bytes,
+                "assistant response exceeded configured byte limit",
+            )?;
+            for call in &response.tool_calls {
+                validate_call_identity(call)?;
+            }
+            messages.push(assistant_message);
             for call in response.tool_calls {
-                validate_call_identity(&call)?;
-                let repeated = seen_call_ids.contains(&call.id);
-                let occurrences = u8::from(repeated).saturating_add(1);
-                if repeated || occurrences > self.limits.max_duplicate_calls {
-                    return malformed("duplicate tool call ID");
-                }
-                seen_call_ids.insert(call.id.clone());
                 let capability = Capability::from_mcp_name(&call.name).ok_or(
                     ApplicationError::MalformedModelOutput {
                         reason: "unknown tool name",
                     },
                 )?;
+                if !allowed_capabilities.contains(capability) {
+                    return malformed("tool is outside authorized capability set");
+                }
                 let payload = validated_arguments(capability, &call.arguments)?;
+                let tool_context = next_tool_context(
+                    context,
+                    &call.id,
+                    &mut call_states,
+                    self.limits.max_duplicate_calls,
+                )?;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ApplicationError::InferenceTimeout);
+                }
                 let result = self
                     .service
-                    .execute_agent_tool(fresh_tool_context(context), capability, payload)
+                    .execute_agent_tool(tool_context, capability, payload)
                     .await?;
-                messages.push(InferenceMessage::Tool {
+                let tool_message = InferenceMessage::Tool {
                     call_id: call.id,
                     content: result,
-                });
+                };
+                enforce_serialized_limit(
+                    &tool_message,
+                    self.limits.max_message_bytes,
+                    "tool result exceeded configured byte limit",
+                )?;
+                messages.push(tool_message);
             }
         }
         malformed("agent iteration limit exceeded")
     }
 }
 
-fn catalog_capabilities(_catalog: &CapabilityCatalog) -> &'static [Capability] {
-    CapabilityCatalog::all()
+#[derive(Clone, Copy)]
+struct CallState {
+    occurrences: u8,
+    context: CommandContext,
+}
+
+fn next_tool_context(
+    base: CommandContext,
+    call_id: &str,
+    states: &mut BTreeMap<String, CallState>,
+    max_occurrences: u8,
+) -> Result<CommandContext, ApplicationError> {
+    if let Some(state) = states.get_mut(call_id) {
+        if state.occurrences >= max_occurrences {
+            return malformed("duplicate tool call ID exceeded configured occurrence limit");
+        }
+        state.occurrences = state.occurrences.saturating_add(1);
+        return Ok(state.context);
+    }
+    let context = fresh_tool_context(base);
+    states.insert(
+        call_id.to_owned(),
+        CallState {
+            occurrences: 1,
+            context,
+        },
+    );
+    Ok(context)
 }
 
 fn fresh_tool_context(base: CommandContext) -> CommandContext {
@@ -184,13 +289,33 @@ fn fresh_tool_context(base: CommandContext) -> CommandContext {
     )
 }
 
-fn final_content(response: InferenceResponse) -> Result<String, ApplicationError> {
+fn final_content(
+    response: InferenceResponse,
+    max_message_bytes: usize,
+) -> Result<String, ApplicationError> {
+    enforce_serialized_limit(
+        &response,
+        max_message_bytes,
+        "assistant response exceeded configured byte limit",
+    )?;
     response
         .content
         .filter(|content| !content.trim().is_empty() && content.len() <= MAX_TEXT_BYTES)
         .ok_or(ApplicationError::MalformedModelOutput {
             reason: "response contained neither valid text nor tool calls",
         })
+}
+
+fn enforce_serialized_limit<T: Serialize>(
+    value: &T,
+    limit: usize,
+    reason: &'static str,
+) -> Result<(), ApplicationError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| ApplicationError::Internal)?;
+    if bytes.len() > limit {
+        return malformed(reason);
+    }
+    Ok(())
 }
 
 fn validate_call_identity(call: &ToolCall) -> Result<(), ApplicationError> {
@@ -391,7 +516,7 @@ fn validate_capability_semantics(
     }
     if capability == Capability::TaskUpdate
         && value.get("title").is_none_or(Value::is_null)
-        && value.get("due_at").is_none_or(Value::is_null)
+        && value.get("due_at").is_none()
     {
         return malformed("task update contains no change");
     }
@@ -471,8 +596,8 @@ struct TaskUpdateArguments {
     expected_revision: NonZeroU64,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    due_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "UpdateField::is_missing")]
+    due_at: UpdateField<DateTime<Utc>>,
 }
 
 #[derive(serde::Deserialize, Serialize)]
@@ -539,5 +664,49 @@ impl TryFrom<Uuid> for V7Uuid {
 impl From<V7Uuid> for Uuid {
     fn from(value: V7Uuid) -> Self {
         value.0
+    }
+}
+
+#[derive(Default)]
+enum UpdateField<T> {
+    #[default]
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<T> UpdateField<T> {
+    const fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for UpdateField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(|value| match value {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
+}
+
+impl<T> Serialize for UpdateField<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Missing | Self::Null => serializer.serialize_none(),
+            Self::Value(value) => value.serialize(serializer),
+        }
     }
 }
