@@ -369,9 +369,29 @@ where
         .read_exact(&mut bytes)
         .await
         .map_err(|_| DaemonError::TransportUnavailable)?;
-    let request = daemon.decode_request(&bytes)?;
-    let response = daemon.handle_wire_request(request).await;
+    let response = match daemon.decode_request(&bytes) {
+        Ok(request) => daemon.handle_wire_request(request).await,
+        Err(error) => {
+            let request_id = recover_request_id(&bytes).ok_or(DaemonError::InvalidRequest)?;
+            DaemonResponse {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                result: WireResult::Error {
+                    code: error.wire_code().to_owned(),
+                },
+            }
+        }
+    };
     write_response(stream, &response).await
+}
+
+fn recover_request_id(bytes: &[u8]) -> Option<Uuid> {
+    #[derive(Deserialize)]
+    struct RequestId {
+        request_id: Uuid,
+    }
+    let request_id = serde_json::from_slice::<RequestId>(bytes).ok()?.request_id;
+    is_v7(request_id).then_some(request_id)
 }
 
 async fn write_response<S>(stream: &mut S, response: &DaemonResponse) -> Result<(), DaemonError>
