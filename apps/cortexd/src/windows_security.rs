@@ -5,13 +5,16 @@
 
 use std::{ffi::c_void, mem::size_of, ptr::null_mut};
 
+use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, LocalFree},
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         },
-        GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
+        PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
     },
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
@@ -60,6 +63,46 @@ pub fn create_current_user_server(
     let mut security = CurrentUserPipeSecurity::new()
         .map_err(|()| std::io::Error::other("current-user pipe DACL unavailable"))?;
     security.create_server(options, name)
+}
+
+/// Applies the same protected current-user DACL to a pairing enrollment artifact.
+pub fn restrict_current_user_file(path: &std::path::Path) -> Result<(), ()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let security = CurrentUserPipeSecurity::new()?;
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl = null_mut();
+    // SAFETY: security owns a valid descriptor and all out-pointers are valid for this call.
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            security.descriptor.cast(),
+            &raw mut present,
+            &raw mut dacl,
+            &raw mut defaulted,
+        )
+    } == 0
+        || present == 0
+        || dacl.is_null()
+    {
+        return Err(());
+    }
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: wide is NUL-terminated, dacl points into the live descriptor, and the path names
+    // the just-created enrollment file.
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null_mut(),
+        )
+    };
+    (status == 0).then_some(()).ok_or(())
 }
 
 impl Drop for CurrentUserPipeSecurity {

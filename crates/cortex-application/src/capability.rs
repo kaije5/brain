@@ -18,6 +18,7 @@ pub enum Capability {
     MemoryRestore,
     MemorySearch,
     KnowledgeRetrieve,
+    AgentRun,
 }
 
 /// Whether Cortex needs to retain audit evidence for a capability invocation.
@@ -211,6 +212,13 @@ const KNOWLEDGE_RETRIEVE: CapabilityMetadata = query_metadata!(
     "KnowledgeSearchRequest",
     "KnowledgeSearchResultList"
 );
+const AGENT_RUN: CapabilityMetadata = query_metadata!(
+    Capability::AgentRun,
+    "cortex_agent_run",
+    "Run the bounded local agent",
+    "AgentRunRequest",
+    "AgentRunResult"
+);
 
 impl Capability {
     #[must_use]
@@ -233,6 +241,7 @@ impl Capability {
             Self::MemoryRestore => MEMORY_RESTORE,
             Self::MemorySearch => MEMORY_SEARCH,
             Self::KnowledgeRetrieve => KNOWLEDGE_RETRIEVE,
+            Self::AgentRun => AGENT_RUN,
         }
     }
 
@@ -269,6 +278,7 @@ impl CapabilityCatalog {
             Capability::MemoryRestore,
             Capability::MemorySearch,
             Capability::KnowledgeRetrieve,
+            Capability::AgentRun,
         ]
     }
 }

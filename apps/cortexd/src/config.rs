@@ -16,9 +16,8 @@ pub struct DaemonConfig {
     pub(crate) principal_id: PrincipalId,
     pub(crate) inference_secret: Option<SecretRef>,
     pub(crate) pairing_verifier: VerifyingKey,
-    // This test/composition-only signer is never serialized into discovery. A future IPC client
-    // receives its paired private key via the platform secret store, not this record.
     pub(crate) pairing_signer: SigningKey,
+    pub(crate) pairing_key_path: PathBuf,
     pub(crate) discovery_path: PathBuf,
     pub(crate) bootstrap_grants: Vec<Capability>,
 }
@@ -52,6 +51,7 @@ impl DaemonConfig {
             inference_secret: None,
             pairing_verifier: signer.verifying_key(),
             pairing_signer: signer,
+            pairing_key_path: pairing_key_path(&discovery_path),
             discovery_path,
             bootstrap_grants: CapabilityCatalog::all().to_vec(),
         }
@@ -66,11 +66,18 @@ impl DaemonConfig {
             return Err(crate::DaemonError::InvalidConfiguration);
         }
         let discovery_path = database_path.with_extension("cortexd-discovery.json");
+        let pairing_key_path = pairing_key_path(&discovery_path);
         if discovery_path.exists() {
             let bytes =
                 fs::read(&discovery_path).map_err(|_| crate::DaemonError::InvalidConfiguration)?;
             let discovery: Discovery = serde_json::from_slice(&bytes)
                 .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+            let pairing_signer = load_pairing_signer(&pairing_key_path)?;
+            let pairing_verifier = VerifyingKey::from_bytes(&discovery.pairing_verifier)
+                .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+            if pairing_signer.verifying_key() != pairing_verifier {
+                return Err(crate::DaemonError::InvalidConfiguration);
+            }
             return Ok(Self {
                 database_path,
                 endpoint_name: discovery.endpoint_name,
@@ -79,9 +86,9 @@ impl DaemonConfig {
                 principal_id: PrincipalId::try_from(discovery.principal_id)
                     .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
                 inference_secret: None,
-                pairing_verifier: VerifyingKey::from_bytes(&discovery.pairing_verifier)
-                    .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
-                pairing_signer: fresh_signing_key(),
+                pairing_verifier,
+                pairing_signer,
+                pairing_key_path,
                 discovery_path,
                 bootstrap_grants: CapabilityCatalog::all().to_vec(),
             });
@@ -93,6 +100,7 @@ impl DaemonConfig {
             PrincipalId::new(),
             discovery_path,
         );
+        config.write_pairing_key()?;
         config.write_discovery()?;
         Ok(config)
     }
@@ -112,6 +120,13 @@ impl DaemonConfig {
         self
     }
 
+    /// Opens the separate, per-user pairing enrollment artifact for a local client. The private
+    /// key is never part of the discovery record or an IPC request.
+    #[must_use]
+    pub fn provisioned_client(&self) -> crate::ProvisionedLocalClient {
+        crate::ProvisionedLocalClient::new(self.pairing_signer.clone())
+    }
+
     pub(crate) fn write_discovery(&self) -> Result<(), crate::DaemonError> {
         let discovery = Discovery {
             endpoint_name: self.endpoint_name.clone(),
@@ -122,6 +137,42 @@ impl DaemonConfig {
         let bytes =
             serde_json::to_vec(&discovery).map_err(|_| crate::DaemonError::InvalidConfiguration)?;
         fs::write(&self.discovery_path, bytes).map_err(|_| crate::DaemonError::InvalidConfiguration)
+    }
+
+    pub(crate) fn ensure_pairing_key(&self) -> Result<(), crate::DaemonError> {
+        if self.pairing_key_path.exists() {
+            let signer = load_pairing_signer(&self.pairing_key_path)?;
+            return (signer.verifying_key() == self.pairing_verifier)
+                .then_some(())
+                .ok_or(crate::DaemonError::InvalidConfiguration);
+        }
+        self.write_pairing_key()
+    }
+
+    fn write_pairing_key(&self) -> Result<(), crate::DaemonError> {
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&self.pairing_key_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return self.ensure_pairing_key();
+            }
+            Err(_) => return Err(crate::DaemonError::InvalidConfiguration),
+        };
+        file.write_all(&self.pairing_signer.to_bytes())
+            .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+        file.sync_all()
+            .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+        #[cfg(windows)]
+        crate::windows_security::restrict_current_user_file(&self.pairing_key_path)
+            .map_err(|()| crate::DaemonError::InvalidConfiguration)?;
+        Ok(())
     }
 }
 
@@ -138,4 +189,16 @@ fn fresh_signing_key() -> SigningKey {
     seed[..16].copy_from_slice(uuid::Uuid::now_v7().as_bytes());
     seed[16..].copy_from_slice(uuid::Uuid::now_v7().as_bytes());
     SigningKey::from_bytes(&seed)
+}
+
+fn pairing_key_path(discovery_path: &Path) -> PathBuf {
+    discovery_path.with_extension("cortexd-pairing")
+}
+
+fn load_pairing_signer(path: &Path) -> Result<SigningKey, crate::DaemonError> {
+    let bytes = fs::read(path).map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+    let seed: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+    Ok(SigningKey::from_bytes(&seed))
 }

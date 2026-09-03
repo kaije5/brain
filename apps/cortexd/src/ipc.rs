@@ -1,11 +1,15 @@
-use std::{io, sync::Arc};
+use std::{collections::BTreeSet, io, sync::Arc, time::Duration};
 
 use cortex_application::{
-    ApplicationError, ApplicationService, Capability, CapabilityGrant, CommandContext, GrantPolicy,
-    MemoryCorrectInput, MemoryCreateInput, NoteCreateInput, NoteUpdateInput, SecretStore,
-    TaskCreateInput, TaskUpdateInput,
+    ApplicationError, ApplicationService, AuditPort, Capability, CapabilityCatalog,
+    CapabilityGrant, CommandContext, GrantPolicy, MemoryCorrectInput, MemoryCreateInput,
+    NoteCreateInput, NoteUpdateInput, SecretStore, TaskCreateInput, TaskUpdateInput,
 };
-use cortex_domain::{EntityId, OperationId, PrincipalId, Revision, SourceRef, WorkspaceId};
+use cortex_domain::{
+    AuditEvent, AuditEventId, AuditResult, EntityId, OperationId, PolicyDecision, PolicyDeny,
+    PrincipalId, Revision, SourceRef, WorkspaceId,
+};
+use cortex_inference::{AgentLimits, AgentRunner, AuthorizedCapabilities};
 use cortex_search::{HybridSearchService, SearchRequest};
 use cortex_storage::{OperationStore, SqliteAuditPort, SqliteDatabase, SqliteRepositories};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -22,6 +26,8 @@ use crate::DaemonConfig;
 /// The only supported local IPC protocol version for Cortex v0.1.
 pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
+const MAX_SEARCH_RESULTS: usize = 32;
+const MAX_SEARCH_SNIPPET_BYTES: usize = 1024;
 
 /// A client envelope. The claimed principal is deliberately ignored after OS-local authentication.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -105,12 +111,15 @@ pub struct LocalDaemon {
     migrations_applied: bool,
     service: Arc<DaemonService>,
     search: Arc<DaemonSearch>,
-    _inference: DaemonInferenceUnavailable,
+    agent: Arc<DaemonAgent>,
+    grants: BTreeSet<CapabilityGrant>,
+    audit: SqliteAuditPort,
 }
 
 type DaemonService =
     ApplicationService<GrantPolicy, SqliteRepositories, OperationStore, SqliteAuditPort>;
 type DaemonSearch = HybridSearchService<SqliteRepositories, DaemonEmbeddingUnavailable>;
+type DaemonAgent = AgentRunner<DaemonInferenceUnavailable, DaemonAgentExecutor>;
 
 /// The daemon retains the Task 8 provider boundary even when no model endpoint is configured.
 /// Query callers receive lexical results with an explicit degraded semantic leg.
@@ -135,11 +144,43 @@ impl cortex_application::EmbeddingProvider for DaemonEmbeddingUnavailable {
     }
 }
 
+struct DaemonAgentExecutor;
+
+impl cortex_application::AgentCapabilityExecutor for DaemonAgentExecutor {
+    async fn execute_agent_tool(
+        &self,
+        _context: CommandContext,
+        _capability: Capability,
+        _payload: Value,
+    ) -> Result<Value, ApplicationError> {
+        Err(ApplicationError::PermissionDenied)
+    }
+}
+
 /// A daemon-issued in-process handle representing a completed local authentication handshake.
 /// Its constructor is private so an IPC payload can never manufacture a trusted principal.
 #[derive(Clone)]
 pub struct AuthenticatedLocalClient {
     daemon: LocalDaemon,
+}
+
+/// Private-key material provisioned separately from public discovery for an intended local IPC
+/// client. It can answer a fresh daemon challenge but cannot create a trusted daemon principal.
+#[derive(Clone)]
+pub struct ProvisionedLocalClient {
+    pairing_signer: ed25519_dalek::SigningKey,
+}
+
+impl ProvisionedLocalClient {
+    #[must_use]
+    pub(crate) const fn new(pairing_signer: ed25519_dalek::SigningKey) -> Self {
+        Self { pairing_signer }
+    }
+
+    #[must_use]
+    pub fn pairing_response(&self, challenge: &PairingChallenge) -> PairingResponse {
+        pairing_response_for(&self.pairing_signer, challenge)
+    }
 }
 
 impl AuthenticatedLocalClient {
@@ -194,6 +235,7 @@ impl LocalDaemon {
     }
 
     async fn start_inner(config: DaemonConfig) -> Result<Self, DaemonError> {
+        config.ensure_pairing_key()?;
         let database = SqliteDatabase::connect_and_migrate(config.database_path)
             .await
             .map_err(|_| DaemonError::StartupFailed)?;
@@ -210,15 +252,26 @@ impl LocalDaemon {
             .granted_capabilities(config.workspace_id, config.principal_id)
             .await
             .map_err(|_| DaemonError::StartupFailed)?;
-        let grants = persisted_capabilities.into_iter().map(|capability| {
-            CapabilityGrant::new(config.workspace_id, config.principal_id, capability)
-        });
+        let grants: BTreeSet<_> = persisted_capabilities
+            .into_iter()
+            .map(|capability| {
+                CapabilityGrant::new(config.workspace_id, config.principal_id, capability)
+            })
+            .collect();
         let service = Arc::new(ApplicationService::new(
-            GrantPolicy::new(grants),
+            GrantPolicy::new(grants.iter().copied()),
             repositories.clone(),
             database.operation_store(),
             database.audit_port(),
         ));
+        let agent_limits = AgentLimits::new(4, Duration::from_secs(5), 1, 32 * 1024, 128 * 1024)
+            .map_err(DaemonError::from)?;
+        let agent = Arc::new(AgentRunner::new(
+            Arc::new(DaemonInferenceUnavailable),
+            Arc::new(DaemonAgentExecutor),
+            agent_limits,
+        ));
+        let audit = database.audit_port();
         Ok(Self {
             database,
             endpoint_name: config.endpoint_name,
@@ -232,7 +285,9 @@ impl LocalDaemon {
                 repositories,
                 DaemonEmbeddingUnavailable,
             )),
-            _inference: DaemonInferenceUnavailable,
+            agent,
+            grants,
+            audit,
         })
     }
 
@@ -296,6 +351,7 @@ impl LocalDaemon {
             "cortex_knowledge_search" | "cortex_note_search" | "cortex_memory_search" => {
                 self.search_knowledge(request).await
             }
+            "cortex_agent_run" => self.run_agent(request).await,
             "cortex_note_create"
             | "cortex_note_update"
             | "cortex_note_delete"
@@ -462,6 +518,10 @@ impl LocalDaemon {
             query: String,
             limit: Option<usize>,
         }
+        let capability = Capability::from_mcp_name(&request.capability)
+            .ok_or(DaemonError::UnsupportedCapability)?;
+        self.authorize_and_audit(request, capability, AuditResult::Succeeded)
+            .await?;
         let payload: SearchPayload = decode_payload(&request.payload)?;
         let limit = std::num::NonZeroUsize::new(payload.limit.unwrap_or(20).min(100))
             .ok_or(DaemonError::InvalidRequest)?;
@@ -475,7 +535,81 @@ impl LocalDaemon {
             })
             .await
             .map_err(DaemonError::from)?;
-        Ok(DaemonResponse { protocol_version: PROTOCOL_VERSION, request_id: request.request_id, result: WireResult::Success { value: json!(hits.iter().map(|hit| json!({ "entity_id": Uuid::from(hit.entity_id).to_string(), "kind": hit.kind.as_str(), "snippet": hit.snippet, "semantic_degraded": hit.semantic_degraded })).collect::<Vec<_>>()) } })
+        Ok(search_response(request.request_id, hits))
+    }
+
+    async fn run_agent(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct AgentPayload {
+            prompt: String,
+        }
+        self.authorize_and_audit(request, Capability::AgentRun, AuditResult::Succeeded)
+            .await?;
+        let payload: AgentPayload = decode_payload(&request.payload)?;
+        let allowed = AuthorizedCapabilities::new(
+            CapabilityCatalog::all()
+                .iter()
+                .copied()
+                .filter(|capability| *capability != Capability::AgentRun),
+        )
+        .map_err(DaemonError::from)?;
+        let context = self.command_context(request)?;
+        let output = self
+            .agent
+            .run(context, &payload.prompt, allowed)
+            .await
+            .map_err(DaemonError::from)?;
+        Ok(DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            result: WireResult::Success {
+                value: json!({ "content": output }),
+            },
+        })
+    }
+
+    async fn authorize_and_audit(
+        &self,
+        request: &DaemonRequest,
+        capability: Capability,
+        allowed_result: AuditResult,
+    ) -> Result<(), DaemonError> {
+        let context = self.command_context(request)?;
+        let allowed = self.grants.contains(&CapabilityGrant::new(
+            self.workspace_id,
+            self.principal_id,
+            capability,
+        ));
+        let decision = if allowed {
+            PolicyDecision::Allow
+        } else {
+            PolicyDecision::Deny(PolicyDeny::MissingGrant)
+        };
+        let result = if allowed {
+            allowed_result
+        } else {
+            AuditResult::Rejected
+        };
+        self.audit
+            .append(AuditEvent {
+                id: AuditEventId::new(),
+                workspace_id: self.workspace_id,
+                principal_id: self.principal_id,
+                operation_id: context.operation_id,
+                correlation_id: context.correlation_id,
+                capability: capability.metadata().mcp_name,
+                target_id: None,
+                policy_decision: decision,
+                result,
+            })
+            .await
+            .map_err(DaemonError::from)?;
+        if allowed {
+            Ok(())
+        } else {
+            Err(DaemonError::PermissionDenied)
+        }
     }
 
     fn command_context(&self, request: &DaemonRequest) -> Result<CommandContext, DaemonError> {
@@ -505,14 +639,7 @@ impl LocalDaemon {
     }
 
     fn pairing_response(&self, challenge: &PairingChallenge) -> PairingResponse {
-        PairingResponse {
-            protocol_version: PROTOCOL_VERSION,
-            signature: self
-                .pairing_signer
-                .sign(&pairing_message(challenge))
-                .to_bytes()
-                .to_vec(),
-        }
+        pairing_response_for(&self.pairing_signer, challenge)
     }
 
     fn verify_pairing(&self, challenge: &PairingChallenge, response: &PairingResponse) -> bool {
@@ -555,6 +682,19 @@ impl LocalDaemon {
         shutdown: watch::Receiver<bool>,
     ) -> Result<(), DaemonError> {
         serve_platform(self, shutdown).await
+    }
+}
+
+fn pairing_response_for(
+    pairing_signer: &ed25519_dalek::SigningKey,
+    challenge: &PairingChallenge,
+) -> PairingResponse {
+    PairingResponse {
+        protocol_version: PROTOCOL_VERSION,
+        signature: pairing_signer
+            .sign(&pairing_message(challenge))
+            .to_bytes()
+            .to_vec(),
     }
 }
 
@@ -757,6 +897,39 @@ fn mutation_response(
     }
 }
 
+fn search_response(request_id: Uuid, hits: Vec<cortex_search::SearchHit>) -> DaemonResponse {
+    let values: Vec<_> = hits
+        .into_iter()
+        .take(MAX_SEARCH_RESULTS)
+        .map(|hit| {
+            json!({
+                "entity_id": Uuid::from(hit.entity_id).to_string(),
+                "kind": hit.kind.as_str(),
+                "snippet": truncate_utf8(&hit.snippet, MAX_SEARCH_SNIPPET_BYTES),
+                "semantic_degraded": hit.semantic_degraded,
+            })
+        })
+        .collect();
+    DaemonResponse {
+        protocol_version: PROTOCOL_VERSION,
+        request_id,
+        result: WireResult::Success {
+            value: Value::Array(values),
+        },
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 async fn process_stream<S>(daemon: &LocalDaemon, stream: &mut S) -> Result<(), DaemonError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -830,7 +1003,24 @@ async fn write_response<S>(stream: &mut S, response: &DaemonResponse) -> Result<
 where
     S: AsyncWrite + Unpin,
 {
-    write_json_frame(stream, response).await
+    let response = if serialized_len(response).is_ok_and(|length| length <= MAX_FRAME_BYTES) {
+        response.clone()
+    } else {
+        DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: response.request_id,
+            result: WireResult::Error {
+                code: "response_too_large".to_owned(),
+            },
+        }
+    };
+    write_json_frame(stream, &response).await
+}
+
+fn serialized_len<T: Serialize>(value: &T) -> Result<usize, DaemonError> {
+    serde_json::to_vec(value)
+        .map(|value| value.len())
+        .map_err(|_| DaemonError::TransportUnavailable)
 }
 
 async fn write_json_frame<S, T>(stream: &mut S, value: &T) -> Result<(), DaemonError>
@@ -977,14 +1167,39 @@ fn _io_error_is_redacted(_: io::Error) -> DaemonError {
 
 #[cfg(test)]
 mod tests {
+    use cortex_application::Capability;
     use serde_json::json;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     use super::{
         DaemonConfig, DaemonRequest, LocalDaemon, PROTOCOL_VERSION, PairingChallenge,
-        PairingResponse, WireResult, process_stream, read_frame, write_json_frame,
+        PairingResponse, ProvisionedLocalClient, WireResult, process_stream, read_frame,
+        write_json_frame,
     };
+
+    async fn request_over_wire(
+        daemon: LocalDaemon,
+        client: &ProvisionedLocalClient,
+        request: DaemonRequest,
+    ) -> super::DaemonResponse {
+        let (mut wire_client, mut server) = tokio::io::duplex(128 * 1024);
+        let serving = tokio::spawn(async move { process_stream(&daemon, &mut server).await });
+        let challenge: PairingChallenge =
+            serde_json::from_slice(&read_frame(&mut wire_client).await.expect("challenge"))
+                .expect("challenge JSON");
+        write_json_frame(&mut wire_client, &client.pairing_response(&challenge))
+            .await
+            .expect("proof");
+        write_json_frame(&mut wire_client, &request)
+            .await
+            .expect("request");
+        let response =
+            serde_json::from_slice(&read_frame(&mut wire_client).await.expect("response"))
+                .expect("response JSON");
+        serving.await.expect("server task").expect("wire request");
+        response
+    }
 
     #[tokio::test]
     async fn stream_requires_a_fresh_signed_challenge_before_dispatch() {
@@ -1046,5 +1261,201 @@ mod tests {
             .await
             .expect("server task")
             .expect("authenticated stream");
+    }
+
+    #[tokio::test]
+    async fn provisioned_client_authenticates_an_independent_daemon_after_restart() {
+        let directory = TempDir::new().expect("temporary directory");
+        let database_path = directory.path().join("cortex.db");
+        let first_config = DaemonConfig::from_database_path(database_path.clone()).expect("config");
+        let client = first_config.provisioned_client();
+        let first = LocalDaemon::start(first_config)
+            .await
+            .expect("first daemon");
+        drop(first);
+        let second_config =
+            DaemonConfig::from_database_path(database_path).expect("restart config");
+        let daemon = LocalDaemon::start(second_config)
+            .await
+            .expect("second daemon");
+        let (mut wire_client, mut server) = tokio::io::duplex(128 * 1024);
+        let serving = tokio::spawn(async move { process_stream(&daemon, &mut server).await });
+        let challenge: PairingChallenge =
+            serde_json::from_slice(&read_frame(&mut wire_client).await.expect("challenge"))
+                .expect("challenge JSON");
+        write_json_frame(&mut wire_client, &client.pairing_response(&challenge))
+            .await
+            .expect("proof");
+        write_json_frame(
+            &mut wire_client,
+            &DaemonRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: Uuid::now_v7(),
+                principal_id: Uuid::now_v7(),
+                operation_id: Uuid::now_v7(),
+                capability: "cortex_daemon_status".to_owned(),
+                payload: json!({}),
+            },
+        )
+        .await
+        .expect("request");
+        let response: super::DaemonResponse =
+            serde_json::from_slice(&read_frame(&mut wire_client).await.expect("response"))
+                .expect("response JSON");
+        assert!(matches!(response.result, WireResult::Success { .. }));
+        serving
+            .await
+            .expect("server task")
+            .expect("authenticated stream");
+    }
+
+    #[tokio::test]
+    async fn search_and_agent_wire_requests_are_policy_audited() {
+        let directory = TempDir::new().expect("temporary directory");
+        let config = DaemonConfig::for_test(directory.path());
+        let client = config.provisioned_client();
+        let daemon = LocalDaemon::start(config).await.expect("daemon");
+        let search_id = Uuid::now_v7();
+        let search = request_over_wire(
+            daemon.clone(),
+            &client,
+            DaemonRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: search_id,
+                principal_id: Uuid::now_v7(),
+                operation_id: Uuid::now_v7(),
+                capability: "cortex_knowledge_search".to_owned(),
+                payload: json!({"query":"nothing"}),
+            },
+        )
+        .await;
+        assert!(matches!(search.result, WireResult::Success { .. }));
+        assert_eq!(
+            daemon
+                .audit
+                .count_for_correlation(daemon.workspace_id, search_id)
+                .await
+                .expect("audit"),
+            1
+        );
+        let agent_id = Uuid::now_v7();
+        let agent = request_over_wire(
+            daemon.clone(),
+            &client,
+            DaemonRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: agent_id,
+                principal_id: Uuid::now_v7(),
+                operation_id: Uuid::now_v7(),
+                capability: "cortex_agent_run".to_owned(),
+                payload: json!({"prompt":"hello"}),
+            },
+        )
+        .await;
+        assert_eq!(
+            agent.result,
+            WireResult::Error {
+                code: "unavailable".to_owned()
+            }
+        );
+        assert_eq!(
+            daemon
+                .audit
+                .count_for_correlation(daemon.workspace_id, agent_id)
+                .await
+                .expect("audit"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_wire_search_returns_safe_error_and_writes_a_denial_audit() {
+        let directory = TempDir::new().expect("temporary directory");
+        let config = DaemonConfig::for_test(directory.path())
+            .with_bootstrap_grants(vec![Capability::NoteCreate]);
+        let client = config.provisioned_client();
+        let daemon = LocalDaemon::start(config).await.expect("daemon");
+        let request_id = Uuid::now_v7();
+        let response = request_over_wire(
+            daemon.clone(),
+            &client,
+            DaemonRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                principal_id: Uuid::now_v7(),
+                operation_id: Uuid::now_v7(),
+                capability: "cortex_knowledge_search".to_owned(),
+                payload: json!({"query":"private"}),
+            },
+        )
+        .await;
+        assert_eq!(
+            response.result,
+            WireResult::Error {
+                code: "permission_denied".to_owned()
+            }
+        );
+        assert_eq!(
+            daemon
+                .audit
+                .count_for_correlation(daemon.workspace_id, request_id)
+                .await
+                .expect("audit"),
+            1
+        );
+        let agent_id = Uuid::now_v7();
+        let agent = request_over_wire(
+            daemon.clone(),
+            &client,
+            DaemonRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: agent_id,
+                principal_id: Uuid::now_v7(),
+                operation_id: Uuid::now_v7(),
+                capability: "cortex_agent_run".to_owned(),
+                payload: json!({"prompt":"private"}),
+            },
+        )
+        .await;
+        assert_eq!(
+            agent.result,
+            WireResult::Error {
+                code: "permission_denied".to_owned()
+            }
+        );
+        assert_eq!(
+            daemon
+                .audit
+                .count_for_correlation(daemon.workspace_id, agent_id)
+                .await
+                .expect("audit"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_success_is_replaced_with_a_correlated_bounded_wire_error() {
+        let request_id = Uuid::now_v7();
+        let response = super::DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: WireResult::Success {
+                value: json!({"value": "x".repeat(super::MAX_FRAME_BYTES)}),
+            },
+        };
+        let (mut reader, mut writer) = tokio::io::duplex(128 * 1024);
+        let write =
+            tokio::spawn(async move { super::write_response(&mut writer, &response).await });
+        let bytes = read_frame(&mut reader).await.expect("fallback frame");
+        let emitted: super::DaemonResponse = serde_json::from_slice(&bytes).expect("fallback JSON");
+        assert!(bytes.len() <= super::MAX_FRAME_BYTES);
+        assert_eq!(emitted.request_id, request_id);
+        assert_eq!(
+            emitted.result,
+            WireResult::Error {
+                code: "response_too_large".to_owned()
+            }
+        );
+        write.await.expect("writer task").expect("fallback write");
     }
 }

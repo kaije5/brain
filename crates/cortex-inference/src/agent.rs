@@ -431,15 +431,16 @@ fn input_schema(capability: Capability) -> Value {
             ],
             merge_properties(entity_revision, memory_properties()),
         ),
-        Capability::NoteSearch | Capability::MemorySearch | Capability::KnowledgeRetrieve => {
-            object_schema(
-                &["query"],
-                json!({
-                    "query": { "type": "string", "minLength": 1 },
-                    "limit": { "type": "integer", "minimum": 1 }
-                }),
-            )
-        }
+        Capability::NoteSearch
+        | Capability::MemorySearch
+        | Capability::KnowledgeRetrieve
+        | Capability::AgentRun => object_schema(
+            &["query"],
+            json!({
+                "query": { "type": "string", "minLength": 1 },
+                "limit": { "type": "integer", "minimum": 1 }
+            }),
+        ),
     }
 }
 
@@ -491,9 +492,10 @@ fn validated_arguments(capability: Capability, arguments: &str) -> Result<Value,
         Capability::TaskList => decode::<TaskListArguments>(value),
         Capability::MemoryCreate => decode::<MemoryCreateArguments>(value),
         Capability::MemoryCorrect => decode::<MemoryCorrectArguments>(value),
-        Capability::NoteSearch | Capability::MemorySearch | Capability::KnowledgeRetrieve => {
-            decode::<SearchArguments>(value)
-        }
+        Capability::NoteSearch
+        | Capability::MemorySearch
+        | Capability::KnowledgeRetrieve
+        | Capability::AgentRun => decode::<SearchArguments>(value),
     }?;
     validate_capability_semantics(capability, &normalized)?;
     validate_normalized_arguments(&normalized)?;

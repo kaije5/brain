@@ -9,5 +9,5 @@ mod windows_security;
 pub use config::DaemonConfig;
 pub use ipc::{
     AuthenticatedLocalClient, DaemonError, DaemonRequest, DaemonResponse, LocalDaemon,
-    PROTOCOL_VERSION, WireResult,
+    PROTOCOL_VERSION, PairingChallenge, PairingResponse, ProvisionedLocalClient, WireResult,
 };

@@ -37,6 +37,26 @@ impl SqliteAuditPort {
         .map_err(|_| storage_error("audit lookup failed"))?;
         row.map(|row| decode_event(&row)).transpose()
     }
+
+    /// Counts redacted decision records for one correlation within a workspace.
+    ///
+    /// # Errors
+    /// Returns a redacted storage error if the audit query fails.
+    pub async fn count_for_correlation(
+        &self,
+        workspace_id: cortex_domain::WorkspaceId,
+        correlation_id: Uuid,
+    ) -> Result<u64, ApplicationError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_event WHERE workspace_id = ? AND correlation_id = ?",
+        )
+        .bind(uuid_text(workspace_id))
+        .bind(correlation_id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| storage_error("audit count failed"))?;
+        u64::try_from(count).map_err(|_| storage_error("invalid audit count"))
+    }
 }
 
 impl AuditPort for SqliteAuditPort {
@@ -173,6 +193,7 @@ fn decode_result(value: &str) -> Result<AuditResult, ApplicationError> {
 fn canonical_capability(value: &str) -> Result<&'static str, ApplicationError> {
     match value {
         "cortex_knowledge_search" => Ok("cortex_knowledge_search"),
+        "cortex_agent_run" => Ok("cortex_agent_run"),
         "cortex_memory_correct" => Ok("cortex_memory_correct"),
         "cortex_memory_create" => Ok("cortex_memory_create"),
         "cortex_memory_delete" => Ok("cortex_memory_delete"),

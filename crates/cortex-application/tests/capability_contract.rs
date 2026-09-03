@@ -4,7 +4,7 @@ use cortex_application::{
 use cortex_domain::{EntityId, Lifecycle, Revision};
 use uuid::Uuid;
 
-const EXPECTED_CATALOG: [(Capability, &str, &str, &str, bool, bool); 17] = [
+const EXPECTED_CATALOG: [(Capability, &str, &str, &str, bool, bool); 18] = [
     (
         Capability::NoteCreate,
         "cortex_note_create",
@@ -138,6 +138,14 @@ const EXPECTED_CATALOG: [(Capability, &str, &str, &str, bool, bool); 17] = [
         "cortex_knowledge_search",
         "KnowledgeSearchRequest",
         "KnowledgeSearchResultList",
+        false,
+        false,
+    ),
+    (
+        Capability::AgentRun,
+        "cortex_agent_run",
+        "AgentRunRequest",
+        "AgentRunResult",
         false,
         false,
     ),
