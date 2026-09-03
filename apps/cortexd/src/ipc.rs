@@ -1434,6 +1434,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn revoked_search_grant_remains_denied_and_audited_after_restart() {
+        let directory = TempDir::new().expect("temporary directory");
+        let database_path = directory.path().join("cortex.db");
+        let first_config =
+            DaemonConfig::from_database_path(database_path.clone()).expect("first config");
+        let client = first_config.provisioned_client();
+        let workspace_id = first_config.workspace_id;
+        let principal_id = first_config.principal_id;
+        let first = LocalDaemon::start(first_config)
+            .await
+            .expect("first daemon");
+        first
+            .database
+            .repositories()
+            .revoke_capability(workspace_id, principal_id, Capability::KnowledgeRetrieve)
+            .await
+            .expect("revoke search grant");
+        drop(first);
+
+        let restarted = LocalDaemon::start(
+            DaemonConfig::from_database_path(database_path).expect("restart config"),
+        )
+        .await
+        .expect("restarted daemon");
+        let request_id = Uuid::now_v7();
+        let response = request_over_wire(
+            restarted.clone(),
+            &client,
+            DaemonRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id,
+                principal_id: Uuid::now_v7(),
+                operation_id: Uuid::now_v7(),
+                capability: "cortex_knowledge_search".to_owned(),
+                payload: json!({"query":"private"}),
+            },
+        )
+        .await;
+        assert_eq!(
+            response.result,
+            WireResult::Error {
+                code: "permission_denied".to_owned()
+            }
+        );
+        assert_eq!(
+            restarted
+                .audit
+                .count_for_correlation(restarted.workspace_id, request_id)
+                .await
+                .expect("denial audit"),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_success_is_replaced_with_a_correlated_bounded_wire_error() {
         let request_id = Uuid::now_v7();
         let response = super::DaemonResponse {

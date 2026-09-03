@@ -1,21 +1,21 @@
 //! Narrow, audited Windows security-descriptor boundary for the local named pipe.
 //!
 //! This is the sole `unsafe` exception in `cortexd`: `windows-sys` exposes the Win32 APIs as
-//! raw pointers, while Tokio requires a valid `SECURITY_ATTRIBUTES` pointer for pipe creation.
+//! raw pointers. The owned descriptor is passed to Tokio for pipe creation and to `CreateFileW`
+//! for enrollment-file creation, so the protected current-user DACL exists before secret bytes
+//! can be written.
 
 use std::{ffi::c_void, mem::size_of, ptr::null_mut};
 
-use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, LocalFree},
+    Foundation::{CloseHandle, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree},
     Security::{
         Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         },
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
-        PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
+        GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
+    Storage::FileSystem::{CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL},
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
 
@@ -65,44 +65,34 @@ pub fn create_current_user_server(
     security.create_server(options, name)
 }
 
-/// Applies the same protected current-user DACL to a pairing enrollment artifact.
-pub fn restrict_current_user_file(path: &std::path::Path) -> Result<(), ()> {
-    use std::os::windows::ffi::OsStrExt;
+/// Atomically creates an empty per-user enrollment file with its protected DACL already set.
+///
+/// The returned file has no secret bytes. Callers must write only after this function succeeds.
+pub fn create_current_user_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
 
-    let security = CurrentUserPipeSecurity::new()?;
-    let mut present = 0;
-    let mut defaulted = 0;
-    let mut dacl = null_mut();
-    // SAFETY: security owns a valid descriptor and all out-pointers are valid for this call.
-    if unsafe {
-        GetSecurityDescriptorDacl(
-            security.descriptor.cast(),
-            &raw mut present,
-            &raw mut dacl,
-            &raw mut defaulted,
-        )
-    } == 0
-        || present == 0
-        || dacl.is_null()
-    {
-        return Err(());
-    }
+    let mut security = CurrentUserPipeSecurity::new()
+        .map_err(|()| std::io::Error::other("current-user file DACL unavailable"))?;
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
-    // SAFETY: wide is NUL-terminated, dacl points into the live descriptor, and the path names
-    // the just-created enrollment file.
-    let status = unsafe {
-        SetNamedSecurityInfoW(
+    // SAFETY: wide is NUL-terminated and security owns a valid SECURITY_ATTRIBUTES and
+    // descriptor for the duration of CreateFileW. CREATE_NEW prevents opening an existing file.
+    let handle = unsafe {
+        CreateFileW(
             wide.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            dacl,
+            GENERIC_WRITE,
+            0,
+            security.as_raw_mut().cast(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
             null_mut(),
         )
     };
-    (status == 0).then_some(()).ok_or(())
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned a valid owned HANDLE, transferred exactly once to File.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 impl Drop for CurrentUserPipeSecurity {
@@ -189,4 +179,61 @@ fn wide_string(pointer: *const u16) -> Vec<u16> {
     }
     // SAFETY: the NUL-terminated range is valid for that Win32 string.
     unsafe { std::slice::from_raw_parts(pointer, length + 1).to_vec() }
+}
+
+#[cfg(test)]
+fn has_protected_dacl(path: &std::path::Path) -> Result<bool, ()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::{
+        Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+    };
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut descriptor = null_mut();
+    // SAFETY: wide is NUL-terminated and descriptor receives the LocalAlloc-owned result.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    if status != 0 || descriptor.is_null() {
+        return Err(());
+    }
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: descriptor is the valid result from GetNamedSecurityInfoW.
+    let has_protected_dacl = unsafe {
+        GetSecurityDescriptorControl(descriptor, &raw mut control, &raw mut revision) != 0
+            && control & SE_DACL_PROTECTED != 0
+    };
+    // SAFETY: GetNamedSecurityInfoW allocates descriptor with LocalAlloc.
+    unsafe { LocalFree(descriptor.cast()) };
+    Ok(has_protected_dacl)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::{create_current_user_file, has_protected_dacl};
+
+    #[test]
+    fn enrollment_file_is_created_with_its_protected_descriptor_before_a_write() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("enrollment.key");
+        let mut file = create_current_user_file(&path).expect("protected creation");
+        assert_eq!(file.metadata().expect("metadata").len(), 0);
+        assert!(has_protected_dacl(&path).expect("protected descriptor"));
+        file.write_all(b"secret").expect("write after creation");
+        assert_eq!(file.metadata().expect("metadata").len(), 6);
+    }
 }

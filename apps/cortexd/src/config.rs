@@ -151,27 +151,35 @@ impl DaemonConfig {
 
     fn write_pairing_key(&self) -> Result<(), crate::DaemonError> {
         use std::io::Write;
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = match options.open(&self.pairing_key_path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return self.ensure_pairing_key();
+        #[cfg(windows)]
+        let mut file =
+            match crate::windows_security::create_current_user_file(&self.pairing_key_path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return self.ensure_pairing_key();
+                }
+                Err(_) => return Err(crate::DaemonError::InvalidConfiguration),
+            };
+        #[cfg(not(windows))]
+        let mut file = {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
-            Err(_) => return Err(crate::DaemonError::InvalidConfiguration),
+            match options.open(&self.pairing_key_path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return self.ensure_pairing_key();
+                }
+                Err(_) => return Err(crate::DaemonError::InvalidConfiguration),
+            }
         };
         file.write_all(&self.pairing_signer.to_bytes())
             .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
         file.sync_all()
             .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
-        #[cfg(windows)]
-        crate::windows_security::restrict_current_user_file(&self.pairing_key_path)
-            .map_err(|()| crate::DaemonError::InvalidConfiguration)?;
         Ok(())
     }
 }

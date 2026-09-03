@@ -38,19 +38,25 @@ impl SqliteRepositories {
             .begin()
             .await
             .map_err(|_| storage_error("bootstrap failed"))?;
-        sqlx::query("INSERT INTO workspace (id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING")
-            .bind(id_text(workspace_id))
-            .bind("default")
-            .execute(&mut *transaction)
-            .await
-            .map_err(|_| storage_error("bootstrap failed"))?;
+        let workspace_created = sqlx::query(
+            "INSERT INTO workspace (id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id_text(workspace_id))
+        .bind("default")
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| storage_error("bootstrap failed"))?
+        .rows_affected()
+            == 1;
         sqlx::query("INSERT INTO principal (id, workspace_id, name) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING")
             .bind(id_text(principal_id)).bind(id_text(workspace_id)).bind("owner")
             .execute(&mut *transaction).await.map_err(|_| storage_error("bootstrap failed"))?;
-        for capability in grants {
-            sqlx::query("INSERT INTO capability_grant (workspace_id, principal_id, capability) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
-                .bind(id_text(workspace_id)).bind(id_text(principal_id)).bind(capability.metadata().mcp_name)
-                .execute(&mut *transaction).await.map_err(|_| storage_error("bootstrap failed"))?;
+        if workspace_created {
+            for capability in grants {
+                sqlx::query("INSERT INTO capability_grant (workspace_id, principal_id, capability) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+                    .bind(id_text(workspace_id)).bind(id_text(principal_id)).bind(capability.metadata().mcp_name)
+                    .execute(&mut *transaction).await.map_err(|_| storage_error("bootstrap failed"))?;
+            }
         }
         transaction
             .commit()
@@ -121,6 +127,28 @@ impl SqliteRepositories {
         .execute(&self.pool)
         .await
         .map_err(|_| storage_error("capability grant insert failed"))?;
+        Ok(())
+    }
+
+    /// Removes one explicit capability grant without widening any other principal's authority.
+    ///
+    /// # Errors
+    /// Returns a redacted storage error if the durable revocation cannot be committed.
+    pub async fn revoke_capability(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        capability: Capability,
+    ) -> Result<(), ApplicationError> {
+        sqlx::query(
+            "DELETE FROM capability_grant WHERE workspace_id = ? AND principal_id = ? AND capability = ?",
+        )
+        .bind(id_text(workspace_id))
+        .bind(id_text(principal_id))
+        .bind(capability.metadata().mcp_name)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| storage_error("capability grant revoke failed"))?;
         Ok(())
     }
 
