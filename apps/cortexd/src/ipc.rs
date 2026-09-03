@@ -1,8 +1,11 @@
 use std::{io, sync::Arc};
 
-use cortex_application::{ApplicationError, Capability, GrantPolicy, SecretStore};
+use cortex_application::{
+    ApplicationError, ApplicationService, Capability, CapabilityCatalog, CapabilityGrant,
+    CommandContext, GrantPolicy, NoteCreateInput, SecretStore,
+};
 use cortex_domain::{OperationId, PrincipalId, WorkspaceId};
-use cortex_storage::SqliteDatabase;
+use cortex_storage::{OperationStore, SqliteAuditPort, SqliteDatabase, SqliteRepositories};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
@@ -24,6 +27,7 @@ pub struct DaemonRequest {
     pub request_id: Uuid,
     pub principal_id: Uuid,
     pub operation_id: Uuid,
+    pub pairing_proof: Option<Uuid>,
     pub capability: String,
     pub payload: Value,
 }
@@ -33,7 +37,15 @@ pub struct DaemonRequest {
 pub struct DaemonResponse {
     pub protocol_version: u16,
     pub request_id: Uuid,
-    pub result: Value,
+    pub result: WireResult,
+}
+
+/// Bounded, redacted daemon result carried on the wire for both success and failure.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireResult {
+    Success { value: Value },
+    Error { code: String },
 }
 
 /// Safe local IPC failure categories. They intentionally omit filesystem and database details.
@@ -69,8 +81,13 @@ pub struct LocalDaemon {
     endpoint_name: String,
     workspace_id: WorkspaceId,
     principal_id: PrincipalId,
+    pairing_proof: Uuid,
     migrations_applied: bool,
+    service: Arc<DaemonService>,
 }
+
+type DaemonService =
+    ApplicationService<GrantPolicy, SqliteRepositories, OperationStore, SqliteAuditPort>;
 
 /// A daemon-issued in-process handle representing a completed local authentication handshake.
 /// Its constructor is private so an IPC payload can never manufacture a trusted principal.
@@ -84,8 +101,15 @@ impl AuthenticatedLocalClient {
     ///
     /// # Errors
     /// Returns a safe protocol error for an invalid or unsupported request.
-    pub fn request(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
-        self.daemon.request_authenticated(request)
+    pub async fn request(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
+        let mut request = request.clone();
+        request.pairing_proof = Some(self.daemon.pairing_proof);
+        Ok(self.daemon.handle_wire_request(request).await)
+    }
+
+    #[must_use]
+    pub const fn pairing_proof(&self) -> Option<Uuid> {
+        Some(self.daemon.pairing_proof)
     }
 }
 
@@ -126,19 +150,29 @@ impl LocalDaemon {
         let database = SqliteDatabase::connect_and_migrate(config.database_path)
             .await
             .map_err(|_| DaemonError::StartupFailed)?;
-        // Construct all persistence and policy ports at the ownership boundary. The typed
-        // command routing adapter is intentionally added by its transport task, rather than
-        // accepting generic RPC strings here.
-        let _policy = GrantPolicy::new([]);
-        let _repositories = database.repositories();
-        let _audit = database.audit_port();
-        let _operations = database.operation_store();
+        let repositories = database.repositories();
+        let capabilities = CapabilityCatalog::all();
+        repositories
+            .bootstrap_owner(config.workspace_id, config.principal_id, capabilities)
+            .await
+            .map_err(|_| DaemonError::StartupFailed)?;
+        let grants = capabilities.iter().copied().map(|capability| {
+            CapabilityGrant::new(config.workspace_id, config.principal_id, capability)
+        });
+        let service = Arc::new(ApplicationService::new(
+            GrantPolicy::new(grants),
+            repositories,
+            database.operation_store(),
+            database.audit_port(),
+        ));
         Ok(Self {
             database,
             endpoint_name: config.endpoint_name,
             workspace_id: config.workspace_id,
             principal_id: config.principal_id,
+            pairing_proof: config.pairing_proof,
             migrations_applied: true,
+            service,
         })
     }
 
@@ -183,7 +217,7 @@ impl LocalDaemon {
 
     /// Handles a request after the platform-local transport has authenticated the peer.
     /// The request principal is not trusted: the daemon-owned local principal is authoritative.
-    fn request_authenticated(
+    async fn request_authenticated(
         &self,
         request: &DaemonRequest,
     ) -> Result<DaemonResponse, DaemonError> {
@@ -193,7 +227,65 @@ impl LocalDaemon {
             "cortex_daemon_status" => Ok(self.diagnostic_response(correlation_id, "status")),
             "cortex_daemon_doctor" => Ok(self.diagnostic_response(correlation_id, "doctor")),
             "cortex_daemon_logs" => Ok(self.diagnostic_response(correlation_id, "logs")),
+            "cortex_note_create" => self.create_note(request).await,
             _ => Err(DaemonError::UnsupportedCapability),
+        }
+    }
+
+    async fn create_note(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
+        let input: WireNoteCreate = serde_json::from_value(request.payload.clone())
+            .map_err(|_| DaemonError::InvalidRequest)?;
+        let context = CommandContext::from_authenticated(
+            self.workspace_id,
+            self.principal_id,
+            OperationId::try_from(request.operation_id).map_err(|_| DaemonError::InvalidRequest)?,
+            request.request_id,
+        );
+        let result = self
+            .service
+            .create_note(
+                context,
+                NoteCreateInput {
+                    title: input.title,
+                    content: input.content,
+                },
+            )
+            .await
+            .map_err(DaemonError::from)?;
+        Ok(DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            result: WireResult::Success {
+                value: json!({
+                    "entity_id": Uuid::from(result.entity_id).to_string(),
+                    "revision": result.revision.get(),
+                    "lifecycle": format!("{:?}", result.lifecycle).to_ascii_lowercase(),
+                    "correlation_id": result.audit_correlation_id.to_string(),
+                }),
+            },
+        })
+    }
+
+    /// Applies the real pairing boundary before invoking any daemon capability handler.
+    #[must_use]
+    pub async fn handle_wire_request(&self, request: DaemonRequest) -> DaemonResponse {
+        let request_id = request.request_id;
+        let result = if request.pairing_proof == Some(self.pairing_proof) {
+            match self.request_authenticated(&request).await {
+                Ok(response) => return response,
+                Err(error) => WireResult::Error {
+                    code: error.wire_code().to_owned(),
+                },
+            }
+        } else {
+            WireResult::Error {
+                code: "unauthenticated".to_owned(),
+            }
+        };
+        DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result,
         }
     }
 
@@ -201,13 +293,15 @@ impl LocalDaemon {
         DaemonResponse {
             protocol_version: PROTOCOL_VERSION,
             request_id,
-            result: json!({
-                "capability": capability,
-                "correlation_id": request_id.to_string(),
-                "workspace_id": Uuid::from(self.workspace_id).to_string(),
-                "principal_id": Uuid::from(self.principal_id).to_string(),
-                "migrations_applied": self.migrations_applied,
-            }),
+            result: WireResult::Success {
+                value: json!({
+                    "capability": capability,
+                    "correlation_id": request_id.to_string(),
+                    "workspace_id": Uuid::from(self.workspace_id).to_string(),
+                    "principal_id": Uuid::from(self.principal_id).to_string(),
+                    "migrations_applied": self.migrations_applied,
+                }),
+            },
         }
     }
 
@@ -247,6 +341,13 @@ fn is_v7(value: Uuid) -> bool {
     value.get_version() == Some(Version::SortRand)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNoteCreate {
+    title: String,
+    content: String,
+}
+
 async fn process_stream<S>(daemon: &LocalDaemon, stream: &mut S) -> Result<(), DaemonError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -265,7 +366,7 @@ where
         .await
         .map_err(|_| DaemonError::TransportUnavailable)?;
     let request = daemon.decode_request(&bytes)?;
-    let response = daemon.request_authenticated(&request)?;
+    let response = daemon.handle_wire_request(request).await;
     write_response(stream, &response).await
 }
 
@@ -274,6 +375,9 @@ where
     S: AsyncWrite + Unpin,
 {
     let bytes = serde_json::to_vec(response).map_err(|_| DaemonError::TransportUnavailable)?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(DaemonError::TransportUnavailable);
+    }
     let length = u32::try_from(bytes.len()).map_err(|_| DaemonError::TransportUnavailable)?;
     stream
         .write_u32_le(length)
@@ -361,6 +465,18 @@ async fn serve_platform(
 impl From<ApplicationError> for DaemonError {
     fn from(_: ApplicationError) -> Self {
         Self::StartupFailed
+    }
+}
+
+impl DaemonError {
+    const fn wire_code(&self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::InvalidRequest => "invalid_request",
+            Self::UnsupportedCapability => "unsupported_capability",
+            Self::InvalidConfiguration | Self::StartupFailed => "unavailable",
+            Self::TransportUnavailable => "transport_unavailable",
+        }
     }
 }
 

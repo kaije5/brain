@@ -23,6 +23,41 @@ impl SqliteRepositories {
         Self { pool }
     }
 
+    /// Atomically establishes the durable owner boundary and its explicit grants.
+    ///
+    /// # Errors
+    /// Returns a redacted storage error if bootstrap cannot be committed.
+    pub async fn bootstrap_owner(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        grants: &[Capability],
+    ) -> Result<(), ApplicationError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| storage_error("bootstrap failed"))?;
+        sqlx::query("INSERT INTO workspace (id, name) VALUES (?, ?) ON CONFLICT (id) DO NOTHING")
+            .bind(id_text(workspace_id))
+            .bind("default")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| storage_error("bootstrap failed"))?;
+        sqlx::query("INSERT INTO principal (id, workspace_id, name) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING")
+            .bind(id_text(principal_id)).bind(id_text(workspace_id)).bind("owner")
+            .execute(&mut *transaction).await.map_err(|_| storage_error("bootstrap failed"))?;
+        for capability in grants {
+            sqlx::query("INSERT INTO capability_grant (workspace_id, principal_id, capability) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+                .bind(id_text(workspace_id)).bind(id_text(principal_id)).bind(capability.metadata().mcp_name)
+                .execute(&mut *transaction).await.map_err(|_| storage_error("bootstrap failed"))?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| storage_error("bootstrap failed"))
+    }
+
     /// Creates an explicit workspace ownership boundary.
     ///
     /// # Errors
