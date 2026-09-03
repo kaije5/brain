@@ -146,6 +146,31 @@ impl SqliteRepositories {
         .map_err(|_| storage_error("capability grant lookup failed"))
     }
 
+    /// Loads the explicit persisted grants for one authenticated principal.
+    ///
+    /// # Errors
+    /// Returns a redacted storage error for invalid or unavailable grant rows.
+    pub async fn granted_capabilities(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+    ) -> Result<Vec<Capability>, ApplicationError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT capability FROM capability_grant WHERE workspace_id = ? AND principal_id = ? ORDER BY capability",
+        )
+        .bind(id_text(workspace_id))
+        .bind(id_text(principal_id))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| storage_error("capability grant lookup failed"))?;
+        rows.into_iter()
+            .map(|name| {
+                Capability::from_mcp_name(&name)
+                    .ok_or_else(|| storage_error("invalid capability grant"))
+            })
+            .collect()
+    }
+
     /// Upserts searchable content and its canonical SHA-256 hash only for an
     /// existing canonical entity. A changed hash atomically invalidates vectors.
     ///

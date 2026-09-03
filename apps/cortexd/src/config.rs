@@ -55,7 +55,7 @@ impl DaemonConfig {
                 principal_id: PrincipalId::try_from(discovery.principal_id)
                     .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
                 inference_secret: None,
-                pairing_proof: discovery.pairing_proof,
+                pairing_proof: uuid::Uuid::now_v7(),
                 discovery_path,
             });
         }
@@ -84,7 +84,6 @@ impl DaemonConfig {
             endpoint_name: self.endpoint_name.clone(),
             workspace_id: self.workspace_id.into(),
             principal_id: self.principal_id.into(),
-            pairing_proof: self.pairing_proof,
         };
         let bytes =
             serde_json::to_vec(&discovery).map_err(|_| crate::DaemonError::InvalidConfiguration)?;
@@ -97,5 +96,4 @@ struct Discovery {
     endpoint_name: String,
     workspace_id: uuid::Uuid,
     principal_id: uuid::Uuid,
-    pairing_proof: uuid::Uuid,
 }

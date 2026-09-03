@@ -156,7 +156,11 @@ impl LocalDaemon {
             .bootstrap_owner(config.workspace_id, config.principal_id, capabilities)
             .await
             .map_err(|_| DaemonError::StartupFailed)?;
-        let grants = capabilities.iter().copied().map(|capability| {
+        let persisted_capabilities = repositories
+            .granted_capabilities(config.workspace_id, config.principal_id)
+            .await
+            .map_err(|_| DaemonError::StartupFailed)?;
+        let grants = persisted_capabilities.into_iter().map(|capability| {
             CapabilityGrant::new(config.workspace_id, config.principal_id, capability)
         });
         let service = Arc::new(ApplicationService::new(
@@ -398,14 +402,14 @@ async fn serve_platform(
     daemon: Arc<LocalDaemon>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), DaemonError> {
+    use crate::windows_security::create_current_user_server;
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let pipe_name = format!(r"\\.\pipe\{}", daemon.endpoint_name);
     loop {
         let mut options = ServerOptions::new();
         options.reject_remote_clients(true);
-        let server = options
-            .create(&pipe_name)
+        let server = create_current_user_server(&options, &pipe_name)
             .map_err(|_| DaemonError::TransportUnavailable)?;
         tokio::select! {
             changed = shutdown.changed() => {
