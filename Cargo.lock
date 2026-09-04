@@ -305,8 +305,13 @@ dependencies = [
 name = "cortex-mcp"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "chrono",
  "cortex-application",
  "cortexd",
+ "http",
+ "http-body",
+ "http-body-util",
  "rmcp",
  "schemars",
  "serde",
@@ -314,6 +319,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "tower-service",
  "uuid",
 ]
 
@@ -1760,6 +1766,7 @@ dependencies = [
  "schemars_derive",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
