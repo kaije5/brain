@@ -64,6 +64,56 @@ impl SqliteRepositories {
             .map_err(|_| storage_error("bootstrap failed"))
     }
 
+    /// Atomically creates a non-owner principal and its initial grants exactly once.
+    /// Reopening the daemon never recreates grants that were subsequently revoked.
+    ///
+    /// # Errors
+    /// Returns a redacted storage error when the principal boundary cannot be established.
+    pub async fn bootstrap_principal(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        name: &str,
+        grants: &[Capability],
+    ) -> Result<(), ApplicationError> {
+        validate_name(name)?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| storage_error("principal bootstrap failed"))?;
+        let created = sqlx::query(
+            "INSERT INTO principal (id, workspace_id, name) VALUES (?, ?, ?) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id_text(principal_id))
+        .bind(id_text(workspace_id))
+        .bind(name)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| storage_error("principal bootstrap failed"))?
+        .rows_affected()
+            == 1;
+        if created {
+            for capability in grants {
+                sqlx::query(
+                    "INSERT INTO capability_grant (workspace_id, principal_id, capability) \
+                     VALUES (?, ?, ?)",
+                )
+                .bind(id_text(workspace_id))
+                .bind(id_text(principal_id))
+                .bind(capability.metadata().mcp_name)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| storage_error("principal bootstrap failed"))?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|_| storage_error("principal bootstrap failed"))
+    }
+
     /// Creates an explicit workspace ownership boundary.
     ///
     /// # Errors

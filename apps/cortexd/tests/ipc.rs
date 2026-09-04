@@ -1,4 +1,6 @@
 use cortex_application::Capability;
+use cortex_domain::PrincipalId;
+use cortex_storage::SqliteDatabase;
 use cortexd::{
     AuthenticatedIpcClient, DaemonConfig, DaemonError, DaemonRequest, LocalDaemon,
     PROTOCOL_VERSION, WireResult,
@@ -6,6 +8,96 @@ use cortexd::{
 use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn remote_enrollment_keeps_identity_grants_and_audit_distinct_across_restart() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let database_path = directory.path().join("cortex.db");
+    let mut config = DaemonConfig::from_database_path(database_path.clone()).expect("config");
+    let owner_id = PrincipalId::try_from(config.owner_principal_id()).expect("owner id");
+    let remote_id = PrincipalId::new();
+    let enrollment_path = config
+        .enroll_remote_principal(remote_id, &[Capability::NoteCreate])
+        .expect("remote enrollment");
+
+    let daemon = std::sync::Arc::new(LocalDaemon::start(config).await.expect("daemon starts"));
+    let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(std::sync::Arc::clone(&daemon).serve(shutdown));
+    tokio::task::yield_now().await;
+    let owner = AuthenticatedIpcClient::from_database_path(&database_path).expect("owner client");
+    let remote =
+        AuthenticatedIpcClient::from_enrollment_path(&enrollment_path).expect("remote client");
+    assert_eq!(owner.principal_id(), owner_id);
+    assert_eq!(remote.principal_id(), remote_id);
+
+    let remote_correlation = Uuid::now_v7();
+    let created = remote
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: remote_correlation,
+            principal_id: owner_id.into(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_note_create".to_owned(),
+            payload: json!({"title":"remote", "content":"separate actor"}),
+        })
+        .await
+        .expect("remote response");
+    assert!(matches!(created.result, WireResult::Success { .. }));
+    shutdown_sender.send(true).expect("shutdown");
+    serving.await.expect("server task").expect("clean shutdown");
+
+    let database = SqliteDatabase::connect_and_migrate(&database_path)
+        .await
+        .expect("database");
+    let audit = database
+        .audit_port()
+        .find_for_correlation(daemon.ownership_workspace_id(), remote_correlation)
+        .await
+        .expect("audit lookup")
+        .expect("remote audit");
+    assert_eq!(audit.principal_id, remote_id);
+    assert_ne!(audit.principal_id, owner_id);
+    database
+        .repositories()
+        .revoke_capability(
+            daemon.ownership_workspace_id(),
+            remote_id,
+            Capability::NoteCreate,
+        )
+        .await
+        .expect("revoke remote grant");
+    drop(database);
+
+    let restarted = std::sync::Arc::new(
+        LocalDaemon::start(
+            DaemonConfig::from_database_path(database_path.clone()).expect("restart config"),
+        )
+        .await
+        .expect("restart daemon"),
+    );
+    let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(std::sync::Arc::clone(&restarted).serve(shutdown));
+    tokio::task::yield_now().await;
+    let denied = remote
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: owner_id.into(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_note_create".to_owned(),
+            payload: json!({"title":"denied", "content":"revocation persists"}),
+        })
+        .await
+        .expect("typed denial");
+    assert_eq!(
+        denied.result,
+        WireResult::Error {
+            code: "permission_denied".to_owned()
+        }
+    );
+    shutdown_sender.send(true).expect("shutdown");
+    serving.await.expect("server task").expect("clean shutdown");
+}
 
 #[tokio::test]
 async fn file_backed_ipc_client_authenticates_to_the_served_daemon() {

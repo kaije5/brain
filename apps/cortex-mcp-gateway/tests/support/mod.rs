@@ -70,8 +70,29 @@ pub fn verification_key() -> OidcVerificationKey {
 /// Panics if the checked-in key is invalid or token encoding fails.
 #[must_use]
 pub fn token(subject: &str, issuer: &str, audience: &str, offset_seconds: i64) -> BearerToken {
-    BearerToken::new(encoded_token(subject, issuer, audience, offset_seconds))
-        .expect("bounded token")
+    token_with_kid(subject, issuer, audience, offset_seconds, "test-key")
+}
+
+#[must_use]
+/// Signs a bearer token with an explicit key ID for rotation tests.
+///
+/// # Panics
+/// Panics if the checked-in signing fixture or requested token is invalid.
+pub fn token_with_kid(
+    subject: &str,
+    issuer: &str,
+    audience: &str,
+    offset_seconds: i64,
+    kid: &str,
+) -> BearerToken {
+    BearerToken::new(encoded_token_with_kid(
+        subject,
+        issuer,
+        audience,
+        offset_seconds,
+        kid,
+    ))
+    .expect("bounded token")
 }
 
 /// Signs and returns a raw token for request-level tests.
@@ -82,6 +103,16 @@ pub fn token(subject: &str, issuer: &str, audience: &str, offset_seconds: i64) -
 /// encoding fails.
 #[must_use]
 pub fn encoded_token(subject: &str, issuer: &str, audience: &str, offset_seconds: i64) -> String {
+    encoded_token_with_kid(subject, issuer, audience, offset_seconds, "test-key")
+}
+
+fn encoded_token_with_kid(
+    subject: &str,
+    issuer: &str,
+    audience: &str,
+    offset_seconds: i64,
+    kid: &str,
+) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
@@ -92,7 +123,7 @@ pub fn encoded_token(subject: &str, issuer: &str, audience: &str, offset_seconds
         now.saturating_add(offset_seconds.unsigned_abs())
     };
     let mut header = Header::new(jsonwebtoken::Algorithm::EdDSA);
-    header.kid = Some("test-key".to_owned());
+    header.kid = Some(kid.to_owned());
     encode(
         &header,
         &Claims {

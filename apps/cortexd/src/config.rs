@@ -7,6 +7,8 @@ use cortex_application::{Capability, CapabilityCatalog, SecretRef};
 use cortex_domain::{PrincipalId, WorkspaceId};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+const MAX_REMOTE_CLIENTS: usize = 16;
+
 /// Configuration owned locally by the daemon process, never by an IPC caller.
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -20,6 +22,7 @@ pub struct DaemonConfig {
     pub(crate) pairing_key_path: PathBuf,
     pub(crate) discovery_path: PathBuf,
     pub(crate) bootstrap_grants: Vec<Capability>,
+    pub(crate) remote_clients: Vec<RemoteClientConfig>,
 }
 
 impl DaemonConfig {
@@ -54,6 +57,7 @@ impl DaemonConfig {
             pairing_key_path: pairing_key_path(&discovery_path),
             discovery_path,
             bootstrap_grants: CapabilityCatalog::all().to_vec(),
+            remote_clients: Vec::new(),
         }
     }
 
@@ -78,6 +82,7 @@ impl DaemonConfig {
             if pairing_signer.verifying_key() != pairing_verifier {
                 return Err(crate::DaemonError::InvalidConfiguration);
             }
+            let remote_clients = load_remote_clients(&database_path)?;
             return Ok(Self {
                 database_path,
                 endpoint_name: discovery.endpoint_name,
@@ -91,6 +96,7 @@ impl DaemonConfig {
                 pairing_key_path,
                 discovery_path,
                 bootstrap_grants: CapabilityCatalog::all().to_vec(),
+                remote_clients,
             });
         }
         let config = Self::with_fresh_pairing(
@@ -118,6 +124,55 @@ impl DaemonConfig {
     pub fn with_bootstrap_grants(mut self, grants: Vec<Capability>) -> Self {
         self.bootstrap_grants = grants;
         self
+    }
+
+    /// Returns the daemon owner identity for local administration and enrollment setup.
+    #[must_use]
+    pub fn owner_principal_id(&self) -> uuid::Uuid {
+        self.principal_id.into()
+    }
+
+    /// Creates a distinct, durable local IPC enrollment for a remote paired principal.
+    /// Initial grants are inserted only when the principal is first created, so later
+    /// revocations survive daemon restarts.
+    ///
+    /// # Errors
+    /// Returns a redacted configuration error for duplicates, unsafe bounds, or persistence
+    /// failures.
+    pub fn enroll_remote_principal(
+        &mut self,
+        principal_id: PrincipalId,
+        grants: &[Capability],
+    ) -> Result<PathBuf, crate::DaemonError> {
+        if principal_id == self.principal_id
+            || grants.is_empty()
+            || self.remote_clients.len() >= MAX_REMOTE_CLIENTS
+            || self
+                .remote_clients
+                .iter()
+                .any(|client| client.principal_id == principal_id)
+        {
+            return Err(crate::DaemonError::InvalidConfiguration);
+        }
+        let signer = fresh_signing_key();
+        let enrollment_path = remote_enrollment_path(&self.database_path, principal_id);
+        let enrollment = PrivateEnrollment {
+            endpoint_name: self.endpoint_name.clone(),
+            principal_id: principal_id.into(),
+            signing_key: signer.to_bytes(),
+        };
+        write_private_bytes(
+            &enrollment_path,
+            &serde_json::to_vec(&enrollment)
+                .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
+        )?;
+        self.remote_clients.push(RemoteClientConfig {
+            principal_id,
+            pairing_verifier: signer.verifying_key(),
+            bootstrap_grants: grants.to_vec(),
+        });
+        write_remote_clients(&self.database_path, &self.remote_clients)?;
+        Ok(enrollment_path)
     }
 
     /// Opens the separate, per-user pairing enrollment artifact for a local client. The private
@@ -150,38 +205,41 @@ impl DaemonConfig {
     }
 
     fn write_pairing_key(&self) -> Result<(), crate::DaemonError> {
-        use std::io::Write;
-        #[cfg(windows)]
-        let mut file =
-            match crate::windows_security::create_current_user_file(&self.pairing_key_path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return self.ensure_pairing_key();
-                }
-                Err(_) => return Err(crate::DaemonError::InvalidConfiguration),
-            };
-        #[cfg(not(windows))]
-        let mut file = {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(&self.pairing_key_path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return self.ensure_pairing_key();
-                }
-                Err(_) => return Err(crate::DaemonError::InvalidConfiguration),
-            }
-        };
-        file.write_all(&self.pairing_signer.to_bytes())
-            .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
-        file.sync_all()
-            .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
-        Ok(())
+        write_private_bytes(&self.pairing_key_path, &self.pairing_signer.to_bytes())
     }
+}
+
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<(), crate::DaemonError> {
+    use std::io::Write;
+    #[cfg(windows)]
+    let mut file = match crate::windows_security::create_current_user_file(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(crate::DaemonError::InvalidConfiguration);
+        }
+        Err(_) => return Err(crate::DaemonError::InvalidConfiguration),
+    };
+    #[cfg(not(windows))]
+    let mut file = {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(crate::DaemonError::InvalidConfiguration);
+            }
+            Err(_) => return Err(crate::DaemonError::InvalidConfiguration),
+        }
+    };
+    file.write_all(bytes)
+        .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+    file.sync_all()
+        .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+    Ok(())
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -196,6 +254,32 @@ pub(crate) struct IpcEnrollment {
     pub endpoint_name: String,
     pub principal_id: PrincipalId,
     pub signer: SigningKey,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteClientConfig {
+    pub principal_id: PrincipalId,
+    pub pairing_verifier: VerifyingKey,
+    pub bootstrap_grants: Vec<Capability>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct PrivateEnrollment {
+    endpoint_name: String,
+    principal_id: uuid::Uuid,
+    signing_key: [u8; 32],
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RemoteClientManifest {
+    clients: Vec<RemoteClientEntry>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RemoteClientEntry {
+    principal_id: uuid::Uuid,
+    pairing_verifier: [u8; 32],
+    bootstrap_grants: Vec<String>,
 }
 
 pub(crate) fn load_ipc_enrollment(
@@ -221,6 +305,102 @@ pub(crate) fn load_ipc_enrollment(
             .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
         signer,
     })
+}
+
+pub(crate) fn load_explicit_enrollment(path: &Path) -> Result<IpcEnrollment, crate::DaemonError> {
+    let enrollment: PrivateEnrollment = serde_json::from_slice(
+        &fs::read(path).map_err(|_| crate::DaemonError::InvalidConfiguration)?,
+    )
+    .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+    if enrollment.endpoint_name.trim().is_empty() || enrollment.endpoint_name.len() > 253 {
+        return Err(crate::DaemonError::InvalidConfiguration);
+    }
+    Ok(IpcEnrollment {
+        endpoint_name: enrollment.endpoint_name,
+        principal_id: PrincipalId::try_from(enrollment.principal_id)
+            .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
+        signer: SigningKey::from_bytes(&enrollment.signing_key),
+    })
+}
+
+fn load_remote_clients(
+    database_path: &Path,
+) -> Result<Vec<RemoteClientConfig>, crate::DaemonError> {
+    let path = remote_manifest_path(database_path);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let manifest: RemoteClientManifest = serde_json::from_slice(
+        &fs::read(path).map_err(|_| crate::DaemonError::InvalidConfiguration)?,
+    )
+    .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+    if manifest.clients.len() > MAX_REMOTE_CLIENTS {
+        return Err(crate::DaemonError::InvalidConfiguration);
+    }
+    let mut clients = Vec::with_capacity(manifest.clients.len());
+    for entry in manifest.clients {
+        let principal_id = PrincipalId::try_from(entry.principal_id)
+            .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+        if clients
+            .iter()
+            .any(|client: &RemoteClientConfig| client.principal_id == principal_id)
+        {
+            return Err(crate::DaemonError::InvalidConfiguration);
+        }
+        let pairing_verifier = VerifyingKey::from_bytes(&entry.pairing_verifier)
+            .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+        let bootstrap_grants = entry
+            .bootstrap_grants
+            .into_iter()
+            .map(|name| {
+                Capability::from_mcp_name(&name).ok_or(crate::DaemonError::InvalidConfiguration)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if bootstrap_grants.is_empty() {
+            return Err(crate::DaemonError::InvalidConfiguration);
+        }
+        clients.push(RemoteClientConfig {
+            principal_id,
+            pairing_verifier,
+            bootstrap_grants,
+        });
+    }
+    Ok(clients)
+}
+
+fn write_remote_clients(
+    database_path: &Path,
+    clients: &[RemoteClientConfig],
+) -> Result<(), crate::DaemonError> {
+    let manifest = RemoteClientManifest {
+        clients: clients
+            .iter()
+            .map(|client| RemoteClientEntry {
+                principal_id: client.principal_id.into(),
+                pairing_verifier: client.pairing_verifier.to_bytes(),
+                bootstrap_grants: client
+                    .bootstrap_grants
+                    .iter()
+                    .map(|capability| capability.metadata().mcp_name.to_owned())
+                    .collect(),
+            })
+            .collect(),
+    };
+    let bytes =
+        serde_json::to_vec(&manifest).map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+    fs::write(remote_manifest_path(database_path), bytes)
+        .map_err(|_| crate::DaemonError::InvalidConfiguration)
+}
+
+fn remote_manifest_path(database_path: &Path) -> PathBuf {
+    database_path.with_extension("cortexd-clients.json")
+}
+
+fn remote_enrollment_path(database_path: &Path, principal_id: PrincipalId) -> PathBuf {
+    database_path.with_extension(format!(
+        "cortexd-client-{}.json",
+        uuid::Uuid::from(principal_id)
+    ))
 }
 
 fn fresh_signing_key() -> SigningKey {

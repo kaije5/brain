@@ -5,10 +5,12 @@ mod transport;
 mod tunnel;
 
 pub use auth::{
-    BearerToken, McpPrincipal, OidcAlgorithm, OidcMetadata, OidcVerificationKey,
-    PairedIdentityResolver, PairedSubject,
+    BearerToken, HttpOidcFetcher, McpPrincipal, OidcAlgorithm, OidcDocumentFetcher, OidcMetadata,
+    OidcVerificationKey, PairedIdentityResolver, PairedSubject,
 };
-pub use transport::{GatewayConfig, GatewayTransport, PrincipalRegistry, bind_loopback};
+pub use transport::{
+    GatewayConfig, GatewayRateLimit, GatewayTransport, PrincipalRegistry, bind_loopback,
+};
 pub use tunnel::{
     RelayEndpoint, RetryPolicy, RustlsTunnelConnector, TunnelClient, TunnelConnector,
 };
@@ -21,6 +23,7 @@ pub enum GatewayError {
     UnpairedIdentity,
     LocalTransportUnavailable,
     TunnelUnavailable,
+    OidcUnavailable,
 }
 
 impl std::fmt::Display for GatewayError {
@@ -31,6 +34,7 @@ impl std::fmt::Display for GatewayError {
             Self::UnpairedIdentity => "remote identity is not paired",
             Self::LocalTransportUnavailable => "local gateway transport is unavailable",
             Self::TunnelUnavailable => "outbound tunnel is unavailable",
+            Self::OidcUnavailable => "identity metadata is unavailable",
         })
     }
 }

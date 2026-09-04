@@ -392,6 +392,7 @@ dependencies = [
  "http",
  "http-body-util",
  "jsonwebtoken",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",

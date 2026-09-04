@@ -9,7 +9,8 @@ use tokio::{
 
 use crate::{
     DaemonError, DaemonRequest, DaemonResponse, PROTOCOL_VERSION, PairingChallenge,
-    PairingResponse, config::load_ipc_enrollment,
+    PairingResponse,
+    config::{IpcEnrollment, load_explicit_enrollment, load_ipc_enrollment},
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -31,11 +32,24 @@ impl AuthenticatedIpcClient {
     /// inconsistent.
     pub fn from_database_path(database_path: &Path) -> Result<Self, DaemonError> {
         let enrollment = load_ipc_enrollment(database_path)?;
-        Ok(Self {
+        Ok(Self::from_enrollment(enrollment))
+    }
+
+    /// Loads one explicitly provisioned, per-principal IPC enrollment.
+    ///
+    /// # Errors
+    /// Returns a redacted configuration error for a missing or malformed enrollment artifact.
+    pub fn from_enrollment_path(path: &Path) -> Result<Self, DaemonError> {
+        let enrollment = load_explicit_enrollment(path)?;
+        Ok(Self::from_enrollment(enrollment))
+    }
+
+    fn from_enrollment(enrollment: IpcEnrollment) -> Self {
+        Self {
             endpoint_name: enrollment.endpoint_name,
             principal_id: enrollment.principal_id,
             signer: enrollment.signer,
-        })
+        }
     }
 
     #[must_use]

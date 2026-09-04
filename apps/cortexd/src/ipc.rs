@@ -106,15 +106,21 @@ pub struct LocalDaemon {
     database: SqliteDatabase,
     endpoint_name: String,
     workspace_id: WorkspaceId,
-    principal_id: PrincipalId,
-    pairing_verifier: VerifyingKey,
-    pairing_signer: ed25519_dalek::SigningKey,
+    owner_principal_id: PrincipalId,
+    owner_pairing_signer: ed25519_dalek::SigningKey,
+    client_verifiers: Vec<ClientVerifier>,
     migrations_applied: bool,
     service: Arc<DaemonService>,
     search: Arc<DaemonSearch>,
     agent: Arc<DaemonAgent>,
     grants: BTreeSet<CapabilityGrant>,
     audit: SqliteAuditPort,
+}
+
+#[derive(Clone)]
+struct ClientVerifier {
+    principal_id: PrincipalId,
+    pairing_verifier: VerifyingKey,
 }
 
 type DaemonService =
@@ -163,6 +169,7 @@ impl cortex_application::AgentCapabilityExecutor for DaemonAgentExecutor {
 #[derive(Clone)]
 pub struct AuthenticatedLocalClient {
     daemon: LocalDaemon,
+    principal_id: PrincipalId,
 }
 
 /// Private-key material provisioned separately from public discovery for an intended local IPC
@@ -192,7 +199,7 @@ impl AuthenticatedLocalClient {
     pub async fn request(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
         Ok(self
             .daemon
-            .handle_authenticated_request(request.clone())
+            .handle_request_for(self.principal_id, request.clone())
             .await)
     }
 
@@ -249,16 +256,35 @@ impl LocalDaemon {
             )
             .await
             .map_err(|_| DaemonError::StartupFailed)?;
-        let persisted_capabilities = repositories
-            .granted_capabilities(config.workspace_id, config.principal_id)
-            .await
-            .map_err(|_| DaemonError::StartupFailed)?;
-        let grants: BTreeSet<_> = persisted_capabilities
-            .into_iter()
-            .map(|capability| {
-                CapabilityGrant::new(config.workspace_id, config.principal_id, capability)
-            })
-            .collect();
+        for remote in &config.remote_clients {
+            repositories
+                .bootstrap_principal(
+                    config.workspace_id,
+                    remote.principal_id,
+                    "paired-remote",
+                    &remote.bootstrap_grants,
+                )
+                .await
+                .map_err(|_| DaemonError::StartupFailed)?;
+        }
+        let mut client_verifiers = vec![ClientVerifier {
+            principal_id: config.principal_id,
+            pairing_verifier: config.pairing_verifier,
+        }];
+        client_verifiers.extend(config.remote_clients.iter().map(|remote| ClientVerifier {
+            principal_id: remote.principal_id,
+            pairing_verifier: remote.pairing_verifier,
+        }));
+        let mut grants = BTreeSet::new();
+        for client in &client_verifiers {
+            let persisted_capabilities = repositories
+                .granted_capabilities(config.workspace_id, client.principal_id)
+                .await
+                .map_err(|_| DaemonError::StartupFailed)?;
+            grants.extend(persisted_capabilities.into_iter().map(|capability| {
+                CapabilityGrant::new(config.workspace_id, client.principal_id, capability)
+            }));
+        }
         let service = Arc::new(ApplicationService::new(
             GrantPolicy::new(grants.iter().copied()),
             repositories.clone(),
@@ -277,9 +303,9 @@ impl LocalDaemon {
             database,
             endpoint_name: config.endpoint_name,
             workspace_id: config.workspace_id,
-            principal_id: config.principal_id,
-            pairing_verifier: config.pairing_verifier,
-            pairing_signer: config.pairing_signer,
+            owner_principal_id: config.principal_id,
+            owner_pairing_signer: config.pairing_signer,
+            client_verifiers,
             migrations_applied: true,
             service,
             search: Arc::new(HybridSearchService::new(
@@ -304,7 +330,13 @@ impl LocalDaemon {
     /// Returns the daemon-owned tenant identities for local diagnostics only.
     #[must_use]
     pub fn ownership_identity(&self) -> (Uuid, Uuid) {
-        (self.workspace_id.into(), self.principal_id.into())
+        (self.workspace_id.into(), self.owner_principal_id.into())
+    }
+
+    /// Returns the daemon workspace for local administrative inspection.
+    #[must_use]
+    pub const fn ownership_workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
     }
 
     /// Demonstrates the fail-closed unpaired-client path used by transport adapters.
@@ -320,6 +352,7 @@ impl LocalDaemon {
     pub fn paired_client(&self) -> AuthenticatedLocalClient {
         AuthenticatedLocalClient {
             daemon: self.clone(),
+            principal_id: self.owner_principal_id,
         }
     }
 
@@ -341,19 +374,26 @@ impl LocalDaemon {
     /// The request principal is not trusted: the daemon-owned local principal is authoritative.
     async fn request_authenticated(
         &self,
+        principal_id: PrincipalId,
         request: &DaemonRequest,
     ) -> Result<DaemonResponse, DaemonError> {
         validate_request(request)?;
         let correlation_id = request.request_id;
         match request.capability.as_str() {
-            "cortex_daemon_status" => Ok(self.diagnostic_response(correlation_id, "status")),
-            "cortex_daemon_doctor" => Ok(self.diagnostic_response(correlation_id, "doctor")),
-            "cortex_daemon_logs" => Ok(self.diagnostic_response(correlation_id, "logs")),
-            "cortex_knowledge_search" | "cortex_note_search" | "cortex_memory_search" => {
-                self.search_knowledge(request).await
+            "cortex_daemon_status" => {
+                Ok(self.diagnostic_response(principal_id, correlation_id, "status"))
             }
-            "cortex_task_list" => self.list_tasks(request).await,
-            "cortex_agent_run" => self.run_agent(request).await,
+            "cortex_daemon_doctor" => {
+                Ok(self.diagnostic_response(principal_id, correlation_id, "doctor"))
+            }
+            "cortex_daemon_logs" => {
+                Ok(self.diagnostic_response(principal_id, correlation_id, "logs"))
+            }
+            "cortex_knowledge_search" | "cortex_note_search" | "cortex_memory_search" => {
+                self.search_knowledge(principal_id, request).await
+            }
+            "cortex_task_list" => self.list_tasks(principal_id, request).await,
+            "cortex_agent_run" => self.run_agent(principal_id, request).await,
             "cortex_note_create"
             | "cortex_note_update"
             | "cortex_note_delete"
@@ -366,17 +406,21 @@ impl LocalDaemon {
             | "cortex_memory_create"
             | "cortex_memory_correct"
             | "cortex_memory_delete"
-            | "cortex_memory_restore" => self.dispatch_mutation(request).await,
+            | "cortex_memory_restore" => self.dispatch_mutation(principal_id, request).await,
             _ => Err(DaemonError::UnsupportedCapability),
         }
     }
 
-    async fn create_note(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
+    async fn create_note(
+        &self,
+        principal_id: PrincipalId,
+        request: &DaemonRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
         let input: WireNoteCreate = serde_json::from_value(request.payload.clone())
             .map_err(|_| DaemonError::InvalidRequest)?;
         let context = CommandContext::from_authenticated(
             self.workspace_id,
-            self.principal_id,
+            principal_id,
             OperationId::try_from(request.operation_id).map_err(|_| DaemonError::InvalidRequest)?,
             request.request_id,
         );
@@ -397,12 +441,13 @@ impl LocalDaemon {
     #[allow(clippy::too_many_lines)] // Exhaustive, typed catalog-to-service mapping stays auditable in one place.
     async fn dispatch_mutation(
         &self,
+        principal_id: PrincipalId,
         request: &DaemonRequest,
     ) -> Result<DaemonResponse, DaemonError> {
         if request.capability == "cortex_note_create" {
-            return self.create_note(request).await;
+            return self.create_note(principal_id, request).await;
         }
-        let context = self.command_context(request)?;
+        let context = self.command_context(principal_id, request)?;
         let result = match request.capability.as_str() {
             "cortex_note_update" => {
                 let input: WireNoteUpdate = decode_payload(&request.payload)?;
@@ -512,6 +557,7 @@ impl LocalDaemon {
 
     async fn search_knowledge(
         &self,
+        principal_id: PrincipalId,
         request: &DaemonRequest,
     ) -> Result<DaemonResponse, DaemonError> {
         #[derive(Deserialize)]
@@ -522,7 +568,7 @@ impl LocalDaemon {
         }
         let capability = Capability::from_mcp_name(&request.capability)
             .ok_or(DaemonError::UnsupportedCapability)?;
-        self.authorize_and_audit(request, capability, AuditResult::Succeeded)
+        self.authorize_and_audit(principal_id, request, capability, AuditResult::Succeeded)
             .await?;
         let payload: SearchPayload = decode_payload(&request.payload)?;
         let limit = std::num::NonZeroUsize::new(payload.limit.unwrap_or(20).min(100))
@@ -531,7 +577,7 @@ impl LocalDaemon {
             .search
             .search(SearchRequest {
                 workspace_id: self.workspace_id,
-                principal_id: self.principal_id,
+                principal_id,
                 query: payload.query,
                 limit,
             })
@@ -540,14 +586,23 @@ impl LocalDaemon {
         Ok(search_response(request.request_id, hits))
     }
 
-    async fn list_tasks(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
+    async fn list_tasks(
+        &self,
+        principal_id: PrincipalId,
+        request: &DaemonRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct TaskListPayload {
             limit: Option<usize>,
         }
-        self.authorize_and_audit(request, Capability::TaskList, AuditResult::Succeeded)
-            .await?;
+        self.authorize_and_audit(
+            principal_id,
+            request,
+            Capability::TaskList,
+            AuditResult::Succeeded,
+        )
+        .await?;
         let payload: TaskListPayload = decode_payload(&request.payload)?;
         let limit = std::num::NonZeroUsize::new(payload.limit.unwrap_or(20).min(100))
             .ok_or(DaemonError::InvalidRequest)?;
@@ -577,14 +632,23 @@ impl LocalDaemon {
         })
     }
 
-    async fn run_agent(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
+    async fn run_agent(
+        &self,
+        principal_id: PrincipalId,
+        request: &DaemonRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct AgentPayload {
             prompt: String,
         }
-        self.authorize_and_audit(request, Capability::AgentRun, AuditResult::Succeeded)
-            .await?;
+        self.authorize_and_audit(
+            principal_id,
+            request,
+            Capability::AgentRun,
+            AuditResult::Succeeded,
+        )
+        .await?;
         let payload: AgentPayload = decode_payload(&request.payload)?;
         let allowed = AuthorizedCapabilities::new(
             CapabilityCatalog::all()
@@ -593,7 +657,7 @@ impl LocalDaemon {
                 .filter(|capability| *capability != Capability::AgentRun),
         )
         .map_err(DaemonError::from)?;
-        let context = self.command_context(request)?;
+        let context = self.command_context(principal_id, request)?;
         let output = self
             .agent
             .run(context, &payload.prompt, allowed)
@@ -610,14 +674,15 @@ impl LocalDaemon {
 
     async fn authorize_and_audit(
         &self,
+        principal_id: PrincipalId,
         request: &DaemonRequest,
         capability: Capability,
         allowed_result: AuditResult,
     ) -> Result<(), DaemonError> {
-        let context = self.command_context(request)?;
+        let context = self.command_context(principal_id, request)?;
         let allowed = self.grants.contains(&CapabilityGrant::new(
             self.workspace_id,
-            self.principal_id,
+            principal_id,
             capability,
         ));
         let decision = if allowed {
@@ -634,7 +699,7 @@ impl LocalDaemon {
             .append(AuditEvent {
                 id: AuditEventId::new(),
                 workspace_id: self.workspace_id,
-                principal_id: self.principal_id,
+                principal_id,
                 operation_id: context.operation_id,
                 correlation_id: context.correlation_id,
                 capability: capability.metadata().mcp_name,
@@ -651,10 +716,14 @@ impl LocalDaemon {
         }
     }
 
-    fn command_context(&self, request: &DaemonRequest) -> Result<CommandContext, DaemonError> {
+    fn command_context(
+        &self,
+        principal_id: PrincipalId,
+        request: &DaemonRequest,
+    ) -> Result<CommandContext, DaemonError> {
         Ok(CommandContext::from_authenticated(
             self.workspace_id,
-            self.principal_id,
+            principal_id,
             OperationId::try_from(request.operation_id).map_err(|_| DaemonError::InvalidRequest)?,
             request.request_id,
         ))
@@ -663,8 +732,17 @@ impl LocalDaemon {
     /// Applies the daemon-owned authenticated principal after a transport challenge succeeded.
     #[must_use]
     pub async fn handle_authenticated_request(&self, request: DaemonRequest) -> DaemonResponse {
+        self.handle_request_for(self.owner_principal_id, request)
+            .await
+    }
+
+    async fn handle_request_for(
+        &self,
+        principal_id: PrincipalId,
+        request: DaemonRequest,
+    ) -> DaemonResponse {
         let request_id = request.request_id;
-        let result = match self.request_authenticated(&request).await {
+        let result = match self.request_authenticated(principal_id, &request).await {
             Ok(response) => return response,
             Err(error) => WireResult::Error {
                 code: error.wire_code().to_owned(),
@@ -678,22 +756,35 @@ impl LocalDaemon {
     }
 
     fn pairing_response(&self, challenge: &PairingChallenge) -> PairingResponse {
-        pairing_response_for(&self.pairing_signer, challenge)
+        pairing_response_for(&self.owner_pairing_signer, challenge)
     }
 
-    fn verify_pairing(&self, challenge: &PairingChallenge, response: &PairingResponse) -> bool {
+    fn verify_pairing(
+        &self,
+        challenge: &PairingChallenge,
+        response: &PairingResponse,
+    ) -> Option<PrincipalId> {
         if response.protocol_version != PROTOCOL_VERSION || response.signature.len() != 64 {
-            return false;
+            return None;
         }
         let Ok(signature) = Signature::try_from(response.signature.as_slice()) else {
-            return false;
+            return None;
         };
-        self.pairing_verifier
-            .verify(&pairing_message(challenge), &signature)
-            .is_ok()
+        self.client_verifiers.iter().find_map(|client| {
+            client
+                .pairing_verifier
+                .verify(&pairing_message(challenge), &signature)
+                .is_ok()
+                .then_some(client.principal_id)
+        })
     }
 
-    fn diagnostic_response(&self, request_id: Uuid, capability: &str) -> DaemonResponse {
+    fn diagnostic_response(
+        &self,
+        principal_id: PrincipalId,
+        request_id: Uuid,
+        capability: &str,
+    ) -> DaemonResponse {
         DaemonResponse {
             protocol_version: PROTOCOL_VERSION,
             request_id,
@@ -702,7 +793,7 @@ impl LocalDaemon {
                     "capability": capability,
                     "correlation_id": request_id.to_string(),
                     "workspace_id": Uuid::from(self.workspace_id).to_string(),
-                    "principal_id": Uuid::from(self.principal_id).to_string(),
+                    "principal_id": Uuid::from(principal_id).to_string(),
                     "migrations_applied": self.migrations_applied,
                 }),
             },
@@ -982,20 +1073,21 @@ where
     let pairing = read_frame(stream).await?;
     let pairing: PairingResponse =
         serde_json::from_slice(&pairing).map_err(|_| DaemonError::Unauthenticated)?;
-    if !daemon.verify_pairing(&challenge, &pairing) {
-        return Err(DaemonError::Unauthenticated);
-    }
+    let principal_id = daemon
+        .verify_pairing(&challenge, &pairing)
+        .ok_or(DaemonError::Unauthenticated)?;
     let bytes = read_frame(stream).await?;
-    let response = response_for_request(daemon, &bytes).await?;
+    let response = response_for_request(daemon, principal_id, &bytes).await?;
     write_response(stream, &response).await
 }
 
 async fn response_for_request(
     daemon: &LocalDaemon,
+    principal_id: PrincipalId,
     bytes: &[u8],
 ) -> Result<DaemonResponse, DaemonError> {
     let response = match daemon.decode_request(bytes) {
-        Ok(request) => daemon.handle_authenticated_request(request).await,
+        Ok(request) => daemon.handle_request_for(principal_id, request).await,
         Err(error) => {
             let request_id = recover_request_id(bytes).ok_or(DaemonError::InvalidRequest)?;
             DaemonResponse {

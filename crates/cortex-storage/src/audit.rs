@@ -57,6 +57,32 @@ impl SqliteAuditPort {
         .map_err(|_| storage_error("audit count failed"))?;
         u64::try_from(count).map_err(|_| storage_error("invalid audit count"))
     }
+
+    /// Loads the single audit event for a correlation within one workspace.
+    ///
+    /// # Errors
+    /// Returns a redacted storage error for duplicate, malformed, or unavailable audit state.
+    pub async fn find_for_correlation(
+        &self,
+        workspace_id: cortex_domain::WorkspaceId,
+        correlation_id: Uuid,
+    ) -> Result<Option<AuditEvent>, ApplicationError> {
+        let rows = sqlx::query(
+            "SELECT id, workspace_id, principal_id, operation_id, correlation_id, capability, \
+             target_id, policy_decision, result FROM audit_event \
+             WHERE workspace_id = ? AND correlation_id = ? LIMIT 2",
+        )
+        .bind(uuid_text(workspace_id))
+        .bind(correlation_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| storage_error("audit correlation lookup failed"))?;
+        match rows.as_slice() {
+            [] => Ok(None),
+            [row] => decode_event(row).map(Some),
+            _ => Err(storage_error("duplicate audit correlation")),
+        }
+    }
 }
 
 impl AuditPort for SqliteAuditPort {
