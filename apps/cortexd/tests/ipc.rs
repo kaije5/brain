@@ -1,10 +1,46 @@
 use cortex_application::Capability;
 use cortexd::{
-    DaemonConfig, DaemonError, DaemonRequest, LocalDaemon, PROTOCOL_VERSION, WireResult,
+    AuthenticatedIpcClient, DaemonConfig, DaemonError, DaemonRequest, LocalDaemon,
+    PROTOCOL_VERSION, WireResult,
 };
 use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn file_backed_ipc_client_authenticates_to_the_served_daemon() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let database_path = directory.path().join("cortex.db");
+    let config = DaemonConfig::from_database_path(database_path.clone()).expect("config");
+    let daemon = std::sync::Arc::new(LocalDaemon::start(config).await.expect("daemon starts"));
+    let principal_id = daemon.ownership_identity().1;
+    let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(std::sync::Arc::clone(&daemon).serve(shutdown));
+    tokio::task::yield_now().await;
+
+    let client = AuthenticatedIpcClient::from_database_path(&database_path)
+        .expect("protected enrollment is readable");
+    assert_eq!(Uuid::from(client.principal_id()), principal_id);
+    let request_id = Uuid::now_v7();
+    let response = client
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_daemon_status".to_owned(),
+            payload: json!({}),
+        })
+        .await
+        .expect("paired IPC request");
+    assert_eq!(response.request_id, request_id);
+    assert!(matches!(response.result, WireResult::Success { .. }));
+
+    shutdown_sender
+        .send(true)
+        .expect("server receives shutdown");
+    serving.await.expect("server task").expect("clean shutdown");
+}
 
 #[tokio::test]
 async fn authenticated_ipc_ignores_client_claimed_principal_and_preserves_correlation() {

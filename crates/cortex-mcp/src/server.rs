@@ -9,7 +9,10 @@ use std::{
 };
 
 use bytes::{Buf, Bytes};
-use cortexd::{AuthenticatedLocalClient, DaemonRequest, PROTOCOL_VERSION, WireResult};
+use cortexd::{
+    AuthenticatedIpcClient, AuthenticatedLocalClient, DaemonRequest, DaemonResponse,
+    PROTOCOL_VERSION, WireResult,
+};
 use http::{Request, Response, StatusCode, header, uri::Authority};
 use http_body::Body;
 use http_body_util::{BodyExt, Full, Limited, combinators::BoxBody};
@@ -41,13 +44,39 @@ const MIN_HTTP_TIMEOUT: Duration = Duration::from_millis(1);
 /// It has no public constructor from untrusted tool arguments.
 #[derive(Clone)]
 pub struct McpPrincipal {
-    client: AuthenticatedLocalClient,
+    client: PrincipalClient,
+}
+
+#[derive(Clone)]
+enum PrincipalClient {
+    InProcess(std::sync::Arc<AuthenticatedLocalClient>),
+    Ipc(std::sync::Arc<AuthenticatedIpcClient>),
 }
 
 impl McpPrincipal {
     #[must_use]
     pub fn from_authenticated(client: AuthenticatedLocalClient) -> Self {
-        Self { client }
+        Self {
+            client: PrincipalClient::InProcess(std::sync::Arc::new(client)),
+        }
+    }
+
+    /// Creates a principal backed by the daemon's file-enrolled local IPC client.
+    #[must_use]
+    pub fn from_ipc(client: AuthenticatedIpcClient) -> Self {
+        Self {
+            client: PrincipalClient::Ipc(std::sync::Arc::new(client)),
+        }
+    }
+
+    async fn request(
+        &self,
+        request: &DaemonRequest,
+    ) -> Result<DaemonResponse, cortexd::DaemonError> {
+        match &self.client {
+            PrincipalClient::InProcess(client) => client.request(request).await,
+            PrincipalClient::Ipc(client) => client.request(request).await,
+        }
     }
 }
 
@@ -85,7 +114,7 @@ impl McpServer {
             capability: schema.name,
             payload: arguments,
         };
-        let response = timeout(TOOL_TIMEOUT, principal.client.request(&request))
+        let response = timeout(TOOL_TIMEOUT, principal.request(&request))
             .await
             .map_err(|_| McpError::unavailable())?
             .map_err(|_| McpError::unavailable())?;

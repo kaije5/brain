@@ -1,11 +1,13 @@
 #![deny(unsafe_code)]
 
+mod client;
 mod config;
 mod ipc;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_security;
 
+pub use client::AuthenticatedIpcClient;
 pub use config::DaemonConfig;
 pub use ipc::{
     AuthenticatedLocalClient, DaemonError, DaemonRequest, DaemonResponse, LocalDaemon,

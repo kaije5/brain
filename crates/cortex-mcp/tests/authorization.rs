@@ -1,12 +1,38 @@
 use bytes::Bytes;
 use cortex_mcp::{HttpSecurityConfig, McpError, McpPrincipal, McpServer, streamable_http_service};
-use cortexd::{DaemonConfig, LocalDaemon};
+use cortexd::{AuthenticatedIpcClient, DaemonConfig, LocalDaemon};
 use http::{Request, header};
 use http_body_util::{BodyExt, Full};
 use serde_json::json;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use tower_service::Service;
+
+#[tokio::test]
+async fn file_enrolled_gateway_principal_dispatches_over_real_local_ipc() {
+    let directory = TempDir::new().expect("temporary directory");
+    let database_path = directory.path().join("cortex.db");
+    let config = DaemonConfig::from_database_path(database_path.clone()).expect("config");
+    let daemon = std::sync::Arc::new(LocalDaemon::start(config).await.expect("daemon starts"));
+    let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(std::sync::Arc::clone(&daemon).serve(shutdown));
+    tokio::task::yield_now().await;
+    let client = AuthenticatedIpcClient::from_database_path(&database_path).expect("enrollment");
+    let principal = McpPrincipal::from_ipc(client);
+
+    let result = McpServer::new()
+        .call_tool_as(
+            &principal,
+            "cortex_knowledge_search",
+            json!({"query":"Cortex"}),
+        )
+        .await
+        .expect("paired IPC dispatch");
+    assert!(result.is_array());
+
+    shutdown_sender.send(true).expect("shutdown sent");
+    serving.await.expect("server task").expect("clean shutdown");
+}
 
 const MCP_ACCEPT: &str = "application/json, text/event-stream";
 

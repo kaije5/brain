@@ -192,6 +192,37 @@ struct Discovery {
     pairing_verifier: [u8; 32],
 }
 
+pub(crate) struct IpcEnrollment {
+    pub endpoint_name: String,
+    pub principal_id: PrincipalId,
+    pub signer: SigningKey,
+}
+
+pub(crate) fn load_ipc_enrollment(
+    database_path: &Path,
+) -> Result<IpcEnrollment, crate::DaemonError> {
+    if database_path.as_os_str().is_empty() {
+        return Err(crate::DaemonError::InvalidConfiguration);
+    }
+    let discovery_path = database_path.with_extension("cortexd-discovery.json");
+    let discovery: Discovery = serde_json::from_slice(
+        &fs::read(&discovery_path).map_err(|_| crate::DaemonError::InvalidConfiguration)?,
+    )
+    .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+    let signer = load_pairing_signer(&pairing_key_path(&discovery_path))?;
+    let verifier = VerifyingKey::from_bytes(&discovery.pairing_verifier)
+        .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+    if signer.verifying_key() != verifier {
+        return Err(crate::DaemonError::InvalidConfiguration);
+    }
+    Ok(IpcEnrollment {
+        endpoint_name: discovery.endpoint_name,
+        principal_id: PrincipalId::try_from(discovery.principal_id)
+            .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
+        signer,
+    })
+}
+
 fn fresh_signing_key() -> SigningKey {
     let mut seed = [0_u8; 32];
     seed[..16].copy_from_slice(uuid::Uuid::now_v7().as_bytes());
