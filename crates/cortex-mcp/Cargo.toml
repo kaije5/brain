@@ -1,0 +1,23 @@
+[package]
+name = "cortex-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cortex-application = { path = "../cortex-application" }
+cortexd = { path = "../../apps/cortexd" }
+rmcp = { version = "0.16", features = ["server", "transport-streamable-http-server"] }
+schemars = "1.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["macros", "rt", "time"] }
+tokio-util = "0.7"
+uuid = { version = "1.24", features = ["v7"] }
+
+[dev-dependencies]
+tempfile = "3.23"
