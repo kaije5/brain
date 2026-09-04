@@ -29,3 +29,24 @@ fn task_due_date_is_normalized_to_daemon_rfc3339() {
         json!({"title":"Finish","due_at":"2026-09-01T00:00:00+00:00"})
     );
 }
+
+#[tokio::test]
+async fn task_list_payload_is_accepted_by_the_daemon_contract() {
+    let directory = tempfile::TempDir::new().expect("temporary directory");
+    let daemon = cortexd::LocalDaemon::start(cortexd::DaemonConfig::for_test(directory.path()))
+        .await
+        .expect("daemon starts");
+    let cli = Cli::try_parse_from(["brain", "task", "list", "--limit", "3"]).expect("parses");
+    let request = command_request(&cli)
+        .expect("maps")
+        .into_daemon_request(uuid::Uuid::now_v7());
+    let response = daemon
+        .paired_client()
+        .request(&request)
+        .await
+        .expect("wire response");
+    assert!(matches!(
+        response.result,
+        cortexd::WireResult::Success { .. }
+    ));
+}

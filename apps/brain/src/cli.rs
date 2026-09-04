@@ -123,7 +123,7 @@ pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
             json!({"title": title, "due_at": due.as_deref().map(normalize_due).transpose()?}),
             true,
         ),
-        Command::Task(TaskCommand::List { limit }) => bounded("cortex_task_list", "", *limit)?,
+        Command::Task(TaskCommand::List { limit }) => task_list(*limit)?,
         Command::Task(TaskCommand::Complete(input)) => (
             "cortex_task_complete",
             json!({"entity_id": input.entity_id, "expected_revision": input.revision}),
@@ -161,6 +161,13 @@ fn bounded<'a>(
         return Err(CliCommandError::InvalidInput);
     }
     Ok((capability, json!({"query":query,"limit":limit}), false))
+}
+
+fn task_list(limit: usize) -> Result<(&'static str, Value, bool), CliCommandError> {
+    if limit == 0 || limit > 100 {
+        return Err(CliCommandError::InvalidInput);
+    }
+    Ok(("cortex_task_list", json!({"limit":limit}), false))
 }
 
 fn normalize_due(value: &str) -> Result<String, CliCommandError> {
