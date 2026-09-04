@@ -595,6 +595,25 @@ impl NoteRepository for SqliteRepositories {
 }
 
 impl TaskRepository for SqliteRepositories {
+    async fn list_active(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<Task>, ApplicationError> {
+        let limit = i64::try_from(limit.get()).map_err(|_| storage_error("task list failed"))?;
+        let rows = sqlx::query(
+            "SELECT id, workspace_id, title, due_at, status, revision, lifecycle \
+             FROM task WHERE workspace_id = ? AND lifecycle = 'active' \
+             ORDER BY due_at IS NULL, due_at, id LIMIT ?",
+        )
+        .bind(id_text(workspace_id))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| storage_error("task list failed"))?;
+        rows.iter().map(decode_task).collect()
+    }
+
     async fn find(
         &self,
         workspace_id: WorkspaceId,

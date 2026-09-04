@@ -175,6 +175,27 @@ impl NoteRepository for FakeState {
 }
 
 impl TaskRepository for FakeState {
+    async fn list_active(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<Task>, ApplicationError> {
+        let mut tasks: Vec<_> = self
+            .inner
+            .lock()
+            .map_err(|_| ApplicationError::Internal)?
+            .tasks
+            .iter()
+            .filter(|((stored_workspace, _), task)| {
+                *stored_workspace == workspace_id && task.lifecycle() == Lifecycle::Active
+            })
+            .map(|(_, task)| task.clone())
+            .collect();
+        tasks.sort_by_key(Task::id);
+        tasks.truncate(limit.get());
+        Ok(tasks)
+    }
+
     async fn find(
         &self,
         workspace_id: WorkspaceId,

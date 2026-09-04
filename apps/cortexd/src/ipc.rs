@@ -3,7 +3,8 @@ use std::{collections::BTreeSet, io, sync::Arc, time::Duration};
 use cortex_application::{
     ApplicationError, ApplicationService, AuditPort, Capability, CapabilityCatalog,
     CapabilityGrant, CommandContext, GrantPolicy, MemoryCorrectInput, MemoryCreateInput,
-    NoteCreateInput, NoteUpdateInput, SecretStore, TaskCreateInput, TaskUpdateInput,
+    NoteCreateInput, NoteUpdateInput, SecretStore, TaskCreateInput, TaskRepository,
+    TaskUpdateInput,
 };
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, OperationId, PolicyDecision, PolicyDeny,
@@ -351,6 +352,7 @@ impl LocalDaemon {
             "cortex_knowledge_search" | "cortex_note_search" | "cortex_memory_search" => {
                 self.search_knowledge(request).await
             }
+            "cortex_task_list" => self.list_tasks(request).await,
             "cortex_agent_run" => self.run_agent(request).await,
             "cortex_note_create"
             | "cortex_note_update"
@@ -536,6 +538,43 @@ impl LocalDaemon {
             .await
             .map_err(DaemonError::from)?;
         Ok(search_response(request.request_id, hits))
+    }
+
+    async fn list_tasks(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct TaskListPayload {
+            limit: Option<usize>,
+        }
+        self.authorize_and_audit(request, Capability::TaskList, AuditResult::Succeeded)
+            .await?;
+        let payload: TaskListPayload = decode_payload(&request.payload)?;
+        let limit = std::num::NonZeroUsize::new(payload.limit.unwrap_or(20).min(100))
+            .ok_or(DaemonError::InvalidRequest)?;
+        let tasks =
+            TaskRepository::list_active(&self.database.repositories(), self.workspace_id, limit)
+                .await
+                .map_err(DaemonError::from)?;
+        Ok(DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            result: WireResult::Success {
+                value: Value::Array(
+                    tasks
+                        .into_iter()
+                        .map(|task| {
+                            json!({
+                                "entity_id": Uuid::from(task.id()).to_string(),
+                                "title": task.title(),
+                                "due_at": task.due_at().map(|due| due.to_rfc3339()),
+                                "status": format!("{:?}", task.status()).to_ascii_lowercase(),
+                                "revision": task.revision().get(),
+                            })
+                        })
+                        .collect(),
+                ),
+            },
+        })
     }
 
     async fn run_agent(&self, request: &DaemonRequest) -> Result<DaemonResponse, DaemonError> {
@@ -906,6 +945,7 @@ fn search_response(request_id: Uuid, hits: Vec<cortex_search::SearchHit>) -> Dae
                 "entity_id": Uuid::from(hit.entity_id).to_string(),
                 "kind": hit.kind.as_str(),
                 "snippet": truncate_utf8(&hit.snippet, MAX_SEARCH_SNIPPET_BYTES),
+                "sources": hit.sources.into_iter().map(|source| Uuid::from(source.source_id).to_string()).collect::<Vec<_>>(),
                 "semantic_degraded": hit.semantic_degraded,
             })
         })
@@ -1512,5 +1552,27 @@ mod tests {
             }
         );
         write.await.expect("writer task").expect("fallback write");
+    }
+
+    #[test]
+    fn search_wire_response_preserves_bounded_source_citations() {
+        let source = cortex_domain::EntityId::new();
+        let response = super::search_response(
+            Uuid::now_v7(),
+            vec![cortex_search::SearchHit {
+                entity_id: cortex_domain::EntityId::new(),
+                kind: cortex_application::EntityKind::Memory,
+                snippet: "cited statement".to_owned(),
+                lexical_rank: Some(1),
+                semantic_rank: None,
+                fused_score: 1.0,
+                sources: vec![cortex_domain::SourceRef { source_id: source }],
+                semantic_degraded: false,
+            }],
+        );
+        let WireResult::Success { value } = response.result else {
+            panic!("search response is successful");
+        };
+        assert_eq!(value[0]["sources"][0], Uuid::from(source).to_string());
     }
 }

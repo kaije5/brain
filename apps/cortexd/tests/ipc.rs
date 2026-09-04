@@ -132,6 +132,42 @@ async fn paired_note_create_is_dispatched_through_the_daemon_owned_application_s
 }
 
 #[tokio::test]
+async fn task_list_is_authorized_audited_and_returns_only_active_workspace_tasks() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let daemon = LocalDaemon::start(DaemonConfig::for_test(directory.path()))
+        .await
+        .expect("daemon should start");
+    let paired = daemon.paired_client();
+    let created = paired
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_task_create".to_owned(),
+            payload: json!({"title":"listed","due_at":null}),
+        })
+        .await
+        .expect("create response");
+    assert!(matches!(created.result, WireResult::Success { .. }));
+    let response = paired
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_task_list".to_owned(),
+            payload: json!({"limit":20}),
+        })
+        .await
+        .expect("list response");
+    let WireResult::Success { value } = response.result else {
+        panic!("list succeeds");
+    };
+    assert_eq!(value[0]["title"], "listed");
+}
+
+#[tokio::test]
 async fn paired_unsupported_capability_returns_a_redacted_wire_error() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let daemon = LocalDaemon::start(DaemonConfig::for_test(directory.path()))

@@ -25,6 +25,13 @@ pub trait NoteRepository: Send + Sync {
 /// Application-owned persistence port for task aggregates.
 #[allow(async_fn_in_trait)]
 pub trait TaskRepository: Send + Sync {
+    /// Lists active tasks in a workspace, bounded by the adapter-provided page limit.
+    async fn list_active(
+        &self,
+        workspace_id: WorkspaceId,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<Vec<Task>, ApplicationError>;
+
     /// Loads only an active task for ordinary query paths.
     async fn find(
         &self,

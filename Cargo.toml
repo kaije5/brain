@@ -6,6 +6,7 @@ members = [
     "crates/cortex-search",
     "crates/cortex-storage",
     "apps/cortexd",
+    "apps/brain",
 ]
 resolver = "3"
 
