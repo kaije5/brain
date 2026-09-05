@@ -116,12 +116,16 @@ impl McpServer {
         };
         let response = timeout(TOOL_TIMEOUT, principal.request(&request))
             .await
-            .map_err(|_| McpError::unavailable())?
-            .map_err(|_| McpError::unavailable())?;
+            .map_err(|_| McpError::unavailable().with_correlation(request.request_id))?
+            .map_err(|_| McpError::unavailable().with_correlation(request.request_id))?;
         match response.result {
             WireResult::Success { value } if serialized_len(&value)? <= MAX_TOOL_BYTES => Ok(value),
-            WireResult::Success { .. } => Err(McpError::unavailable()),
-            WireResult::Error { code } => Err(map_wire_error(&code)),
+            WireResult::Success { .. } => {
+                Err(McpError::unavailable().with_correlation(request.request_id))
+            }
+            WireResult::Error { code } => {
+                Err(map_wire_error(&code).with_correlation(request.request_id))
+            }
         }
     }
 }

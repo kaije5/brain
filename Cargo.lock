@@ -346,6 +346,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortex-e2e"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "brain",
+ "clap",
+ "cortex-application",
+ "cortex-domain",
+ "cortex-inference",
+ "cortex-mcp",
+ "cortex-mcp-gateway",
+ "cortex-storage",
+ "cortexd",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "cortex-inference"
 version = "0.1.0"
 dependencies = [

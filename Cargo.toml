@@ -9,6 +9,7 @@ members = [
     "apps/brain",
     "apps/cortex-mcp-gateway",
     "crates/cortex-mcp",
+    "tests/e2e",
 ]
 resolver = "3"
 

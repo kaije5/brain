@@ -10,7 +10,10 @@ use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, OperationId, PolicyDecision, PolicyDeny,
     PrincipalId, Revision, SourceRef, WorkspaceId,
 };
-use cortex_inference::{AgentLimits, AgentRunner, AuthorizedCapabilities};
+use cortex_inference::{
+    AgentLimits, AgentRunner, AuthorizedCapabilities, OpenAiCompatibleProvider,
+    ReqwestOpenAiTransport,
+};
 use cortex_search::{HybridSearchService, SearchRequest};
 use cortex_storage::{OperationStore, SqliteAuditPort, SqliteDatabase, SqliteRepositories};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
@@ -112,7 +115,7 @@ pub struct LocalDaemon {
     migrations_applied: bool,
     service: Arc<DaemonService>,
     search: Arc<DaemonSearch>,
-    agent: Arc<DaemonAgent>,
+    embedding_provider: DaemonEmbeddingProvider,
     grants: BTreeSet<CapabilityGrant>,
     audit: SqliteAuditPort,
 }
@@ -125,42 +128,82 @@ struct ClientVerifier {
 
 type DaemonService =
     ApplicationService<GrantPolicy, SqliteRepositories, OperationStore, SqliteAuditPort>;
-type DaemonSearch = HybridSearchService<SqliteRepositories, DaemonEmbeddingUnavailable>;
-type DaemonAgent = AgentRunner<DaemonInferenceUnavailable, DaemonAgentExecutor>;
+type DaemonSearch = HybridSearchService<SqliteRepositories, DaemonEmbeddingProvider>;
 
-/// The daemon retains the Task 8 provider boundary even when no model endpoint is configured.
-/// Query callers receive lexical results with an explicit degraded semantic leg.
 #[derive(Clone)]
-struct DaemonInferenceUnavailable;
+enum DaemonEmbeddingProvider {
+    Unavailable,
+    Configured(Arc<OpenAiCompatibleProvider<ReqwestOpenAiTransport>>),
+}
 
-impl cortex_inference::InferenceProvider for DaemonInferenceUnavailable {
+impl cortex_application::EmbeddingProvider for DaemonEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<cortex_application::Embedding, ApplicationError> {
+        match self {
+            Self::Unavailable => Err(ApplicationError::InferenceUnavailable),
+            Self::Configured(provider) => {
+                cortex_application::EmbeddingProvider::embed(provider.as_ref(), text).await
+            }
+        }
+    }
+}
+
+impl cortex_inference::InferenceProvider for DaemonEmbeddingProvider {
     async fn complete(
         &self,
-        _request: cortex_inference::InferenceRequest,
+        request: cortex_inference::InferenceRequest,
     ) -> Result<cortex_inference::InferenceResponse, ApplicationError> {
-        Err(ApplicationError::InferenceUnavailable)
+        match self {
+            Self::Unavailable => Err(ApplicationError::InferenceUnavailable),
+            Self::Configured(provider) => {
+                cortex_inference::InferenceProvider::complete(provider.as_ref(), request).await
+            }
+        }
     }
 }
 
-#[derive(Clone)]
-struct DaemonEmbeddingUnavailable;
-
-impl cortex_application::EmbeddingProvider for DaemonEmbeddingUnavailable {
-    async fn embed(&self, _text: &str) -> Result<cortex_application::Embedding, ApplicationError> {
-        Err(ApplicationError::InferenceUnavailable)
-    }
+struct DaemonAgentExecutor {
+    daemon: LocalDaemon,
 }
-
-struct DaemonAgentExecutor;
 
 impl cortex_application::AgentCapabilityExecutor for DaemonAgentExecutor {
     async fn execute_agent_tool(
         &self,
-        _context: CommandContext,
-        _capability: Capability,
-        _payload: Value,
+        context: CommandContext,
+        capability: Capability,
+        payload: Value,
     ) -> Result<Value, ApplicationError> {
-        Err(ApplicationError::PermissionDenied)
+        let response = Box::pin(self.daemon.request_authenticated(
+            context.principal_id,
+            &DaemonRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: context.correlation_id,
+                principal_id: Uuid::from(context.principal_id),
+                operation_id: Uuid::from(context.operation_id),
+                capability: capability.metadata().mcp_name.to_owned(),
+                payload,
+            },
+        ))
+        .await
+        .map_err(|error| application_error_from_daemon(&error))?;
+        match response.result {
+            WireResult::Success { value } => Ok(value),
+            WireResult::Error { code } if code == "permission_denied" => {
+                Err(ApplicationError::PermissionDenied)
+            }
+            WireResult::Error { .. } => Err(ApplicationError::Internal),
+        }
+    }
+}
+
+fn application_error_from_daemon(error: &DaemonError) -> ApplicationError {
+    match error {
+        DaemonError::PermissionDenied => ApplicationError::PermissionDenied,
+        DaemonError::InvalidRequest => ApplicationError::Validation { field: "payload" },
+        DaemonError::Unauthenticated
+        | DaemonError::UnsupportedCapability
+        | DaemonError::InvalidConfiguration
+        | DaemonError::StartupFailed
+        | DaemonError::TransportUnavailable => ApplicationError::Internal,
     }
 }
 
@@ -215,7 +258,13 @@ impl LocalDaemon {
     /// # Errors
     /// Returns only a redacted startup failure category.
     pub async fn start(config: DaemonConfig) -> Result<Self, DaemonError> {
-        if config.inference_secret.is_some() {
+        if config.inference_secret.is_some()
+            || config
+                .model_config
+                .as_ref()
+                .and_then(cortex_inference::OpenAiCompatibleConfig::secret_reference)
+                .is_some()
+        {
             return Err(DaemonError::InvalidConfiguration);
         }
         Self::start_inner(config).await
@@ -234,6 +283,16 @@ impl LocalDaemon {
         S: SecretStore,
     {
         if let Some(reference) = config.inference_secret.as_ref() {
+            let _resolved = secret_store
+                .resolve(reference)
+                .await
+                .map_err(|_| DaemonError::StartupFailed)?;
+        }
+        if let Some(reference) = config
+            .model_config
+            .as_ref()
+            .and_then(cortex_inference::OpenAiCompatibleConfig::secret_reference)
+        {
             let _resolved = secret_store
                 .resolve(reference)
                 .await
@@ -285,18 +344,19 @@ impl LocalDaemon {
                 CapabilityGrant::new(config.workspace_id, client.principal_id, capability)
             }));
         }
+        let embedding_provider =
+            config
+                .model_config
+                .map_or(DaemonEmbeddingProvider::Unavailable, |provider| {
+                    DaemonEmbeddingProvider::Configured(Arc::new(OpenAiCompatibleProvider::new(
+                        provider,
+                    )))
+                });
         let service = Arc::new(ApplicationService::new(
             GrantPolicy::new(grants.iter().copied()),
             repositories.clone(),
             database.operation_store(),
             database.audit_port(),
-        ));
-        let agent_limits = AgentLimits::new(4, Duration::from_secs(5), 1, 32 * 1024, 128 * 1024)
-            .map_err(DaemonError::from)?;
-        let agent = Arc::new(AgentRunner::new(
-            Arc::new(DaemonInferenceUnavailable),
-            Arc::new(DaemonAgentExecutor),
-            agent_limits,
         ));
         let audit = database.audit_port();
         Ok(Self {
@@ -310,9 +370,9 @@ impl LocalDaemon {
             service,
             search: Arc::new(HybridSearchService::new(
                 repositories,
-                DaemonEmbeddingUnavailable,
+                embedding_provider.clone(),
             )),
-            agent,
+            embedding_provider,
             grants,
             audit,
         })
@@ -406,7 +466,11 @@ impl LocalDaemon {
             | "cortex_memory_create"
             | "cortex_memory_correct"
             | "cortex_memory_delete"
-            | "cortex_memory_restore" => self.dispatch_mutation(principal_id, request).await,
+            | "cortex_memory_restore" => {
+                let response = self.dispatch_mutation(principal_id, request).await?;
+                self.refresh_embedding(&response).await;
+                Ok(response)
+            }
             _ => Err(DaemonError::UnsupportedCapability),
         }
     }
@@ -650,16 +714,28 @@ impl LocalDaemon {
         )
         .await?;
         let payload: AgentPayload = decode_payload(&request.payload)?;
-        let allowed = AuthorizedCapabilities::new(
-            CapabilityCatalog::all()
-                .iter()
-                .copied()
-                .filter(|capability| *capability != Capability::AgentRun),
-        )
+        let allowed = AuthorizedCapabilities::new(CapabilityCatalog::all().iter().copied().filter(
+            |capability| {
+                *capability != Capability::AgentRun
+                    && self.grants.contains(&CapabilityGrant::new(
+                        self.workspace_id,
+                        principal_id,
+                        *capability,
+                    ))
+            },
+        ))
         .map_err(DaemonError::from)?;
         let context = self.command_context(principal_id, request)?;
-        let output = self
-            .agent
+        let limits = AgentLimits::new(4, Duration::from_secs(5), 1, 32 * 1024, 128 * 1024)
+            .map_err(DaemonError::from)?;
+        let agent = AgentRunner::new(
+            Arc::new(self.embedding_provider.clone()),
+            Arc::new(DaemonAgentExecutor {
+                daemon: self.clone(),
+            }),
+            limits,
+        );
+        let output = agent
             .run(context, &payload.prompt, allowed)
             .await
             .map_err(DaemonError::from)?;
@@ -670,6 +746,42 @@ impl LocalDaemon {
                 value: json!({ "content": output }),
             },
         })
+    }
+
+    async fn refresh_embedding(&self, response: &DaemonResponse) {
+        let WireResult::Success { value } = &response.result else {
+            return;
+        };
+        let Some(entity_id) = value
+            .get("entity_id")
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .and_then(|value| EntityId::try_from(value).ok())
+        else {
+            return;
+        };
+        let repositories = self.database.repositories();
+        let Ok(Some(text)) = repositories
+            .search_document_text(self.workspace_id, entity_id)
+            .await
+        else {
+            return;
+        };
+        let Ok(embedding) =
+            cortex_application::EmbeddingProvider::embed(&self.embedding_provider, &text).await
+        else {
+            return;
+        };
+        let _ = repositories
+            .upsert_embedding(
+                self.workspace_id,
+                entity_id,
+                embedding.model_id(),
+                embedding.model_version(),
+                embedding.dimensions(),
+                &embedding.to_le_bytes(),
+            )
+            .await;
     }
 
     async fn authorize_and_audit(

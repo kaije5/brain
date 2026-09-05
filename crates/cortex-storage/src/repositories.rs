@@ -292,6 +292,26 @@ impl SqliteRepositories {
         Ok(())
     }
 
+    /// Loads the current canonical searchable text for post-commit embedding generation.
+    /// Deleted and otherwise non-searchable entities have no row.
+    ///
+    /// # Errors
+    /// Returns a redacted storage error when the index row cannot be read.
+    pub async fn search_document_text(
+        &self,
+        workspace_id: WorkspaceId,
+        entity_id: EntityId,
+    ) -> Result<Option<String>, ApplicationError> {
+        sqlx::query_scalar(
+            "SELECT snippet FROM search_document WHERE workspace_id = ? AND entity_id = ?",
+        )
+        .bind(id_text(workspace_id))
+        .bind(id_text(entity_id))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| storage_error("search document lookup failed"))
+    }
+
     /// Returns bounded lexical candidates after workspace, grant, lifecycle,
     /// memory-status, and provenance filtering.
     ///

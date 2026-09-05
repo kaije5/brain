@@ -256,6 +256,7 @@ fn classify_reqwest_error(error: &reqwest::Error) -> TransportError {
 }
 
 /// OpenAI-compatible inference adapter parameterized by its transport.
+#[derive(Clone)]
 pub struct OpenAiCompatibleProvider<T = ReqwestOpenAiTransport> {
     config: OpenAiCompatibleConfig,
     transport: T,

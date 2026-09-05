@@ -6,6 +6,7 @@ use cortex_domain::{
     EntityId, Lifecycle, MemoryAssertion, Note, Revision, Source, Task, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
@@ -98,6 +99,7 @@ impl AtomicMutationPort for OperationStore {
 
         for change in &mutation.changes {
             apply_change(&mut transaction, mutation.workspace_id, change).await?;
+            sync_search_document(&mut transaction, mutation.workspace_id, change).await?;
         }
         insert_event_in_transaction(&mut transaction, &mutation.audit_event).await?;
         transaction
@@ -106,6 +108,93 @@ impl AtomicMutationPort for OperationStore {
             .map_err(|_| storage_error("transaction commit failed"))?;
         Ok(mutation.result)
     }
+}
+
+async fn sync_search_document(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: WorkspaceId,
+    change: &AggregateChange,
+) -> Result<(), ApplicationError> {
+    let entity = match change {
+        AggregateChange::InsertNote(note) => Some(("note", note.id())),
+        AggregateChange::ReplaceNote { entity_id, .. }
+        | AggregateChange::DeleteNote { entity_id, .. }
+        | AggregateChange::RestoreNote { entity_id, .. } => Some(("note", *entity_id)),
+        AggregateChange::InsertTask(task) => Some(("task", task.id())),
+        AggregateChange::ReplaceTask { entity_id, .. }
+        | AggregateChange::DeleteTask { entity_id, .. }
+        | AggregateChange::RestoreTask { entity_id, .. } => Some(("task", *entity_id)),
+        AggregateChange::InsertMemory(memory) => Some(("memory", memory.id())),
+        AggregateChange::ReplaceMemory { entity_id, .. }
+        | AggregateChange::DeleteMemory { entity_id, .. }
+        | AggregateChange::RestoreMemory { entity_id, .. } => Some(("memory", *entity_id)),
+        AggregateChange::InsertSource(source) => Some(("source", source.id())),
+        AggregateChange::LinkMemorySource { .. } => None,
+    };
+    let Some((kind, entity_id)) = entity else {
+        return Ok(());
+    };
+    let snippet = active_search_snippet(transaction, workspace_id, entity_id, kind).await?;
+    if let Some(snippet) = snippet {
+        let content_hash = Sha256::digest(snippet.as_bytes()).to_vec();
+        sqlx::query(
+            "INSERT INTO search_document \
+             (workspace_id, entity_id, entity_kind, snippet, content_hash) \
+             VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT(workspace_id, entity_id) DO UPDATE SET \
+             entity_kind = excluded.entity_kind, snippet = excluded.snippet, \
+             content_hash = excluded.content_hash, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(id_text(workspace_id))
+        .bind(id_text(entity_id))
+        .bind(kind)
+        .bind(snippet)
+        .bind(content_hash)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| storage_error("search document update failed"))?;
+    } else {
+        sqlx::query("DELETE FROM search_document WHERE workspace_id = ? AND entity_id = ?")
+            .bind(id_text(workspace_id))
+            .bind(id_text(entity_id))
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| storage_error("search document delete failed"))?;
+    }
+    Ok(())
+}
+
+async fn active_search_snippet(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: WorkspaceId,
+    entity_id: EntityId,
+    kind: &str,
+) -> Result<Option<String>, ApplicationError> {
+    let query = match kind {
+        "note" => {
+            "SELECT title || char(10) || content FROM note \
+             WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'"
+        }
+        "task" => {
+            "SELECT title FROM task \
+             WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'"
+        }
+        "memory" => {
+            "SELECT statement FROM memory_assertion \
+             WHERE workspace_id = ? AND id = ? AND lifecycle = 'active' AND status = 'active'"
+        }
+        "source" => {
+            "SELECT reference FROM source \
+             WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'"
+        }
+        _ => return Err(ApplicationError::Internal),
+    };
+    sqlx::query_scalar(query)
+        .bind(id_text(workspace_id))
+        .bind(id_text(entity_id))
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(|_| storage_error("search document lookup failed"))
 }
 
 async fn apply_change(

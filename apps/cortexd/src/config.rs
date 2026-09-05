@@ -5,6 +5,7 @@ use std::{
 
 use cortex_application::{Capability, CapabilityCatalog, SecretRef};
 use cortex_domain::{PrincipalId, WorkspaceId};
+use cortex_inference::OpenAiCompatibleConfig;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 const MAX_REMOTE_CLIENTS: usize = 16;
@@ -17,6 +18,7 @@ pub struct DaemonConfig {
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) principal_id: PrincipalId,
     pub(crate) inference_secret: Option<SecretRef>,
+    pub(crate) model_config: Option<OpenAiCompatibleConfig>,
     pub(crate) pairing_verifier: VerifyingKey,
     pub(crate) pairing_signer: SigningKey,
     pub(crate) pairing_key_path: PathBuf,
@@ -52,6 +54,7 @@ impl DaemonConfig {
             workspace_id,
             principal_id,
             inference_secret: None,
+            model_config: None,
             pairing_verifier: signer.verifying_key(),
             pairing_signer: signer,
             pairing_key_path: pairing_key_path(&discovery_path),
@@ -91,6 +94,7 @@ impl DaemonConfig {
                 principal_id: PrincipalId::try_from(discovery.principal_id)
                     .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
                 inference_secret: None,
+                model_config: None,
                 pairing_verifier,
                 pairing_signer,
                 pairing_key_path,
@@ -115,6 +119,13 @@ impl DaemonConfig {
     #[must_use]
     pub fn with_inference_secret(mut self, reference: SecretRef) -> Self {
         self.inference_secret = Some(reference);
+        self
+    }
+
+    /// Configures the bounded loopback OpenAI-compatible provider used by search and the agent.
+    #[must_use]
+    pub fn with_model_config(mut self, config: OpenAiCompatibleConfig) -> Self {
+        self.model_config = Some(config);
         self
     }
 

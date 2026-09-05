@@ -1,5 +1,7 @@
 use cortex_application::{ApplicationError, SecretRef, SecretStore};
+use cortex_inference::{OpenAiCompatibleConfig, ProviderLimits};
 use cortexd::{DaemonConfig, DaemonError, LocalDaemon};
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -37,6 +39,22 @@ async fn daemon_resolves_configured_secret_references_only_during_composition() 
         .expect("daemon should resolve composition secret");
 
     assert!(daemon.migrations_applied().expect("migration state"));
+}
+
+#[tokio::test]
+async fn daemon_rejects_model_credentials_that_bypass_the_secret_store_composition() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let model = OpenAiCompatibleConfig::new(
+        "http://127.0.0.1:33119/v1/",
+        "nemotron",
+        Some(SecretRef::new("secret://local-model").expect("secret reference")),
+        Duration::from_secs(1),
+        ProviderLimits::new(64 * 1024, 32 * 1024, 32).expect("provider limits"),
+    )
+    .expect("model config");
+    let result =
+        LocalDaemon::start(DaemonConfig::for_test(directory.path()).with_model_config(model)).await;
+    assert!(matches!(result, Err(DaemonError::InvalidConfiguration)));
 }
 
 #[tokio::test]
