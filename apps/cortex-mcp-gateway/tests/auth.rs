@@ -155,6 +155,70 @@ async fn discovery_refreshes_jwks_once_on_rotation_and_concurrent_kid_miss() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn concurrent_distinct_unknown_kids_share_one_global_refresh_cooldown() {
+    let fetcher = FakeFetcher::new();
+    fetcher.push(
+        discovery_url(),
+        Ok(discovery("https://issuer.example", jwks_url())),
+    );
+    fetcher.push(jwks_url(), Ok(jwks("test-key")));
+    let resolver = discovered_resolver(fetcher.clone());
+    let known = token("paired-subject", "https://issuer.example", "cortex", 300);
+    assert!(resolver.resolve(&known).await.is_ok());
+
+    for _ in 0..16 {
+        fetcher.push(
+            discovery_url(),
+            Ok(discovery("https://issuer.example", jwks_url())),
+        );
+        fetcher.push(jwks_url(), Ok(jwks("test-key")));
+    }
+    let mut attempts = Vec::new();
+    for index in 0..16 {
+        let resolver = resolver.clone();
+        let unknown = support::token_with_kid(
+            "paired-subject",
+            "https://issuer.example",
+            "cortex",
+            300,
+            &format!("attacker-kid-{index}"),
+        );
+        attempts.push(tokio::spawn(
+            async move { resolver.resolve(&unknown).await },
+        ));
+    }
+    for attempt in attempts {
+        assert_eq!(
+            attempt.await.expect("resolver task"),
+            Err(GatewayError::InvalidToken)
+        );
+    }
+    assert_eq!(fetcher.calls(), 4);
+
+    fetcher.clear();
+    fetcher.push(
+        discovery_url(),
+        Ok(discovery("https://issuer.example", jwks_url())),
+    );
+    fetcher.push(jwks_url(), Ok(jwks("rotated-key")));
+    let rotated = support::token_with_kid(
+        "paired-subject",
+        "https://issuer.example",
+        "cortex",
+        300,
+        "rotated-key",
+    );
+    assert_eq!(
+        resolver.resolve(&rotated).await,
+        Err(GatewayError::InvalidToken)
+    );
+    assert_eq!(fetcher.calls(), 4);
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(resolver.resolve(&rotated).await.is_ok());
+    assert_eq!(fetcher.calls(), 6);
+}
+
+#[tokio::test(start_paused = true)]
 async fn ttl_refresh_failure_retains_last_known_good_keys() {
     let fetcher = FakeFetcher::new();
     fetcher.push(
@@ -169,6 +233,49 @@ async fn ttl_refresh_failure_retains_last_known_good_keys() {
     tokio::time::advance(Duration::from_secs(61)).await;
     fetcher.push(discovery_url(), Err(GatewayError::OidcUnavailable));
     assert!(resolver.resolve(&token).await.is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_keys_fail_closed_after_grace_and_recover_with_a_validated_rotation() {
+    let fetcher = FakeFetcher::new();
+    fetcher.push(
+        discovery_url(),
+        Ok(discovery("https://issuer.example", jwks_url())),
+    );
+    fetcher.push(jwks_url(), Ok(jwks("test-key")));
+    let resolver = discovered_resolver(fetcher.clone());
+    let original = token("paired-subject", "https://issuer.example", "cortex", 300);
+    assert!(resolver.resolve(&original).await.is_ok());
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    fetcher.push(discovery_url(), Err(GatewayError::OidcUnavailable));
+    assert!(resolver.resolve(&original).await.is_ok());
+
+    tokio::time::advance(Duration::from_mins(5)).await;
+    fetcher.push(discovery_url(), Err(GatewayError::OidcUnavailable));
+    assert_eq!(
+        resolver.resolve(&original).await,
+        Err(GatewayError::InvalidToken)
+    );
+
+    tokio::time::advance(Duration::from_secs(6)).await;
+    fetcher.push(
+        discovery_url(),
+        Ok(discovery("https://issuer.example", jwks_url())),
+    );
+    fetcher.push(jwks_url(), Ok(jwks("rotated-key")));
+    let rotated = support::token_with_kid(
+        "paired-subject",
+        "https://issuer.example",
+        "cortex",
+        300,
+        "rotated-key",
+    );
+    assert!(resolver.resolve(&rotated).await.is_ok());
+    assert_eq!(
+        resolver.resolve(&original).await,
+        Err(GatewayError::InvalidToken)
+    );
 }
 
 #[tokio::test]
@@ -367,6 +474,10 @@ impl FakeFetcher {
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn clear(&self) {
+        self.responses.lock().expect("responses").clear();
     }
 }
 

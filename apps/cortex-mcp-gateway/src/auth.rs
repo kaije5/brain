@@ -26,6 +26,7 @@ const MAX_PAIRED_SUBJECTS: usize = 64;
 const MIN_CACHE_TTL: Duration = Duration::from_secs(30);
 const MAX_CACHE_TTL: Duration = Duration::from_hours(24);
 const FAILED_REFRESH_COOLDOWN: Duration = Duration::from_secs(5);
+const MAX_STALE_IF_ERROR: Duration = Duration::from_mins(5);
 
 /// A credential wrapper whose formatter never reveals the bearer value.
 #[derive(Clone)]
@@ -340,7 +341,8 @@ struct DiscoveryState {
 struct KeyCache {
     keys: HashMap<String, OidcVerificationKey>,
     expires_at: Option<Instant>,
-    last_forced_kid: Option<(String, Instant)>,
+    stale_until: Option<Instant>,
+    unknown_kid_refresh_after: Option<Instant>,
     retry_after: Option<Instant>,
 }
 
@@ -377,7 +379,8 @@ impl PairedIdentityResolver {
             keys: Arc::new(RwLock::new(KeyCache {
                 keys: key_map,
                 expires_at: None,
-                last_forced_kid: None,
+                stale_until: None,
+                unknown_kid_refresh_after: None,
                 retry_after: None,
             })),
             discovery: None,
@@ -452,16 +455,28 @@ impl PairedIdentityResolver {
         let now = Instant::now();
         {
             let cache = self.keys.read().await;
-            if cache.expires_at.is_none_or(|expires| expires > now)
-                && let Some(key) = cache.keys.get(key_id)
-            {
-                return Ok(key.clone());
+            if cache.expires_at.is_none_or(|expires| expires > now) {
+                if let Some(key) = cache.keys.get(key_id) {
+                    return Ok(key.clone());
+                }
+                if cache
+                    .unknown_kid_refresh_after
+                    .is_some_and(|after| after > now)
+                {
+                    return Err(GatewayError::InvalidToken);
+                }
+            }
+            if cache.retry_after.is_some_and(|after| after > now) {
+                return stale_key(&cache, key_id, now);
             }
         }
         let Some(discovery) = &self.discovery else {
             return Err(GatewayError::InvalidToken);
         };
-        let _refresh = discovery.refresh.lock().await;
+        let Ok(_refresh) = discovery.refresh.try_lock() else {
+            let cache = self.keys.read().await;
+            return stale_key(&cache, key_id, now);
+        };
         let now = Instant::now();
         {
             let cache = self.keys.read().await;
@@ -470,39 +485,31 @@ impl PairedIdentityResolver {
                     return Ok(key.clone());
                 }
                 if cache
-                    .last_forced_kid
-                    .as_ref()
-                    .is_some_and(|(kid, until)| kid == key_id && *until > now)
+                    .unknown_kid_refresh_after
+                    .is_some_and(|after| after > now)
                 {
                     return Err(GatewayError::InvalidToken);
                 }
             }
-            if cache.retry_after.is_some_and(|until| until > now) {
-                return cache
-                    .keys
-                    .get(key_id)
-                    .cloned()
-                    .ok_or(GatewayError::InvalidToken);
+            if cache.retry_after.is_some_and(|after| after > now) {
+                return stale_key(&cache, key_id, now);
             }
         }
         if let Ok(keys) = self.refresh_keys(discovery).await {
             let key = keys.get(key_id).cloned();
             let mut cache = self.keys.write().await;
             cache.keys = keys;
-            cache.expires_at = Some(now + discovery.cache_ttl);
+            let expires_at = now + discovery.cache_ttl;
+            cache.expires_at = Some(expires_at);
+            cache.stale_until = Some(expires_at + MAX_STALE_IF_ERROR);
             cache.retry_after = None;
-            cache.last_forced_kid = key
-                .is_none()
-                .then(|| (key_id.to_owned(), now + FAILED_REFRESH_COOLDOWN));
+            cache.unknown_kid_refresh_after =
+                key.is_none().then_some(now + FAILED_REFRESH_COOLDOWN);
             key.ok_or(GatewayError::InvalidToken)
         } else {
             let mut cache = self.keys.write().await;
             cache.retry_after = Some(now + FAILED_REFRESH_COOLDOWN);
-            cache
-                .keys
-                .get(key_id)
-                .cloned()
-                .ok_or(GatewayError::InvalidToken)
+            stale_key(&cache, key_id, now)
         }
     }
 
@@ -555,6 +562,21 @@ impl PairedIdentityResolver {
         }
         Ok(keys)
     }
+}
+
+fn stale_key(
+    cache: &KeyCache,
+    key_id: &str,
+    now: Instant,
+) -> Result<OidcVerificationKey, GatewayError> {
+    if cache.stale_until.is_some_and(|until| until > now) {
+        return cache
+            .keys
+            .get(key_id)
+            .cloned()
+            .ok_or(GatewayError::InvalidToken);
+    }
+    Err(GatewayError::InvalidToken)
 }
 
 #[derive(Deserialize)]
