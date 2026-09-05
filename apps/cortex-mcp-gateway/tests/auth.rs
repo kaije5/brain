@@ -219,6 +219,104 @@ async fn concurrent_distinct_unknown_kids_share_one_global_refresh_cooldown() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn slow_missing_key_refresh_starts_unknown_kid_cooldown_at_completion() {
+    let fetcher = FakeFetcher::new();
+    fetcher.push(
+        discovery_url(),
+        Ok(discovery("https://issuer.example", jwks_url())),
+    );
+    fetcher.push(jwks_url(), Ok(jwks("test-key")));
+    let resolver = discovered_resolver(fetcher.clone());
+    let known = token("paired-subject", "https://issuer.example", "cortex", 300);
+    assert!(resolver.resolve(&known).await.is_ok());
+
+    fetcher.push_delayed(
+        discovery_url(),
+        Duration::from_secs(3),
+        Ok(discovery("https://issuer.example", jwks_url())),
+    );
+    fetcher.push_delayed(jwks_url(), Duration::from_secs(3), Ok(jwks("test-key")));
+    let first_unknown = support::token_with_kid(
+        "paired-subject",
+        "https://issuer.example",
+        "cortex",
+        300,
+        "attacker-kid-a",
+    );
+    assert_eq!(
+        resolver.resolve(&first_unknown).await,
+        Err(GatewayError::InvalidToken)
+    );
+    assert_eq!(fetcher.calls(), 4);
+
+    fetcher.push(
+        discovery_url(),
+        Ok(discovery("https://issuer.example", jwks_url())),
+    );
+    fetcher.push(jwks_url(), Ok(jwks("rotated-key")));
+    let rotated = support::token_with_kid(
+        "paired-subject",
+        "https://issuer.example",
+        "cortex",
+        300,
+        "rotated-key",
+    );
+    assert_eq!(
+        resolver.resolve(&rotated).await,
+        Err(GatewayError::InvalidToken)
+    );
+    assert_eq!(fetcher.calls(), 4);
+
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(resolver.resolve(&rotated).await.is_ok());
+    assert_eq!(fetcher.calls(), 6);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_failed_refresh_starts_retry_cooldown_at_completion() {
+    let fetcher = FakeFetcher::new();
+    fetcher.push(
+        discovery_url(),
+        Ok(discovery("https://issuer.example", jwks_url())),
+    );
+    fetcher.push(jwks_url(), Ok(jwks("test-key")));
+    let resolver = discovered_resolver(fetcher.clone());
+    let original = token("paired-subject", "https://issuer.example", "cortex", 300);
+    assert!(resolver.resolve(&original).await.is_ok());
+
+    tokio::time::advance(Duration::from_secs(61)).await;
+    fetcher.push_delayed(
+        discovery_url(),
+        Duration::from_secs(6),
+        Err(GatewayError::OidcUnavailable),
+    );
+    assert!(resolver.resolve(&original).await.is_ok());
+    assert_eq!(fetcher.calls(), 3);
+
+    fetcher.push(
+        discovery_url(),
+        Ok(discovery("https://issuer.example", jwks_url())),
+    );
+    fetcher.push(jwks_url(), Ok(jwks("rotated-key")));
+    let rotated = support::token_with_kid(
+        "paired-subject",
+        "https://issuer.example",
+        "cortex",
+        300,
+        "rotated-key",
+    );
+    assert_eq!(
+        resolver.resolve(&rotated).await,
+        Err(GatewayError::InvalidToken)
+    );
+    assert_eq!(fetcher.calls(), 3);
+
+    tokio::time::advance(Duration::from_secs(6)).await;
+    assert!(resolver.resolve(&rotated).await.is_ok());
+    assert_eq!(fetcher.calls(), 5);
+}
+
+#[tokio::test(start_paused = true)]
 async fn ttl_refresh_failure_retains_last_known_good_keys() {
     let fetcher = FakeFetcher::new();
     fetcher.push(
@@ -451,10 +549,11 @@ fn jwks(kid: &str) -> Vec<u8> {
 }
 
 type FakeResult = Result<Vec<u8>, GatewayError>;
+type DelayedFakeResult = (Duration, FakeResult);
 
 #[derive(Clone, Default)]
 struct FakeFetcher {
-    responses: Arc<Mutex<HashMap<String, VecDeque<FakeResult>>>>,
+    responses: Arc<Mutex<HashMap<String, VecDeque<DelayedFakeResult>>>>,
     calls: Arc<AtomicUsize>,
 }
 
@@ -464,12 +563,16 @@ impl FakeFetcher {
     }
 
     fn push(&self, url: &str, response: FakeResult) {
+        self.push_delayed(url, Duration::ZERO, response);
+    }
+
+    fn push_delayed(&self, url: &str, delay: Duration, response: FakeResult) {
         self.responses
             .lock()
             .expect("responses")
             .entry(url.to_owned())
             .or_default()
-            .push_back(response);
+            .push_back((delay, response));
     }
 
     fn calls(&self) -> usize {
@@ -489,13 +592,18 @@ impl OidcDocumentFetcher for FakeFetcher {
     ) -> Pin<Box<dyn Future<Output = FakeResult> + Send + 'a>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let response = self
-                .responses
-                .lock()
-                .expect("responses")
-                .get_mut(url)
-                .and_then(VecDeque::pop_front)
-                .ok_or(GatewayError::OidcUnavailable)??;
+            let (delay, response) = {
+                self.responses
+                    .lock()
+                    .expect("responses")
+                    .get_mut(url)
+                    .and_then(VecDeque::pop_front)
+                    .ok_or(GatewayError::OidcUnavailable)?
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let response = response?;
             if response.len() > max_bytes {
                 return Err(GatewayError::InvalidConfiguration);
             }

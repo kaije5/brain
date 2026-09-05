@@ -477,39 +477,42 @@ impl PairedIdentityResolver {
             let cache = self.keys.read().await;
             return stale_key(&cache, key_id, now);
         };
-        let now = Instant::now();
+        let checked_at = Instant::now();
         {
             let cache = self.keys.read().await;
-            if cache.expires_at.is_some_and(|expires| expires > now) {
+            if cache.expires_at.is_some_and(|expires| expires > checked_at) {
                 if let Some(key) = cache.keys.get(key_id) {
                     return Ok(key.clone());
                 }
                 if cache
                     .unknown_kid_refresh_after
-                    .is_some_and(|after| after > now)
+                    .is_some_and(|after| after > checked_at)
                 {
                     return Err(GatewayError::InvalidToken);
                 }
             }
-            if cache.retry_after.is_some_and(|after| after > now) {
-                return stale_key(&cache, key_id, now);
+            if cache.retry_after.is_some_and(|after| after > checked_at) {
+                return stale_key(&cache, key_id, checked_at);
             }
         }
-        if let Ok(keys) = self.refresh_keys(discovery).await {
+        let refresh_result = self.refresh_keys(discovery).await;
+        let completed_at = Instant::now();
+        if let Ok(keys) = refresh_result {
             let key = keys.get(key_id).cloned();
             let mut cache = self.keys.write().await;
             cache.keys = keys;
-            let expires_at = now + discovery.cache_ttl;
+            let expires_at = completed_at + discovery.cache_ttl;
             cache.expires_at = Some(expires_at);
             cache.stale_until = Some(expires_at + MAX_STALE_IF_ERROR);
             cache.retry_after = None;
-            cache.unknown_kid_refresh_after =
-                key.is_none().then_some(now + FAILED_REFRESH_COOLDOWN);
+            cache.unknown_kid_refresh_after = key
+                .is_none()
+                .then_some(completed_at + FAILED_REFRESH_COOLDOWN);
             key.ok_or(GatewayError::InvalidToken)
         } else {
             let mut cache = self.keys.write().await;
-            cache.retry_after = Some(now + FAILED_REFRESH_COOLDOWN);
-            stale_key(&cache, key_id, now)
+            cache.retry_after = Some(completed_at + FAILED_REFRESH_COOLDOWN);
+            stale_key(&cache, key_id, completed_at)
         }
     }
 
