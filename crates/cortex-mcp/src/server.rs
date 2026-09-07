@@ -366,9 +366,11 @@ impl ServerHandler for McpServer {
         };
         match self.call_tool_as(principal, &request.name, arguments).await {
             Ok(value) => Ok(CallToolResult::structured(value)),
-            Err(error) => Ok(CallToolResult::structured_error(
-                json!({"code":error.code,"message":error.message}),
-            )),
+            Err(error) => Ok(CallToolResult::structured_error(json!({
+                "code":error.code,
+                "message":error.message,
+                "correlation_id":error.correlation_id.map(|value| value.to_string())
+            }))),
         }
     }
 }

@@ -1,6 +1,11 @@
 mod support;
 
-use support::Harness;
+use support::{Harness, assert_deployed_daemon_rejects_missing_model_secret};
+
+#[tokio::test]
+async fn deployed_model_secret_reference_must_resolve_before_startup() {
+    assert_deployed_daemon_rejects_missing_model_secret().await;
+}
 
 #[tokio::test]
 async fn cli_created_memory_is_retrievable_through_paired_mcp_with_provenance() {
@@ -16,6 +21,10 @@ async fn cli_created_memory_is_retrievable_through_paired_mcp_with_provenance() 
         "Cortex uses Nemotron as its local AI."
     );
     assert_eq!(result.first_sources(), &[harness.source_id()]);
+    assert!(!result.first_semantic_degraded());
+    harness
+        .assert_cli_text_search("Nemotron", "Cortex uses Nemotron as its local AI.")
+        .await;
     harness.shutdown().await;
 }
 
@@ -35,5 +44,6 @@ async fn local_agent_mutation_is_visible_to_cli_and_paired_mcp() {
         "Cortex stores one canonical local state."
     );
     assert_eq!(mcp.first_sources(), &[harness.source_id()]);
+    assert!(!mcp.first_semantic_degraded());
     harness.shutdown().await;
 }

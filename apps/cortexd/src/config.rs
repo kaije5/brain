@@ -1,14 +1,18 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use cortex_application::{Capability, CapabilityCatalog, SecretRef};
 use cortex_domain::{PrincipalId, WorkspaceId};
-use cortex_inference::OpenAiCompatibleConfig;
+use cortex_inference::{OpenAiCompatibleConfig, ProviderLimits};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 const MAX_REMOTE_CLIENTS: usize = 16;
+const MODEL_RESPONSE_BYTES: usize = 64 * 1024;
+const MODEL_EMBEDDING_INPUT_BYTES: usize = 32 * 1024;
+const MODEL_EMBEDDING_DIMENSIONS: usize = 4096;
 
 /// Configuration owned locally by the daemon process, never by an IPC caller.
 #[derive(Clone, Debug)]
@@ -115,6 +119,44 @@ impl DaemonConfig {
         Ok(config)
     }
 
+    /// Loads durable daemon identity plus the deployed loopback model settings from the process
+    /// environment. `CORTEX_MODEL_BASE_URL` and `CORTEX_MODEL_NAME` must either both be absent or
+    /// both be present. `CORTEX_MODEL_SECRET_REF` is optional, but is accepted only alongside the
+    /// provider settings; it remains an opaque platform-store locator and is never a credential.
+    ///
+    /// # Errors
+    /// Returns a redacted configuration error for incomplete, non-Unicode, or invalid settings.
+    pub fn from_environment(database_path: PathBuf) -> Result<Self, crate::DaemonError> {
+        let config = Self::from_database_path(database_path)?;
+        let endpoint = environment_value("CORTEX_MODEL_BASE_URL")?;
+        let model = environment_value("CORTEX_MODEL_NAME")?;
+        let secret = environment_value("CORTEX_MODEL_SECRET_REF")?
+            .map(SecretRef::new)
+            .transpose()
+            .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+        match (endpoint, model, secret) {
+            (None, None, None) => Ok(config),
+            (Some(endpoint), Some(model), secret) => {
+                let limits = ProviderLimits::new(
+                    MODEL_RESPONSE_BYTES,
+                    MODEL_EMBEDDING_INPUT_BYTES,
+                    MODEL_EMBEDDING_DIMENSIONS,
+                )
+                .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+                let provider = OpenAiCompatibleConfig::new(
+                    endpoint,
+                    model,
+                    secret,
+                    Duration::from_secs(5),
+                    limits,
+                )
+                .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+                Ok(config.with_model_config(provider))
+            }
+            _ => Err(crate::DaemonError::InvalidConfiguration),
+        }
+    }
+
     /// Adds an opaque inference credential locator that must be resolved by the composition root.
     #[must_use]
     pub fn with_inference_secret(mut self, reference: SecretRef) -> Self {
@@ -141,6 +183,12 @@ impl DaemonConfig {
     #[must_use]
     pub fn owner_principal_id(&self) -> uuid::Uuid {
         self.principal_id.into()
+    }
+
+    /// Returns the durable workspace identity for local process composition and fixtures.
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
     }
 
     /// Creates a distinct, durable local IPC enrollment for a remote paired principal.
@@ -218,6 +266,18 @@ impl DaemonConfig {
     fn write_pairing_key(&self) -> Result<(), crate::DaemonError> {
         write_private_bytes(&self.pairing_key_path, &self.pairing_signer.to_bytes())
     }
+}
+
+fn environment_value(name: &str) -> Result<Option<String>, crate::DaemonError> {
+    std::env::var_os(name)
+        .map(|value| {
+            value
+                .into_string()
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or(crate::DaemonError::InvalidConfiguration)
+        })
+        .transpose()
 }
 
 fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<(), crate::DaemonError> {

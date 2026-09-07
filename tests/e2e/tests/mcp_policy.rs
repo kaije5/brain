@@ -32,11 +32,11 @@ async fn paired_client_without_delete_grant_is_denied_and_audited() {
 }
 
 #[tokio::test]
-async fn agent_receives_only_the_paired_principals_granted_tools() {
+async fn deployed_agent_receives_only_the_authenticated_principals_granted_tools() {
     let harness =
-        Harness::start_with_remote_grants(vec![Capability::AgentRun, Capability::MemorySearch])
+        Harness::start_with_owner_grants(vec![Capability::AgentRun, Capability::MemorySearch])
             .await;
-    let offered = harness.remote_agent_tools().await;
+    let offered = harness.cli_agent_tools().await;
     assert!(offered.iter().any(|name| name == "cortex_memory_search"));
     assert!(!offered.iter().any(|name| name == "cortex_memory_create"));
     assert!(!offered.iter().any(|name| name == "cortex_agent_run"));

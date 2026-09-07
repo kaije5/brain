@@ -8,19 +8,41 @@ license.workspace = true
 [lints]
 workspace = true
 
-[dev-dependencies]
-axum = "0.8"
+[dependencies]
 brain = { path = "../../apps/brain" }
 clap = { version = "4.5", features = ["derive"] }
+cortexd = { path = "../../apps/cortexd" }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+
+[[bin]]
+name = "brain-e2e"
+path = "../../apps/brain/src/main.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "cortexd-e2e"
+path = "../../apps/cortexd/src/main.rs"
+test = false
+bench = false
+
+[dev-dependencies]
+axum = "0.8"
 cortex-application = { path = "../../crates/cortex-application" }
 cortex-domain = { path = "../../crates/cortex-domain" }
 cortex-inference = { path = "../../crates/cortex-inference" }
 cortex-mcp = { path = "../../crates/cortex-mcp" }
 cortex-mcp-gateway = { path = "../../apps/cortex-mcp-gateway" }
 cortex-storage = { path = "../../crates/cortex-storage" }
-cortexd = { path = "../../apps/cortexd" }
-serde_json = "1.0"
+jsonwebtoken = { version = "11.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.23"
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = "0.7"
 uuid = { version = "1.24", features = ["serde", "v7"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+keyring-core = "1.0"
+windows-native-keyring-store = "1.1"
