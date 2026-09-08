@@ -24,8 +24,9 @@ A compromised local user account remains within the host trust boundary. v0.1 do
 
 The trusted provisioning path for remote principals, protected enrollment files,
 relay client keys, and OIDC subject mapping remains security-sensitive. Cortex
-does not provide an unprivileged remote-enrollment command, but an operator can
-still misconfigure a relay, grant excessive capabilities, or expose a backup.
+provides `brain remote enroll` only over the owner-authenticated local IPC
+boundary; a remote/unpaired client cannot invoke it. An operator can still
+misconfigure a relay, grant excessive capabilities, or expose a backup.
 The stateless relay and external ChatGPT connector remain external dependencies;
 their availability and account-level configuration are outside the local
 daemon's control. v0.1 also cannot recover a platform-secret-store credential

@@ -20,6 +20,26 @@ fn ask_maps_to_daemon_agent_without_model_configuration() {
 }
 
 #[test]
+fn remote_enroll_maps_only_subject_and_explicit_requested_grants() {
+    let cli = Cli::try_parse_from([
+        "brain",
+        "remote",
+        "enroll",
+        "--subject",
+        "chatgpt-owner-subject",
+        "--grant",
+        "cortex_note_create",
+    ])
+    .expect("parses");
+    let request = command_request(&cli).expect("maps");
+    assert_eq!(request.capability, "cortex_remote_enroll");
+    assert_eq!(
+        request.payload,
+        json!({"subject":"chatgpt-owner-subject","grants":["cortex_note_create"]})
+    );
+}
+
+#[test]
 fn task_due_date_is_normalized_to_daemon_rfc3339() {
     let cli = Cli::try_parse_from(["brain", "task", "add", "Finish", "--due", "2026-09-01"])
         .expect("parses");

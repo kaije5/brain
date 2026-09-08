@@ -31,6 +31,8 @@ pub enum Command {
     Remember(RememberArgs),
     #[command(subcommand)]
     Memory(MemoryCommand),
+    #[command(subcommand)]
+    Remote(RemoteCommand),
     Ask {
         prompt: String,
     },
@@ -59,6 +61,20 @@ pub enum TaskCommand {
 #[derive(Clone, Debug, Subcommand)]
 pub enum MemoryCommand {
     Search(SearchArgs),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum RemoteCommand {
+    /// Enrolls one OIDC subject through the authenticated local owner daemon.
+    Enroll(RemoteEnrollArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct RemoteEnrollArgs {
+    #[arg(long)]
+    pub subject: String,
+    #[arg(long = "grant", required = true)]
+    pub grants: Vec<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -135,6 +151,11 @@ pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
             true,
         ),
         Command::Memory(MemoryCommand::Search(input)) => search("cortex_memory_search", input)?,
+        Command::Remote(RemoteCommand::Enroll(input)) => (
+            "cortex_remote_enroll",
+            json!({"subject": input.subject, "grants": input.grants}),
+            true,
+        ),
         Command::Ask { prompt } => ("cortex_agent_run", json!({"prompt":prompt}), false),
     };
     let operation_id = Uuid::now_v7();

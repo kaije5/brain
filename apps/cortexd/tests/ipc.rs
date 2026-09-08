@@ -100,6 +100,159 @@ async fn remote_enrollment_keeps_identity_grants_and_audit_distinct_across_resta
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keeps the owner, restart, paired, denied, and audit lifecycle together.
+async fn owner_enrolls_a_paired_remote_principal_over_local_ipc_with_only_requested_grants() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let database_path = directory.path().join("cortex.db");
+    let daemon = std::sync::Arc::new(
+        LocalDaemon::start(
+            DaemonConfig::from_database_path(database_path.clone()).expect("owner config"),
+        )
+        .await
+        .expect("daemon starts"),
+    );
+    let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(std::sync::Arc::clone(&daemon).serve(shutdown));
+    tokio::task::yield_now().await;
+
+    let owner = AuthenticatedIpcClient::from_database_path(&database_path).expect("owner client");
+    let enrollment_request_id = Uuid::now_v7();
+    let response = owner
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: enrollment_request_id,
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_remote_enroll".to_owned(),
+            payload: json!({
+                "subject": "chatgpt-owner-subject",
+                "grants": ["cortex_note_create"]
+            }),
+        })
+        .await
+        .expect("owner receives typed enrollment result");
+    let WireResult::Success { value } = response.result else {
+        panic!("owner enrollment should succeed");
+    };
+    assert!(value["principal_id"].as_str().is_some());
+    assert!(value["ipc_enrollment_path"].as_str().is_some());
+    assert_eq!(
+        value["gateway_paired_subject"]["subject"],
+        "chatgpt-owner-subject"
+    );
+    assert_eq!(
+        value["gateway_paired_subject"]["principal_id"],
+        value["principal_id"]
+    );
+    assert!(value.get("signing_key").is_none());
+    let enrollment_path = value["ipc_enrollment_path"]
+        .as_str()
+        .map(std::path::PathBuf::from)
+        .expect("safe enrollment path");
+    let principal_id = value["principal_id"]
+        .as_str()
+        .expect("returned principal ID")
+        .to_owned();
+    let repeated = owner
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_remote_enroll".to_owned(),
+            payload: json!({
+                "subject": "chatgpt-owner-subject",
+                "grants": ["cortex_note_create"]
+            }),
+        })
+        .await
+        .expect("idempotent owner response");
+    let WireResult::Success { value } = repeated.result else {
+        panic!("same subject/grants should be idempotent");
+    };
+    assert_eq!(value["principal_id"], principal_id);
+    let remote = AuthenticatedIpcClient::from_enrollment_path(&enrollment_path)
+        .expect("protected remote enrollment");
+
+    shutdown_sender.send(true).expect("shutdown");
+    serving.await.expect("server task").expect("clean shutdown");
+    let database = SqliteDatabase::connect_and_migrate(&database_path)
+        .await
+        .expect("audit database");
+    let audit = database
+        .audit_port()
+        .find_for_correlation(daemon.ownership_workspace_id(), enrollment_request_id)
+        .await
+        .expect("audit lookup")
+        .expect("owner enrollment audit");
+    assert_eq!(audit.capability, "cortex_remote_enroll");
+    let restarted = std::sync::Arc::new(
+        LocalDaemon::start(
+            DaemonConfig::from_database_path(database_path.clone()).expect("restart config"),
+        )
+        .await
+        .expect("restarted daemon"),
+    );
+    let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);
+    let serving = tokio::spawn(std::sync::Arc::clone(&restarted).serve(shutdown));
+    tokio::task::yield_now().await;
+
+    let created = remote
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_note_create".to_owned(),
+            payload: json!({"title":"remote","content":"paired actor"}),
+        })
+        .await
+        .expect("paired remote response");
+    assert!(matches!(created.result, WireResult::Success { .. }));
+
+    let denied = remote
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_memory_search".to_owned(),
+            payload: json!({"query":"must be denied", "limit":20}),
+        })
+        .await
+        .expect("typed denial");
+    assert_eq!(
+        denied.result,
+        WireResult::Error {
+            code: "permission_denied".to_owned()
+        }
+    );
+    let forbidden_enrollment = remote
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_remote_enroll".to_owned(),
+            payload: json!({
+                "subject": "attacker-subject",
+                "grants": ["cortex_note_create"]
+            }),
+        })
+        .await
+        .expect("typed owner-only denial");
+    assert_eq!(
+        forbidden_enrollment.result,
+        WireResult::Error {
+            code: "permission_denied".to_owned()
+        }
+    );
+
+    shutdown_sender.send(true).expect("shutdown");
+    serving.await.expect("server task").expect("clean shutdown");
+}
+
+#[tokio::test]
 async fn file_backed_ipc_client_authenticates_to_the_served_daemon() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let database_path = directory.path().join("cortex.db");

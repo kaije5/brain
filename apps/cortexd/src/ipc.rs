@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, io, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, io, path::PathBuf, sync::Arc, time::Duration};
 
 use cortex_application::{
     ApplicationError, ApplicationService, AuditPort, Capability, CapabilityCatalog,
@@ -107,6 +107,7 @@ impl std::error::Error for DaemonError {}
 #[derive(Clone)]
 pub struct LocalDaemon {
     database: SqliteDatabase,
+    database_path: PathBuf,
     endpoint_name: String,
     workspace_id: WorkspaceId,
     owner_principal_id: PrincipalId,
@@ -303,7 +304,8 @@ impl LocalDaemon {
 
     async fn start_inner(config: DaemonConfig) -> Result<Self, DaemonError> {
         config.ensure_pairing_key()?;
-        let database = SqliteDatabase::connect_and_migrate(config.database_path)
+        let database_path = config.database_path.clone();
+        let database = SqliteDatabase::connect_and_migrate(&database_path)
             .await
             .map_err(|_| DaemonError::StartupFailed)?;
         let repositories = database.repositories();
@@ -361,6 +363,7 @@ impl LocalDaemon {
         let audit = database.audit_port();
         Ok(Self {
             database,
+            database_path,
             endpoint_name: config.endpoint_name,
             workspace_id: config.workspace_id,
             owner_principal_id: config.principal_id,
@@ -449,6 +452,7 @@ impl LocalDaemon {
             "cortex_daemon_logs" => {
                 Ok(self.diagnostic_response(principal_id, correlation_id, "logs"))
             }
+            "cortex_remote_enroll" => self.enroll_remote_principal(principal_id, request).await,
             "cortex_knowledge_search" | "cortex_note_search" | "cortex_memory_search" => {
                 self.search_knowledge(principal_id, request).await
             }
@@ -473,6 +477,95 @@ impl LocalDaemon {
             }
             _ => Err(DaemonError::UnsupportedCapability),
         }
+    }
+
+    async fn enroll_remote_principal(
+        &self,
+        principal_id: PrincipalId,
+        request: &DaemonRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct EnrollmentPayload {
+            subject: String,
+            grants: Vec<String>,
+        }
+
+        let context = self.command_context(principal_id, request)?;
+        if principal_id != self.owner_principal_id {
+            self.append_administration_audit(&context, principal_id, AuditResult::Rejected)
+                .await?;
+            return Err(DaemonError::PermissionDenied);
+        }
+        let payload: EnrollmentPayload = decode_payload(&request.payload)?;
+        let mut grants = payload
+            .grants
+            .iter()
+            .map(|grant| Capability::from_mcp_name(grant).ok_or(DaemonError::InvalidRequest))
+            .collect::<Result<Vec<_>, _>>()?;
+        grants.sort_unstable();
+        if grants.len() != payload.grants.len() {
+            return Err(DaemonError::InvalidRequest);
+        }
+        let mut config = DaemonConfig::from_database_path(self.database_path.clone())?;
+        let enrollment = config.enroll_remote_subject(&payload.subject, &grants)?;
+        self.database
+            .repositories()
+            .bootstrap_principal(
+                self.workspace_id,
+                enrollment.principal_id,
+                "paired-remote",
+                &enrollment.grants,
+            )
+            .await
+            .map_err(DaemonError::from)?;
+        self.append_administration_audit(&context, principal_id, AuditResult::Succeeded)
+            .await?;
+        Ok(DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            result: WireResult::Success {
+                value: json!({
+                    "correlation_id": request.request_id.to_string(),
+                    "principal_id": Uuid::from(enrollment.principal_id).to_string(),
+                    "subject": enrollment.subject,
+                    "grants": enrollment.grants.iter().map(|grant| grant.metadata().mcp_name).collect::<Vec<_>>(),
+                    "ipc_enrollment_path": enrollment.enrollment_path,
+                    "gateway_paired_subject": {
+                        "subject": enrollment.subject,
+                        "principal_id": Uuid::from(enrollment.principal_id).to_string(),
+                        "ipc_enrollment_path": enrollment.enrollment_path,
+                    },
+                    "restart_required": true
+                }),
+            },
+        })
+    }
+
+    async fn append_administration_audit(
+        &self,
+        context: &CommandContext,
+        principal_id: PrincipalId,
+        result: AuditResult,
+    ) -> Result<(), DaemonError> {
+        self.audit
+            .append(AuditEvent {
+                id: AuditEventId::new(),
+                workspace_id: self.workspace_id,
+                principal_id,
+                operation_id: context.operation_id,
+                correlation_id: context.correlation_id,
+                capability: "cortex_remote_enroll",
+                target_id: None,
+                policy_decision: if principal_id == self.owner_principal_id {
+                    PolicyDecision::Allow
+                } else {
+                    PolicyDecision::Deny(PolicyDeny::MissingGrant)
+                },
+                result,
+            })
+            .await
+            .map_err(DaemonError::from)
     }
 
     async fn create_note(

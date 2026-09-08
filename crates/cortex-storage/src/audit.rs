@@ -230,6 +230,7 @@ fn canonical_capability(value: &str) -> Result<&'static str, ApplicationError> {
         "cortex_note_restore" => Ok("cortex_note_restore"),
         "cortex_note_search" => Ok("cortex_note_search"),
         "cortex_note_update" => Ok("cortex_note_update"),
+        "cortex_remote_enroll" => Ok("cortex_remote_enroll"),
         "cortex_task_complete" => Ok("cortex_task_complete"),
         "cortex_task_create" => Ok("cortex_task_create"),
         "cortex_task_delete" => Ok("cortex_task_delete"),

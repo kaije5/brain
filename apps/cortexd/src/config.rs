@@ -229,9 +229,72 @@ impl DaemonConfig {
             principal_id,
             pairing_verifier: signer.verifying_key(),
             bootstrap_grants: grants.to_vec(),
+            subject: String::new(),
         });
         write_remote_clients(&self.database_path, &self.remote_clients)?;
         Ok(enrollment_path)
+    }
+
+    /// Creates or returns one durable remote identity for a validated OIDC subject.
+    ///
+    /// This is intentionally reachable only from the daemon's authenticated local-owner
+    /// provisioning path. The result contains no key material; callers receive the protected
+    /// enrollment file path needed by the loopback gateway configuration.
+    ///
+    /// # Errors
+    /// Returns a redacted configuration error for an invalid subject/grant set or unavailable
+    /// protected local storage.
+    pub fn enroll_remote_subject(
+        &mut self,
+        subject: &str,
+        grants: &[Capability],
+    ) -> Result<RemoteEnrollment, crate::DaemonError> {
+        validate_subject(subject)?;
+        validate_remote_grants(grants)?;
+        if let Some(client) = self
+            .remote_clients
+            .iter()
+            .find(|client| client.subject == subject)
+        {
+            if client.bootstrap_grants != grants {
+                return Err(crate::DaemonError::InvalidConfiguration);
+            }
+            return Ok(RemoteEnrollment {
+                principal_id: client.principal_id,
+                enrollment_path: remote_enrollment_path(&self.database_path, client.principal_id),
+                subject: subject.to_owned(),
+                grants: grants.to_vec(),
+            });
+        }
+        if self.remote_clients.len() >= MAX_REMOTE_CLIENTS {
+            return Err(crate::DaemonError::InvalidConfiguration);
+        }
+        let principal_id = PrincipalId::new();
+        let signer = fresh_signing_key();
+        let enrollment_path = remote_enrollment_path(&self.database_path, principal_id);
+        let enrollment = PrivateEnrollment {
+            endpoint_name: self.endpoint_name.clone(),
+            principal_id: principal_id.into(),
+            signing_key: signer.to_bytes(),
+        };
+        write_private_bytes(
+            &enrollment_path,
+            &serde_json::to_vec(&enrollment)
+                .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
+        )?;
+        self.remote_clients.push(RemoteClientConfig {
+            principal_id,
+            pairing_verifier: signer.verifying_key(),
+            bootstrap_grants: grants.to_vec(),
+            subject: subject.to_owned(),
+        });
+        write_remote_clients(&self.database_path, &self.remote_clients)?;
+        Ok(RemoteEnrollment {
+            principal_id,
+            enrollment_path,
+            subject: subject.to_owned(),
+            grants: grants.to_vec(),
+        })
     }
 
     /// Opens the separate, per-user pairing enrollment artifact for a local client. The private
@@ -278,6 +341,23 @@ fn environment_value(name: &str) -> Result<Option<String>, crate::DaemonError> {
                 .ok_or(crate::DaemonError::InvalidConfiguration)
         })
         .transpose()
+}
+
+fn validate_subject(subject: &str) -> Result<(), crate::DaemonError> {
+    if subject.trim().is_empty() || subject.len() > 256 || subject.chars().any(char::is_control) {
+        return Err(crate::DaemonError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+fn validate_remote_grants(grants: &[Capability]) -> Result<(), crate::DaemonError> {
+    if grants.is_empty()
+        || grants.len() > CapabilityCatalog::all().len()
+        || grants.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(crate::DaemonError::InvalidConfiguration);
+    }
+    Ok(())
 }
 
 fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<(), crate::DaemonError> {
@@ -332,6 +412,19 @@ pub(crate) struct RemoteClientConfig {
     pub principal_id: PrincipalId,
     pub pairing_verifier: VerifyingKey,
     pub bootstrap_grants: Vec<Capability>,
+    pub subject: String,
+}
+
+/// Redacted result of trusted local remote-principal provisioning.
+///
+/// The enrollment file contains a private key and is deliberately returned only
+/// as a path; no API serializes or prints its contents.
+#[derive(Clone, Debug)]
+pub struct RemoteEnrollment {
+    pub principal_id: PrincipalId,
+    pub enrollment_path: PathBuf,
+    pub subject: String,
+    pub grants: Vec<Capability>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -351,6 +444,8 @@ struct RemoteClientEntry {
     principal_id: uuid::Uuid,
     pairing_verifier: [u8; 32],
     bootstrap_grants: Vec<String>,
+    #[serde(default)]
+    subject: String,
 }
 
 pub(crate) fn load_ipc_enrollment(
@@ -434,6 +529,7 @@ fn load_remote_clients(
             principal_id,
             pairing_verifier,
             bootstrap_grants,
+            subject: entry.subject,
         });
     }
     Ok(clients)
@@ -454,6 +550,7 @@ fn write_remote_clients(
                     .iter()
                     .map(|capability| capability.metadata().mcp_name.to_owned())
                     .collect(),
+                subject: client.subject.clone(),
             })
             .collect(),
     };

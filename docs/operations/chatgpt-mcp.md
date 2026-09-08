@@ -13,24 +13,42 @@ stateless relay. It never binds a public listener, and the relay must not have
 SQLite access, an enrollment private key, model credentials, or authorization
 responsibility.
 
-## Required provisioning boundary
+## Pair a remote OIDC subject as the local owner
 
-The release includes no `brain pair`, `cortexd enroll-remote`, or automatic
-ChatGPT-account enrollment command. Creating a remote principal and its
-protected IPC enrollment is a trusted deployment/provisioning operation, not a
-request that an unauthenticated client may make. Consequently, Cortex cannot
-truthfully claim that a live ChatGPT connection has been configured merely by
-starting the gateway.
+Creating a remote principal is a trusted local-owner operation. Start
+`cortexd`, set `CORTEX_DATABASE` in a second shell to the same private database,
+then run the authenticated local `brain remote enroll` command below. It creates a distinct durable
+principal, grants only the named capabilities, writes a protected IPC enrollment
+file, and records a redacted local audit event. It prints the principal ID,
+subject, requested grants, enrollment **path**, correlation ID, and
+`restart_required`; it never prints an enrollment signing key.
 
-Before enabling a remote client, an operator must provide all of these:
+```powershell
+$env:CORTEX_DATABASE = 'C:\CortexData\cortex.db'
+cargo run -p brain -- --output json remote enroll --subject 'chatgpt-owner-subject' --grant cortex_note_create --grant cortex_note_search --grant cortex_memory_search
+```
+
+The exact same subject/grant set is idempotent: retrying it returns the existing
+principal and enrollment path. A changed grant set for that subject is rejected;
+make an explicit policy/provisioning change instead. The command is accepted
+only through the authenticated local owner IPC enrollment. A remote or unpaired
+client cannot create principals, and a newly enrolled remote identity cannot
+use grants it was not explicitly given.
+
+Stop `cortexd` with `Ctrl+C`, then start it again using the same
+`CORTEX_DATABASE` before starting the gateway. The restart loads the new
+protected verifier and grants; it is required before the enrollment can
+authenticate. Keep the returned enrollment file local and private.
+
+Before enabling the gateway, an operator must also provide all of these:
 
 1. A relay that implements the v0.1 registration/forwarding contract and
    presents a certificate trusted by the gateway.
 2. A client certificate/key pair for mTLS, stored in protected local files.
 3. An OIDC issuer, audience, permitted signing algorithms, and a stable subject
    for the remote identity.
-4. One durable Cortex principal with explicit grants and one matching protected
-   IPC enrollment file.
+4. The principal ID and protected IPC enrollment path returned by `brain remote
+   enroll`, mapped to the same stable OIDC subject.
 5. A ChatGPT MCP connector configuration supported by the operator's current
    ChatGPT plan that can authenticate with the paired OIDC identity and route
    via the relay. Verify that external connector's current requirements with its
@@ -77,6 +95,11 @@ field, are rejected.
   }
 }
 ```
+
+Replace the `paired_subjects` object with the returned
+`gateway_paired_subject` object from the local-owner enrollment command. It is
+safe to place the path in this configuration; do not place the enrollment file
+contents, token, or private key there.
 
 `local_port` may be `0` to request an ephemeral loopback port. The gateway
 still binds only to `127.0.0.1`; the relay connection is the sole remote
