@@ -7,5 +7,5 @@ mod repositories;
 
 pub use audit::SqliteAuditPort;
 pub use database::SqliteDatabase;
-pub use operation::OperationStore;
+pub use operation::{OperationStore, RemoteEnrollmentRecord, RemoteEnrollmentRequest};
 pub use repositories::SqliteRepositories;

@@ -1,6 +1,6 @@
-use cortex_application::Capability;
-use cortex_domain::PrincipalId;
-use cortex_storage::SqliteDatabase;
+use cortex_application::{Capability, CapabilityCatalog};
+use cortex_domain::{OperationId, PrincipalId};
+use cortex_storage::{RemoteEnrollmentRequest, SqliteDatabase};
 use cortexd::{
     AuthenticatedIpcClient, DaemonConfig, DaemonError, DaemonRequest, LocalDaemon,
     PROTOCOL_VERSION, WireResult,
@@ -8,6 +8,152 @@ use cortexd::{
 use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn durable_remote_enrollment_commits_before_artifact_reconciliation_and_recovers() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let database_path = directory.path().join("cortex.db");
+    let mut config = DaemonConfig::from_database_path(database_path.clone()).expect("config");
+    let workspace_id = config.workspace_id();
+    let owner_id = PrincipalId::try_from(config.owner_principal_id()).expect("owner id");
+    let database = SqliteDatabase::connect_and_migrate(&database_path)
+        .await
+        .expect("database");
+    database
+        .repositories()
+        .bootstrap_owner(workspace_id, owner_id, CapabilityCatalog::all())
+        .await
+        .expect("owner bootstrap");
+
+    let principal_id = PrincipalId::new();
+    let correlation_id = Uuid::now_v7();
+    let request = RemoteEnrollmentRequest {
+        workspace_id,
+        owner_principal_id: owner_id,
+        operation_id: OperationId::new(),
+        correlation_id,
+        subject: "recovery-subject".to_owned(),
+        principal_id,
+        grants: vec![Capability::NoteCreate],
+        pairing_verifier: config
+            .derived_remote_signing_key(principal_id)
+            .verifying_key()
+            .to_bytes(),
+        max_remote_clients: 16,
+    };
+    let record = database
+        .operation_store()
+        .enroll_remote_once(request.clone())
+        .await
+        .expect("durable enrollment transaction");
+    let artifact_path =
+        database_path.with_extension(format!("cortexd-client-{}.json", Uuid::from(principal_id)));
+    assert!(
+        !artifact_path.exists(),
+        "the protected artifact is not written before the durable transaction"
+    );
+    std::fs::create_dir(&artifact_path).expect("artifact failpoint directory");
+    assert!(
+        config.reconcile_remote_enrollment(&record).is_err(),
+        "a protected-artifact failure is redacted and leaves only durable pending state"
+    );
+    assert_eq!(
+        database
+            .audit_port()
+            .count_for_correlation(workspace_id, correlation_id)
+            .await
+            .expect("audit count after artifact failure"),
+        1
+    );
+    std::fs::remove_dir(&artifact_path).expect("remove failpoint");
+    let enrollment = config
+        .reconcile_remote_enrollment(&record)
+        .expect("retry reconciles the same protected artifact");
+    assert_eq!(enrollment.principal_id, principal_id);
+    assert!(artifact_path.is_file());
+    let replay = database
+        .operation_store()
+        .enroll_remote_once(request)
+        .await
+        .expect("replay returns canonical enrollment");
+    assert_eq!(replay, record);
+    assert_eq!(
+        database
+            .audit_port()
+            .count_for_correlation(workspace_id, correlation_id)
+            .await
+            .expect("audit count after replay"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_remote_enrollment_converges_on_one_canonical_identity_and_audit() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let database_path = directory.path().join("cortex.db");
+    let config = DaemonConfig::from_database_path(database_path.clone()).expect("config");
+    let workspace_id = config.workspace_id();
+    let owner_id = PrincipalId::try_from(config.owner_principal_id()).expect("owner id");
+    let database = SqliteDatabase::connect_and_migrate(&database_path)
+        .await
+        .expect("database");
+    database
+        .repositories()
+        .bootstrap_owner(workspace_id, owner_id, CapabilityCatalog::all())
+        .await
+        .expect("owner bootstrap");
+    let first_principal = PrincipalId::new();
+    let second_principal = PrincipalId::new();
+    let first_correlation = Uuid::now_v7();
+    let second_correlation = Uuid::now_v7();
+    let first = RemoteEnrollmentRequest {
+        workspace_id,
+        owner_principal_id: owner_id,
+        operation_id: OperationId::new(),
+        correlation_id: first_correlation,
+        subject: "concurrent-subject".to_owned(),
+        principal_id: first_principal,
+        grants: vec![Capability::NoteCreate],
+        pairing_verifier: config
+            .derived_remote_signing_key(first_principal)
+            .verifying_key()
+            .to_bytes(),
+        max_remote_clients: 16,
+    };
+    let second = RemoteEnrollmentRequest {
+        workspace_id,
+        owner_principal_id: owner_id,
+        operation_id: OperationId::new(),
+        correlation_id: second_correlation,
+        subject: "concurrent-subject".to_owned(),
+        principal_id: second_principal,
+        grants: vec![Capability::NoteCreate],
+        pairing_verifier: config
+            .derived_remote_signing_key(second_principal)
+            .verifying_key()
+            .to_bytes(),
+        max_remote_clients: 16,
+    };
+    let store = database.operation_store();
+    let (left, right) = tokio::join!(
+        store.enroll_remote_once(first),
+        store.enroll_remote_once(second)
+    );
+    let left = left.expect("first enrollment result");
+    let right = right.expect("second enrollment result");
+    assert_eq!(left.principal_id, right.principal_id);
+    assert_eq!(left.correlation_id, right.correlation_id);
+    let audits = database.audit_port();
+    let audit_count = audits
+        .count_for_correlation(workspace_id, first_correlation)
+        .await
+        .expect("first audit count")
+        + audits
+            .count_for_correlation(workspace_id, second_correlation)
+            .await
+            .expect("second audit count");
+    assert_eq!(audit_count, 1, "concurrent provisioning emits one audit");
+}
 
 #[tokio::test]
 async fn remote_enrollment_keeps_identity_grants_and_audit_distinct_across_restart() {
@@ -117,12 +263,13 @@ async fn owner_enrolls_a_paired_remote_principal_over_local_ipc_with_only_reques
 
     let owner = AuthenticatedIpcClient::from_database_path(&database_path).expect("owner client");
     let enrollment_request_id = Uuid::now_v7();
+    let enrollment_operation_id = Uuid::now_v7();
     let response = owner
         .request(&DaemonRequest {
             protocol_version: PROTOCOL_VERSION,
             request_id: enrollment_request_id,
             principal_id: Uuid::now_v7(),
-            operation_id: Uuid::now_v7(),
+            operation_id: enrollment_operation_id,
             capability: "cortex_remote_enroll".to_owned(),
             payload: json!({
                 "subject": "chatgpt-owner-subject",
@@ -156,9 +303,9 @@ async fn owner_enrolls_a_paired_remote_principal_over_local_ipc_with_only_reques
     let repeated = owner
         .request(&DaemonRequest {
             protocol_version: PROTOCOL_VERSION,
-            request_id: Uuid::now_v7(),
+            request_id: enrollment_request_id,
             principal_id: Uuid::now_v7(),
-            operation_id: Uuid::now_v7(),
+            operation_id: enrollment_operation_id,
             capability: "cortex_remote_enroll".to_owned(),
             payload: json!({
                 "subject": "chatgpt-owner-subject",
@@ -186,6 +333,15 @@ async fn owner_enrolls_a_paired_remote_principal_over_local_ipc_with_only_reques
         .expect("audit lookup")
         .expect("owner enrollment audit");
     assert_eq!(audit.capability, "cortex_remote_enroll");
+    assert_eq!(
+        database
+            .audit_port()
+            .count_for_correlation(daemon.ownership_workspace_id(), enrollment_request_id)
+            .await
+            .expect("audit count"),
+        1,
+        "an operation replay must not create a second audit record"
+    );
     let restarted = std::sync::Arc::new(
         LocalDaemon::start(
             DaemonConfig::from_database_path(database_path.clone()).expect("restart config"),

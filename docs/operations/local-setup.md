@@ -33,9 +33,9 @@ Keep the same `CORTEX_DATABASE` value in a second shell. The CLI reads the
 daemon's discovery and protected local enrollment artifacts; it does not accept
 a user-supplied principal or workspace ID.
 
-The command forms are `brain status`, `brain note create`, `brain task add`,
-`brain task list`, and `brain memory search`. From an uninstalled checkout, run
-each form through `cargo run -p brain --` as shown below.
+The CLI provides status, note-creation, task-addition/listing, and memory-search
+operations. From an uninstalled checkout, run the complete forms below through
+`cargo run -p brain --`.
 
 ```powershell
 $env:CORTEX_DATABASE = 'C:\CortexData\cortex.db'

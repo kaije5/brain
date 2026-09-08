@@ -3,11 +3,12 @@ use cortex_application::{
     MutationResult, OperationIdentity, OperationResultRepository, RecordedOperation,
 };
 use cortex_domain::{
-    EntityId, Lifecycle, MemoryAssertion, Note, Revision, Source, Task, WorkspaceId,
+    AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion, Note, OperationId,
+    PolicyDecision, PrincipalId, Revision, Source, Task, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -44,6 +45,346 @@ impl OperationStore {
         .map_err(|_| storage_error("operation lookup failed"))?;
         outcome.map(|value| decode_operation(&value)).transpose()
     }
+
+    /// Reserves and commits remote enrollment, its principal/grants, and its one audit event in
+    /// one `SQLite` transaction. Protected enrollment artifacts are intentionally outside this
+    /// method: callers may reconcile them only after this durable boundary succeeds.
+    ///
+    /// # Errors
+    /// Returns a redacted validation, conflict, or storage error without writing a partial
+    /// principal, grant, operation, or audit record.
+    #[allow(clippy::too_many_lines)] // The transaction's ordered durable boundary is review-critical.
+    pub async fn enroll_remote_once(
+        &self,
+        request: RemoteEnrollmentRequest,
+    ) -> Result<RemoteEnrollmentRecord, ApplicationError> {
+        request.validate()?;
+        if let Some(record) = self.load_remote_operation(&request).await? {
+            return Ok(record);
+        }
+
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|_| storage_error("remote enrollment transaction begin failed"))?;
+
+        if let Some(record) = load_remote_subject(&mut transaction, &request).await? {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| storage_error("remote enrollment rollback failed"))?;
+            return Ok(record);
+        }
+
+        let existing_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM remote_enrollment WHERE workspace_id = ?")
+                .bind(id_text(request.workspace_id))
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|_| storage_error("remote enrollment count failed"))?;
+        if existing_count >= i64::from(request.max_remote_clients) {
+            return Err(ApplicationError::Conflict {
+                entity: "remote_enrollment",
+            });
+        }
+
+        let record = RemoteEnrollmentRecord {
+            subject: request.subject.clone(),
+            principal_id: request.principal_id,
+            grants: request.grants.clone(),
+            pairing_verifier: request.pairing_verifier,
+            correlation_id: request.correlation_id,
+        };
+        let outcome_json = encode_remote_operation(&request, &record)?;
+        let reservation = sqlx::query(
+            "INSERT INTO operation (workspace_id, operation_id, outcome_json) VALUES (?, ?, ?)",
+        )
+        .bind(id_text(request.workspace_id))
+        .bind(id_text(request.operation_id))
+        .bind(outcome_json)
+        .execute(&mut *transaction)
+        .await;
+        if reservation.is_err() {
+            transaction
+                .rollback()
+                .await
+                .map_err(|_| storage_error("remote enrollment rollback failed"))?;
+            if let Some(record) = self.load_durable_remote_subject(&request).await? {
+                return Ok(record);
+            }
+            return self
+                .load_remote_operation(&request)
+                .await?
+                .ok_or_else(|| storage_error("remote enrollment operation reservation failed"));
+        }
+
+        sqlx::query("INSERT INTO principal (id, workspace_id, name) VALUES (?, ?, ?)")
+            .bind(id_text(request.principal_id))
+            .bind(id_text(request.workspace_id))
+            .bind("paired-remote")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| storage_error("remote enrollment principal insert failed"))?;
+        for capability in &request.grants {
+            sqlx::query(
+                "INSERT INTO capability_grant (workspace_id, principal_id, capability) VALUES (?, ?, ?)",
+            )
+            .bind(id_text(request.workspace_id))
+            .bind(id_text(request.principal_id))
+            .bind(capability.metadata().mcp_name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| storage_error("remote enrollment grant insert failed"))?;
+        }
+        sqlx::query(
+            "INSERT INTO remote_enrollment \
+             (workspace_id, subject, principal_id, pairing_verifier, grants_json, correlation_id) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id_text(request.workspace_id))
+        .bind(&request.subject)
+        .bind(id_text(request.principal_id))
+        .bind(request.pairing_verifier.to_vec())
+        .bind(encode_grants(&request.grants)?)
+        .bind(request.correlation_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| storage_error("remote enrollment insert failed"))?;
+        insert_event_in_transaction(
+            &mut transaction,
+            &AuditEvent {
+                id: AuditEventId::new(),
+                workspace_id: request.workspace_id,
+                principal_id: request.owner_principal_id,
+                operation_id: request.operation_id,
+                correlation_id: request.correlation_id,
+                capability: "cortex_remote_enroll",
+                target_id: None,
+                policy_decision: PolicyDecision::Allow,
+                result: AuditResult::Succeeded,
+            },
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| storage_error("remote enrollment commit failed"))?;
+        Ok(record)
+    }
+
+    async fn load_remote_operation(
+        &self,
+        request: &RemoteEnrollmentRequest,
+    ) -> Result<Option<RemoteEnrollmentRecord>, ApplicationError> {
+        let outcome: Option<String> = sqlx::query_scalar(
+            "SELECT outcome_json FROM operation WHERE workspace_id = ? AND operation_id = ?",
+        )
+        .bind(id_text(request.workspace_id))
+        .bind(id_text(request.operation_id))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| storage_error("remote enrollment operation lookup failed"))?;
+        let Some(outcome) = outcome else {
+            return Ok(None);
+        };
+        let stored: StoredRemoteEnrollment =
+            serde_json::from_str(&outcome).map_err(|_| ApplicationError::Conflict {
+                entity: "operation",
+            })?;
+        if stored.version != 1 || stored.kind != "remote_enrollment" {
+            return Err(ApplicationError::Conflict {
+                entity: "operation",
+            });
+        }
+        if stored.owner_principal_id != id_text(request.owner_principal_id)
+            || stored.subject != request.subject
+            || decode_grants(&stored.grants)? != request.grants
+        {
+            return Err(ApplicationError::Conflict {
+                entity: "operation",
+            });
+        }
+        let record = stored.into_record()?;
+        Ok(Some(record))
+    }
+
+    async fn load_durable_remote_subject(
+        &self,
+        request: &RemoteEnrollmentRequest,
+    ) -> Result<Option<RemoteEnrollmentRecord>, ApplicationError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| storage_error("remote enrollment subject transaction failed"))?;
+        let record = load_remote_subject(&mut transaction, request).await?;
+        transaction
+            .rollback()
+            .await
+            .map_err(|_| storage_error("remote enrollment rollback failed"))?;
+        Ok(record)
+    }
+}
+
+/// A validated administrative enrollment request accepted only from the daemon-owned adapter.
+#[derive(Clone, Debug)]
+pub struct RemoteEnrollmentRequest {
+    pub workspace_id: WorkspaceId,
+    pub owner_principal_id: PrincipalId,
+    pub operation_id: OperationId,
+    pub correlation_id: Uuid,
+    pub subject: String,
+    pub principal_id: PrincipalId,
+    pub grants: Vec<Capability>,
+    pub pairing_verifier: [u8; 32],
+    pub max_remote_clients: u8,
+}
+
+impl RemoteEnrollmentRequest {
+    fn validate(&self) -> Result<(), ApplicationError> {
+        if self.subject.trim().is_empty()
+            || self.subject.len() > 256
+            || self.subject.chars().any(char::is_control)
+            || self.grants.is_empty()
+            || self.grants.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.max_remote_clients == 0
+        {
+            return Err(ApplicationError::Validation {
+                field: "remote_enrollment",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Public, non-secret durable enrollment state used to reconcile its protected artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteEnrollmentRecord {
+    pub subject: String,
+    pub principal_id: PrincipalId,
+    pub grants: Vec<Capability>,
+    pub pairing_verifier: [u8; 32],
+    pub correlation_id: Uuid,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredRemoteEnrollment {
+    version: u8,
+    kind: String,
+    owner_principal_id: String,
+    subject: String,
+    principal_id: String,
+    grants: Vec<String>,
+    pairing_verifier: [u8; 32],
+    correlation_id: String,
+}
+
+impl StoredRemoteEnrollment {
+    fn into_record(self) -> Result<RemoteEnrollmentRecord, ApplicationError> {
+        Ok(RemoteEnrollmentRecord {
+            subject: self.subject,
+            principal_id: parse_id(&self.principal_id)
+                .map_err(|_| storage_error("invalid remote enrollment principal"))?,
+            grants: decode_grants(&self.grants)?,
+            pairing_verifier: self.pairing_verifier,
+            correlation_id: Uuid::parse_str(&self.correlation_id)
+                .map_err(|_| storage_error("invalid remote enrollment correlation"))?,
+        })
+    }
+}
+
+fn encode_remote_operation(
+    request: &RemoteEnrollmentRequest,
+    record: &RemoteEnrollmentRecord,
+) -> Result<String, ApplicationError> {
+    serde_json::to_string(&StoredRemoteEnrollment {
+        version: 1,
+        kind: "remote_enrollment".to_owned(),
+        owner_principal_id: id_text(request.owner_principal_id),
+        subject: record.subject.clone(),
+        principal_id: id_text(record.principal_id),
+        grants: record
+            .grants
+            .iter()
+            .map(|capability| capability.metadata().mcp_name.to_owned())
+            .collect(),
+        pairing_verifier: record.pairing_verifier,
+        correlation_id: record.correlation_id.to_string(),
+    })
+    .map_err(|_| storage_error("remote enrollment operation encoding failed"))
+}
+
+async fn load_remote_subject(
+    transaction: &mut Transaction<'_, Sqlite>,
+    request: &RemoteEnrollmentRequest,
+) -> Result<Option<RemoteEnrollmentRecord>, ApplicationError> {
+    let row = sqlx::query(
+        "SELECT principal_id, pairing_verifier, grants_json, correlation_id FROM remote_enrollment \
+         WHERE workspace_id = ? AND subject = ?",
+    )
+    .bind(id_text(request.workspace_id))
+    .bind(&request.subject)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| storage_error("remote enrollment subject lookup failed"))?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let principal_text: String = row
+        .try_get("principal_id")
+        .map_err(|_| storage_error("invalid remote enrollment row"))?;
+    let verifier: Vec<u8> = row
+        .try_get("pairing_verifier")
+        .map_err(|_| storage_error("invalid remote enrollment row"))?;
+    let verifier: [u8; 32] = verifier
+        .try_into()
+        .map_err(|_| storage_error("invalid remote enrollment verifier"))?;
+    let grants_json: String = row
+        .try_get("grants_json")
+        .map_err(|_| storage_error("invalid remote enrollment row"))?;
+    let grants: Vec<String> = serde_json::from_str(&grants_json)
+        .map_err(|_| storage_error("invalid remote enrollment grants"))?;
+    let correlation_id: String = row
+        .try_get("correlation_id")
+        .map_err(|_| storage_error("invalid remote enrollment row"))?;
+    let record = RemoteEnrollmentRecord {
+        subject: request.subject.clone(),
+        principal_id: parse_id(&principal_text)?,
+        grants: decode_grants(&grants)?,
+        pairing_verifier: verifier,
+        correlation_id: Uuid::parse_str(&correlation_id)
+            .map_err(|_| storage_error("invalid remote enrollment correlation"))?,
+    };
+    if record.grants != request.grants {
+        return Err(ApplicationError::Conflict {
+            entity: "remote_enrollment",
+        });
+    }
+    Ok(Some(record))
+}
+
+fn encode_grants(grants: &[Capability]) -> Result<String, ApplicationError> {
+    serde_json::to_string(
+        &grants
+            .iter()
+            .map(|capability| capability.metadata().mcp_name)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|_| storage_error("remote enrollment grants encoding failed"))
+}
+
+fn decode_grants(grants: &[String]) -> Result<Vec<Capability>, ApplicationError> {
+    let decoded = grants
+        .iter()
+        .map(|grant| {
+            Capability::from_mcp_name(grant)
+                .ok_or_else(|| storage_error("invalid remote enrollment grant"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if decoded.is_empty() || decoded.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(storage_error("invalid remote enrollment grants"));
+    }
+    Ok(decoded)
 }
 
 impl OperationResultRepository for OperationStore {

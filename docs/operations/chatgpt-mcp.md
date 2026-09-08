@@ -17,7 +17,7 @@ responsibility.
 
 Creating a remote principal is a trusted local-owner operation. Start
 `cortexd`, set `CORTEX_DATABASE` in a second shell to the same private database,
-then run the authenticated local `brain remote enroll` command below. It creates a distinct durable
+then run the authenticated local remote-enrollment command below. It creates a distinct durable
 principal, grants only the named capabilities, writes a protected IPC enrollment
 file, and records a redacted local audit event. It prints the principal ID,
 subject, requested grants, enrollment **path**, correlation ID, and
@@ -35,6 +35,14 @@ only through the authenticated local owner IPC enrollment. A remote or unpaired
 client cannot create principals, and a newly enrolled remote identity cannot
 use grants it was not explicitly given.
 
+Before the protected enrollment artifact or verifier manifest is written, the
+daemon commits one local SQLite transaction containing the subject-to-principal
+mapping, requested grants, operation replay record, and redacted success audit
+event. It then reconciles the protected artifact from that durable mapping. If
+the local file write is interrupted, the command returns a redacted unavailable
+result; re-run the same owner command to reconcile the same identity. It never
+creates a second principal or prints the private enrollment key.
+
 Stop `cortexd` with `Ctrl+C`, then start it again using the same
 `CORTEX_DATABASE` before starting the gateway. The restart loads the new
 protected verifier and grants; it is required before the enrollment can
@@ -47,8 +55,8 @@ Before enabling the gateway, an operator must also provide all of these:
 2. A client certificate/key pair for mTLS, stored in protected local files.
 3. An OIDC issuer, audience, permitted signing algorithms, and a stable subject
    for the remote identity.
-4. The principal ID and protected IPC enrollment path returned by `brain remote
-   enroll`, mapped to the same stable OIDC subject.
+4. The principal ID and protected IPC enrollment path returned by the local
+   enrollment command, mapped to the same stable OIDC subject.
 5. A ChatGPT MCP connector configuration supported by the operator's current
    ChatGPT plan that can authenticate with the paired OIDC identity and route
    via the relay. Verify that external connector's current requirements with its

@@ -19,9 +19,9 @@ Use the release guides in this order:
 4. [Diagnostics](docs/operations/diagnostics.md) — inspect safe status output,
    model-offline behavior, and redacted failure categories.
 
-The real local CLI includes commands such as `brain status`, `brain doctor`,
-`brain note create`, `brain task add`, and `brain memory search`; their exact
-arguments and output modes are documented in the local setup guide.
+The real local CLI includes status, diagnostic, note-creation, task, and
+memory-search operations. Complete, executable forms and their output modes
+are documented in the local setup guide.
 
 ## Security boundary
 

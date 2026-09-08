@@ -15,7 +15,9 @@ use cortex_inference::{
     ReqwestOpenAiTransport,
 };
 use cortex_search::{HybridSearchService, SearchRequest};
-use cortex_storage::{OperationStore, SqliteAuditPort, SqliteDatabase, SqliteRepositories};
+use cortex_storage::{
+    OperationStore, RemoteEnrollmentRequest, SqliteAuditPort, SqliteDatabase, SqliteRepositories,
+};
 use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -25,7 +27,7 @@ use tokio::{
 };
 use uuid::{Uuid, Version};
 
-use crate::DaemonConfig;
+use crate::{DaemonConfig, config::MAX_REMOTE_CLIENTS};
 
 /// The only supported local IPC protocol version for Cortex v0.1.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -507,26 +509,37 @@ impl LocalDaemon {
         if grants.len() != payload.grants.len() {
             return Err(DaemonError::InvalidRequest);
         }
-        let mut config = DaemonConfig::from_database_path(self.database_path.clone())?;
-        let enrollment = config.enroll_remote_subject(&payload.subject, &grants)?;
-        self.database
-            .repositories()
-            .bootstrap_principal(
-                self.workspace_id,
-                enrollment.principal_id,
-                "paired-remote",
-                &enrollment.grants,
-            )
+        let config = DaemonConfig::from_database_path(self.database_path.clone())?;
+        let proposed_principal_id = PrincipalId::new();
+        let record = self
+            .database
+            .operation_store()
+            .enroll_remote_once(RemoteEnrollmentRequest {
+                workspace_id: self.workspace_id,
+                owner_principal_id: self.owner_principal_id,
+                operation_id: context.operation_id,
+                correlation_id: context.correlation_id,
+                subject: payload.subject,
+                principal_id: proposed_principal_id,
+                grants,
+                pairing_verifier: config
+                    .derived_remote_signing_key(proposed_principal_id)
+                    .verifying_key()
+                    .to_bytes(),
+                max_remote_clients: u8::try_from(MAX_REMOTE_CLIENTS)
+                    .map_err(|_| DaemonError::InvalidConfiguration)?,
+            })
             .await
             .map_err(DaemonError::from)?;
-        self.append_administration_audit(&context, principal_id, AuditResult::Succeeded)
-            .await?;
+        let mut reconciliation_config =
+            DaemonConfig::from_database_path(self.database_path.clone())?;
+        let enrollment = reconciliation_config.reconcile_remote_enrollment(&record)?;
         Ok(DaemonResponse {
             protocol_version: PROTOCOL_VERSION,
             request_id: request.request_id,
             result: WireResult::Success {
                 value: json!({
-                    "correlation_id": request.request_id.to_string(),
+                    "correlation_id": record.correlation_id.to_string(),
                     "principal_id": Uuid::from(enrollment.principal_id).to_string(),
                     "subject": enrollment.subject,
                     "grants": enrollment.grants.iter().map(|grant| grant.metadata().mcp_name).collect::<Vec<_>>(),

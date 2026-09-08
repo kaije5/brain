@@ -2,7 +2,7 @@
 
 ## What to copy
 
-Cortex v0.1 has no `brain export` command and no cloud backup service. A backup
+Cortex v0.1 has no CLI export capability and no cloud backup service. A backup
 is a local file-level copy of the complete private data directory after the
 daemon has stopped. Copying the directory preserves the SQLite database,
 migration state, discovery record, owner pairing enrollment, and any remote
@@ -43,8 +43,9 @@ $env:CORTEX_DATABASE = 'C:\CortexRestore\cortex.db'
 cargo run -p cortexd
 ```
 
-In another shell with the same `CORTEX_DATABASE`, run `brain status` and a
-non-mutating search before using the restored state. The daemon applies its
+In another shell with the same `CORTEX_DATABASE`, run the complete status form
+from the local setup guide and a non-mutating search before using the restored
+state. The daemon applies its
 ordered migrations before serving; do not manually alter migration tables.
 
 If an existing deployment must be replaced, preserve the old directory as a

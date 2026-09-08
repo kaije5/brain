@@ -27,6 +27,12 @@ relay client keys, and OIDC subject mapping remains security-sensitive. Cortex
 provides `brain remote enroll` only over the owner-authenticated local IPC
 boundary; a remote/unpaired client cannot invoke it. An operator can still
 misconfigure a relay, grant excessive capabilities, or expose a backup.
+Remote enrollment first durably commits the subject/principal/grant mapping,
+operation replay record, and redacted audit event, and only then reconciles the
+protected artifact and local verifier manifest. An interrupted artifact write
+therefore leaves no unaudited active remote mapping; the trusted owner retries
+the same request to reconcile the fixed identity. This does not remove the risk
+of a compromised local owner account or unsafe handling of the protected file.
 The stateless relay and external ChatGPT connector remain external dependencies;
 their availability and account-level configuration are outside the local
 daemon's control. v0.1 also cannot recover a platform-secret-store credential
@@ -34,9 +40,11 @@ that was not available on the restore host.
 
 ## Release verification evidence
 
-- `tests/e2e/tests/documented_commands.rs` checks that the local operation
-  guides name real CLI/configuration contracts, require an outbound-only
-  loopback gateway, cover recoverable lifecycle behavior, and avoid credential
+- `tests/e2e/tests/documented_commands.rs` exhaustively extracts every
+  executable CLI form from the README and all operation guides, then parses,
+  maps, and executes each against the real daemon boundary. It also validates
+  the gateway configuration shape, requires an outbound-only loopback gateway,
+  covers recoverable lifecycle behavior, and avoids credential
   examples.
 - The end-to-end suite exercises the real daemon/CLI IPC boundary, paired OIDC
   gateway, mutual-TLS outbound tunnel, policy/audit, provenance, deletion and

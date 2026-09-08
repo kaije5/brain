@@ -6,7 +6,10 @@ use std::{
 use brain::{Cli, command_request};
 use clap::Parser;
 use cortex_mcp_gateway::GatewayConfig;
+use tokio::process::Command;
 use uuid::Uuid;
+
+mod support;
 
 fn read(path: &str) -> String {
     fs::read_to_string(workspace_root().join(path))
@@ -23,14 +26,7 @@ fn workspace_root() -> PathBuf {
 
 #[test]
 fn documented_brain_commands_parse_and_map_to_the_real_daemon_contract() {
-    let setup = read("docs/operations/local-setup.md");
-    let diagnostics = read("docs/operations/diagnostics.md");
-    let chatgpt = read("docs/operations/chatgpt-mcp.md");
-    let commands = documented_brain_commands(&setup)
-        .into_iter()
-        .chain(documented_brain_commands(&diagnostics))
-        .chain(documented_brain_commands(&chatgpt))
-        .collect::<Vec<_>>();
+    let commands = all_documented_brain_commands();
     assert!(
         !commands.is_empty(),
         "guides must contain executable brain commands"
@@ -39,6 +35,32 @@ fn documented_brain_commands_parse_and_map_to_the_real_daemon_contract() {
         let cli = Cli::try_parse_from(command).expect("documented brain command must parse");
         command_request(&cli).expect("documented brain command must map to daemon IPC");
     }
+}
+
+#[tokio::test]
+async fn every_documented_brain_command_executes_against_the_real_daemon_boundary() {
+    let harness = support::Harness::start().await;
+    for command in all_documented_brain_commands() {
+        let output = Command::new(env!("CARGO_BIN_EXE_brain-e2e"))
+            .args(&command[1..])
+            .env("CORTEX_DATABASE", harness.database_path())
+            .output()
+            .await
+            .unwrap_or_else(|error| panic!("documented command must execute: {error}"));
+        assert!(
+            output.status.success(),
+            "documented command {:?} failed: {}",
+            command,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn an_invalid_brain_form_added_to_any_release_artifact_fails_validation() {
+    let mut document = read("README.md");
+    document.push_str("\n`brain made-up-command`\n");
+    assert!(validate_documented_brain_commands(&document).is_err());
 }
 
 #[test]
@@ -106,20 +128,53 @@ fn required_operation_guides_are_tracked_as_release_artifacts() {
 #[test]
 fn remote_pairing_guide_uses_the_owner_provisioning_command() {
     let guide = read("docs/operations/chatgpt-mcp.md");
-    assert!(guide.contains("brain remote enroll"));
+    assert!(guide.contains("cargo run -p brain -- --output json remote enroll"));
     assert!(guide.contains("restart_required"));
 }
 
-fn documented_brain_commands(document: &str) -> Vec<Vec<String>> {
-    document
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("cargo run -p brain -- "))
-        .map(|arguments| {
-            let mut argv = vec!["brain".to_owned()];
-            argv.extend(shell_words(arguments));
-            argv
-        })
+fn all_documented_brain_commands() -> Vec<Vec<String>> {
+    RELEASE_ARTIFACTS
+        .iter()
+        .flat_map(|path| documented_brain_commands(&read(path)))
         .collect()
+}
+
+const RELEASE_ARTIFACTS: [&str; 5] = [
+    "README.md",
+    "docs/operations/local-setup.md",
+    "docs/operations/chatgpt-mcp.md",
+    "docs/operations/backup-restore.md",
+    "docs/operations/diagnostics.md",
+];
+
+fn validate_documented_brain_commands(document: &str) -> Result<(), String> {
+    for command in documented_brain_commands(document) {
+        let cli = Cli::try_parse_from(command).map_err(|error| error.to_string())?;
+        command_request(&cli).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn documented_brain_commands(document: &str) -> Vec<Vec<String>> {
+    let fenced = document.lines().filter_map(|line| {
+        line.trim()
+            .strip_prefix("cargo run -p brain -- ")
+            .map(|arguments| {
+                let mut argv = vec!["brain".to_owned()];
+                argv.extend(shell_words(arguments));
+                argv
+            })
+    });
+    let inline = document.lines().flat_map(|line| {
+        line.split('`').filter_map(|snippet| {
+            snippet.strip_prefix("brain ").map(|arguments| {
+                let mut argv = vec!["brain".to_owned()];
+                argv.extend(shell_words(arguments));
+                argv
+            })
+        })
+    });
+    fenced.chain(inline).collect()
 }
 
 fn shell_words(input: &str) -> Vec<String> {

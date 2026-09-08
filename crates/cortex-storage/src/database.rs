@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use cortex_application::ApplicationError;
 use sqlx::{
@@ -28,6 +28,7 @@ impl SqliteDatabase {
             .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5))
             .journal_mode(SqliteJournalMode::Wal);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -109,6 +110,7 @@ mod tests {
             "embedding",
             "operation",
             "audit_event",
+            "remote_enrollment",
         ];
 
         assert_eq!(journal_mode.to_ascii_lowercase(), "wal");

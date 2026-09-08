@@ -109,6 +109,10 @@ pub struct Harness {
 }
 
 impl Harness {
+    pub fn database_path(&self) -> &std::path::Path {
+        &self.database_path
+    }
+
     pub async fn start() -> Self {
         Self::start_with_remote_grants(CapabilityCatalog::all().to_vec()).await
     }

@@ -7,9 +7,11 @@ use std::{
 use cortex_application::{Capability, CapabilityCatalog, SecretRef};
 use cortex_domain::{PrincipalId, WorkspaceId};
 use cortex_inference::{OpenAiCompatibleConfig, ProviderLimits};
+use cortex_storage::RemoteEnrollmentRecord;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use sha2::{Digest, Sha256};
 
-const MAX_REMOTE_CLIENTS: usize = 16;
+pub(crate) const MAX_REMOTE_CLIENTS: usize = 16;
 const MODEL_RESPONSE_BYTES: usize = 64 * 1024;
 const MODEL_EMBEDDING_INPUT_BYTES: usize = 32 * 1024;
 const MODEL_EMBEDDING_DIMENSIONS: usize = 4096;
@@ -235,66 +237,95 @@ impl DaemonConfig {
         Ok(enrollment_path)
     }
 
-    /// Creates or returns one durable remote identity for a validated OIDC subject.
-    ///
-    /// This is intentionally reachable only from the daemon's authenticated local-owner
-    /// provisioning path. The result contains no key material; callers receive the protected
-    /// enrollment file path needed by the loopback gateway configuration.
+    /// Reconciles the protected local artifact and verifier manifest for an enrollment that has
+    /// already committed through the daemon's `SQLite` operation/audit transaction. This method
+    /// never creates a new identity: the durable record fixes the subject, principal, grants, and
+    /// verifier, so retries after an interrupted filesystem write converge on the same artifact.
     ///
     /// # Errors
-    /// Returns a redacted configuration error for an invalid subject/grant set or unavailable
-    /// protected local storage.
-    pub fn enroll_remote_subject(
+    /// Returns a redacted configuration error when the durable record, protected artifact, or
+    /// local verifier manifest cannot be reconciled safely.
+    pub fn reconcile_remote_enrollment(
         &mut self,
-        subject: &str,
-        grants: &[Capability],
+        record: &RemoteEnrollmentRecord,
     ) -> Result<RemoteEnrollment, crate::DaemonError> {
-        validate_subject(subject)?;
-        validate_remote_grants(grants)?;
-        if let Some(client) = self
-            .remote_clients
-            .iter()
-            .find(|client| client.subject == subject)
-        {
-            if client.bootstrap_grants != grants {
-                return Err(crate::DaemonError::InvalidConfiguration);
-            }
-            return Ok(RemoteEnrollment {
-                principal_id: client.principal_id,
-                enrollment_path: remote_enrollment_path(&self.database_path, client.principal_id),
-                subject: subject.to_owned(),
-                grants: grants.to_vec(),
-            });
-        }
-        if self.remote_clients.len() >= MAX_REMOTE_CLIENTS {
+        validate_subject(&record.subject)?;
+        validate_remote_grants(&record.grants)?;
+        if record.principal_id == self.principal_id {
             return Err(crate::DaemonError::InvalidConfiguration);
         }
-        let principal_id = PrincipalId::new();
-        let signer = fresh_signing_key();
-        let enrollment_path = remote_enrollment_path(&self.database_path, principal_id);
-        let enrollment = PrivateEnrollment {
-            endpoint_name: self.endpoint_name.clone(),
-            principal_id: principal_id.into(),
-            signing_key: signer.to_bytes(),
-        };
-        write_private_bytes(
-            &enrollment_path,
-            &serde_json::to_vec(&enrollment)
-                .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
-        )?;
-        self.remote_clients.push(RemoteClientConfig {
-            principal_id,
+        let signer = self.derived_remote_signing_key(record.principal_id);
+        if signer.verifying_key().to_bytes() != record.pairing_verifier {
+            return Err(crate::DaemonError::InvalidConfiguration);
+        }
+        let enrollment_path = remote_enrollment_path(&self.database_path, record.principal_id);
+        if enrollment_path.exists() {
+            let existing = load_explicit_enrollment(&enrollment_path)?;
+            if existing.principal_id != record.principal_id
+                || existing.endpoint_name != self.endpoint_name
+                || existing.signer.verifying_key() != signer.verifying_key()
+            {
+                return Err(crate::DaemonError::InvalidConfiguration);
+            }
+        } else {
+            let enrollment = PrivateEnrollment {
+                endpoint_name: self.endpoint_name.clone(),
+                principal_id: record.principal_id.into(),
+                signing_key: signer.to_bytes(),
+            };
+            write_private_bytes(
+                &enrollment_path,
+                &serde_json::to_vec(&enrollment)
+                    .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
+            )?;
+        }
+        let client = RemoteClientConfig {
+            principal_id: record.principal_id,
             pairing_verifier: signer.verifying_key(),
-            bootstrap_grants: grants.to_vec(),
-            subject: subject.to_owned(),
-        });
-        write_remote_clients(&self.database_path, &self.remote_clients)?;
+            bootstrap_grants: record.grants.clone(),
+            subject: record.subject.clone(),
+        };
+        if let Some(existing) = self
+            .remote_clients
+            .iter()
+            .find(|existing| existing.subject == record.subject)
+        {
+            if existing.principal_id != client.principal_id
+                || existing.pairing_verifier != client.pairing_verifier
+                || existing.bootstrap_grants != client.bootstrap_grants
+            {
+                return Err(crate::DaemonError::InvalidConfiguration);
+            }
+        } else {
+            if self.remote_clients.len() >= MAX_REMOTE_CLIENTS
+                || self
+                    .remote_clients
+                    .iter()
+                    .any(|existing| existing.principal_id == client.principal_id)
+            {
+                return Err(crate::DaemonError::InvalidConfiguration);
+            }
+            self.remote_clients.push(client);
+            write_remote_clients(&self.database_path, &self.remote_clients)?;
+        }
         Ok(RemoteEnrollment {
-            principal_id,
+            principal_id: record.principal_id,
             enrollment_path,
-            subject: subject.to_owned(),
-            grants: grants.to_vec(),
+            subject: record.subject.clone(),
+            grants: record.grants.clone(),
         })
+    }
+
+    /// Derives a per-principal artifact key from the protected owner pairing key. The derivation
+    /// happens in memory and is domain-separated, allowing post-commit reconciliation without
+    /// persisting a remote private key before the database/audit transaction is durable.
+    #[must_use]
+    pub fn derived_remote_signing_key(&self, principal_id: PrincipalId) -> SigningKey {
+        let mut digest = Sha256::new();
+        digest.update(b"cortex-v0.1 remote enrollment key\0");
+        digest.update(self.pairing_signer.to_bytes());
+        digest.update(uuid::Uuid::from(principal_id).as_bytes());
+        SigningKey::from_bytes(&digest.finalize().into())
     }
 
     /// Opens the separate, per-user pairing enrollment artifact for a local client. The private

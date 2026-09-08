@@ -5,8 +5,8 @@
 With `cortexd` running and `CORTEX_DATABASE` set to the same database path,
 these commands use the authenticated local client:
 
-The executable command forms are `brain status`, `brain doctor`, and `brain
-logs`; the examples below use `cargo run` so they work from a checkout.
+The executable forms are shown in full below; the examples use `cargo run` so
+they work from a checkout.
 
 ```powershell
 cargo run -p brain -- status
@@ -17,8 +17,8 @@ cargo run -p brain -- --output json status
 
 Today the daemon returns a bounded diagnostic envelope for `status`, `doctor`,
 and `logs`: requested capability, correlation ID, workspace ID, authenticated
-principal ID, and whether migrations were applied. `brain logs` is not a raw
-log-file tailer. It is intentionally safe to run remotely because it does not
+principal ID, and whether migrations were applied. The logs command is not a
+raw log-file tailer. It is intentionally safe to run remotely because it does not
 return filesystem paths, pairing material, SQLite errors, prompt text, notes,
 memory text, credentials, or raw trace data.
 
