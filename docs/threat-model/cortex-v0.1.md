@@ -21,3 +21,25 @@ Cortex is local-first. `cortexd` owns mutable SQLite state and makes final polic
 ## Residual risks
 
 A compromised local user account remains within the host trust boundary. v0.1 documents and constrains this risk but cannot make a compromised host trustworthy.
+
+The trusted provisioning path for remote principals, protected enrollment files,
+relay client keys, and OIDC subject mapping remains security-sensitive. Cortex
+does not provide an unprivileged remote-enrollment command, but an operator can
+still misconfigure a relay, grant excessive capabilities, or expose a backup.
+The stateless relay and external ChatGPT connector remain external dependencies;
+their availability and account-level configuration are outside the local
+daemon's control. v0.1 also cannot recover a platform-secret-store credential
+that was not available on the restore host.
+
+## Release verification evidence
+
+- `tests/e2e/tests/documented_commands.rs` checks that the local operation
+  guides name real CLI/configuration contracts, require an outbound-only
+  loopback gateway, cover recoverable lifecycle behavior, and avoid credential
+  examples.
+- The end-to-end suite exercises the real daemon/CLI IPC boundary, paired OIDC
+  gateway, mutual-TLS outbound tunnel, policy/audit, provenance, deletion and
+  restore, offline lexical retrieval, and platform secret-store behavior using
+  local fixtures only.
+- Release gates run formatting, strict workspace Clippy, the serialized
+  workspace tests, the documented-command test, and `git diff --check`.
