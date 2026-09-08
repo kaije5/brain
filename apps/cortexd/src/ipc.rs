@@ -319,16 +319,22 @@ impl LocalDaemon {
             )
             .await
             .map_err(|_| DaemonError::StartupFailed)?;
+        let committed_remote_enrollments = database
+            .operation_store()
+            .remote_enrollments(config.workspace_id)
+            .await
+            .map_err(|_| DaemonError::StartupFailed)?;
         for remote in &config.remote_clients {
-            repositories
-                .bootstrap_principal(
-                    config.workspace_id,
-                    remote.principal_id,
-                    "paired-remote",
-                    &remote.bootstrap_grants,
-                )
-                .await
-                .map_err(|_| DaemonError::StartupFailed)?;
+            let committed = committed_remote_enrollments
+                .iter()
+                .find(|record| record.subject == remote.subject)
+                .ok_or(DaemonError::StartupFailed)?;
+            if committed.principal_id != remote.principal_id
+                || committed.pairing_verifier != remote.pairing_verifier.to_bytes()
+                || committed.grants != remote.bootstrap_grants
+            {
+                return Err(DaemonError::StartupFailed);
+            }
         }
         let mut client_verifiers = vec![ClientVerifier {
             principal_id: config.principal_id,

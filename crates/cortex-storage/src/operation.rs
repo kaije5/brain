@@ -224,6 +224,25 @@ impl OperationStore {
             .map_err(|_| storage_error("remote enrollment rollback failed"))?;
         Ok(record)
     }
+
+    /// Loads the committed, non-secret remote enrollment mappings for daemon startup validation.
+    ///
+    /// # Errors
+    /// Returns a redacted storage error when a durable mapping is malformed or unavailable.
+    pub async fn remote_enrollments(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<RemoteEnrollmentRecord>, ApplicationError> {
+        let rows = sqlx::query(
+            "SELECT subject, principal_id, pairing_verifier, grants_json, correlation_id \
+             FROM remote_enrollment WHERE workspace_id = ? ORDER BY subject",
+        )
+        .bind(id_text(workspace_id))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| storage_error("remote enrollment list failed"))?;
+        rows.iter().map(decode_remote_enrollment_row).collect()
+    }
 }
 
 /// A validated administrative enrollment request accepted only from the daemon-owned adapter.
@@ -319,7 +338,7 @@ async fn load_remote_subject(
     request: &RemoteEnrollmentRequest,
 ) -> Result<Option<RemoteEnrollmentRecord>, ApplicationError> {
     let row = sqlx::query(
-        "SELECT principal_id, pairing_verifier, grants_json, correlation_id FROM remote_enrollment \
+        "SELECT subject, principal_id, pairing_verifier, grants_json, correlation_id FROM remote_enrollment \
          WHERE workspace_id = ? AND subject = ?",
     )
     .bind(id_text(request.workspace_id))
@@ -330,13 +349,31 @@ async fn load_remote_subject(
     let Some(row) = row else {
         return Ok(None);
     };
+    let record = decode_remote_enrollment_row(&row)?;
+    if record.subject != request.subject {
+        return Err(storage_error("invalid remote enrollment subject"));
+    }
+    if record.grants != request.grants {
+        return Err(ApplicationError::Conflict {
+            entity: "remote_enrollment",
+        });
+    }
+    Ok(Some(record))
+}
+
+fn decode_remote_enrollment_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<RemoteEnrollmentRecord, ApplicationError> {
+    let subject: String = row
+        .try_get("subject")
+        .map_err(|_| storage_error("invalid remote enrollment row"))?;
     let principal_text: String = row
         .try_get("principal_id")
         .map_err(|_| storage_error("invalid remote enrollment row"))?;
     let verifier: Vec<u8> = row
         .try_get("pairing_verifier")
         .map_err(|_| storage_error("invalid remote enrollment row"))?;
-    let verifier: [u8; 32] = verifier
+    let pairing_verifier: [u8; 32] = verifier
         .try_into()
         .map_err(|_| storage_error("invalid remote enrollment verifier"))?;
     let grants_json: String = row
@@ -347,20 +384,14 @@ async fn load_remote_subject(
     let correlation_id: String = row
         .try_get("correlation_id")
         .map_err(|_| storage_error("invalid remote enrollment row"))?;
-    let record = RemoteEnrollmentRecord {
-        subject: request.subject.clone(),
+    Ok(RemoteEnrollmentRecord {
+        subject,
         principal_id: parse_id(&principal_text)?,
         grants: decode_grants(&grants)?,
-        pairing_verifier: verifier,
+        pairing_verifier,
         correlation_id: Uuid::parse_str(&correlation_id)
             .map_err(|_| storage_error("invalid remote enrollment correlation"))?,
-    };
-    if record.grants != request.grants {
-        return Err(ApplicationError::Conflict {
-            entity: "remote_enrollment",
-        });
-    }
-    Ok(Some(record))
+    })
 }
 
 fn encode_grants(grants: &[Capability]) -> Result<String, ApplicationError> {

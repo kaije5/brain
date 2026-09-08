@@ -5,9 +5,54 @@ use cortexd::{
     AuthenticatedIpcClient, DaemonConfig, DaemonError, DaemonRequest, LocalDaemon,
     PROTOCOL_VERSION, WireResult,
 };
+use ed25519_dalek::SigningKey;
 use serde_json::json;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn forged_remote_manifest_cannot_bootstrap_principal_or_remote_access() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let database_path = directory.path().join("cortex.db");
+    let config = DaemonConfig::from_database_path(database_path.clone()).expect("owner config");
+    let workspace_id = config.workspace_id();
+    let forged_principal = PrincipalId::new();
+    let forged_signer = SigningKey::from_bytes(&[7; 32]);
+    let manifest_path = database_path.with_extension("cortexd-clients.json");
+    std::fs::write(
+        manifest_path,
+        serde_json::to_vec(&json!({
+            "clients": [{
+                "principal_id": Uuid::from(forged_principal),
+                "pairing_verifier": forged_signer.verifying_key().to_bytes(),
+                "bootstrap_grants": ["cortex_note_create"],
+                "subject": "forged-subject"
+            }]
+        }))
+        .expect("manifest encoding"),
+    )
+    .expect("forged manifest write");
+    drop(config);
+
+    let forged_config = DaemonConfig::from_database_path(database_path.clone())
+        .expect("manifest remains syntactically valid");
+    match LocalDaemon::start(forged_config).await {
+        Err(error) => assert_eq!(error, DaemonError::StartupFailed),
+        Ok(_) => panic!("uncommitted manifest must fail"),
+    }
+    let database = SqliteDatabase::connect_and_migrate(&database_path)
+        .await
+        .expect("database opens");
+    let grants = database
+        .repositories()
+        .granted_capabilities(workspace_id, forged_principal)
+        .await
+        .expect("grant lookup");
+    assert!(
+        grants.is_empty(),
+        "forged manifest must not create grant rows"
+    );
+}
 
 #[tokio::test]
 async fn durable_remote_enrollment_commits_before_artifact_reconciliation_and_recovers() {
@@ -156,15 +201,45 @@ async fn concurrent_remote_enrollment_converges_on_one_canonical_identity_and_au
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Covers durable setup, restart, revocation, and remote provenance.
 async fn remote_enrollment_keeps_identity_grants_and_audit_distinct_across_restart() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let database_path = directory.path().join("cortex.db");
     let mut config = DaemonConfig::from_database_path(database_path.clone()).expect("config");
     let owner_id = PrincipalId::try_from(config.owner_principal_id()).expect("owner id");
+    let workspace_id = config.workspace_id();
+    let database = SqliteDatabase::connect_and_migrate(&database_path)
+        .await
+        .expect("database");
+    database
+        .repositories()
+        .bootstrap_owner(workspace_id, owner_id, CapabilityCatalog::all())
+        .await
+        .expect("owner bootstrap");
     let remote_id = PrincipalId::new();
+    let record = database
+        .operation_store()
+        .enroll_remote_once(RemoteEnrollmentRequest {
+            workspace_id,
+            owner_principal_id: owner_id,
+            operation_id: OperationId::new(),
+            correlation_id: Uuid::now_v7(),
+            subject: "restart-remote-subject".to_owned(),
+            principal_id: remote_id,
+            grants: vec![Capability::NoteCreate],
+            pairing_verifier: config
+                .derived_remote_signing_key(remote_id)
+                .verifying_key()
+                .to_bytes(),
+            max_remote_clients: 16,
+        })
+        .await
+        .expect("durable remote enrollment");
     let enrollment_path = config
-        .enroll_remote_principal(remote_id, &[Capability::NoteCreate])
-        .expect("remote enrollment");
+        .reconcile_remote_enrollment(&record)
+        .expect("remote artifact reconciliation")
+        .enrollment_path;
+    drop(database);
 
     let daemon = std::sync::Arc::new(LocalDaemon::start(config).await.expect("daemon starts"));
     let (shutdown_sender, shutdown) = tokio::sync::watch::channel(false);

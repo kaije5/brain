@@ -31,7 +31,7 @@ use cortex_mcp_gateway::{
     PairedSubject, PrincipalRegistry, RelayEndpoint, RetryPolicy, RustlsTunnelConnector,
     TunnelClient,
 };
-use cortex_storage::SqliteDatabase;
+use cortex_storage::{RemoteEnrollmentRequest, SqliteDatabase};
 use cortexd::{AuthenticatedIpcClient, DaemonConfig, DaemonRequest, PROTOCOL_VERSION};
 use jsonwebtoken::{EncodingKey, Header, encode};
 #[cfg(windows)]
@@ -142,11 +142,6 @@ impl Harness {
             .with_bootstrap_grants(owner_grants);
         let workspace_id = config.workspace_id();
         let owner_id = PrincipalId::try_from(config.owner_principal_id()).expect("owner principal");
-        let remote_id = PrincipalId::new();
-        let enrollment_path = config
-            .enroll_remote_principal(remote_id, &remote_grants)
-            .expect("remote MCP enrollment");
-        drop(config);
         let bootstrap_database = SqliteDatabase::connect_and_migrate(&database_path)
             .await
             .expect("bootstrap database");
@@ -155,6 +150,30 @@ impl Harness {
             .bootstrap_owner(workspace_id, owner_id, &owner_grant_fixture)
             .await
             .expect("owner grant fixture");
+        let remote_id = PrincipalId::new();
+        let record = bootstrap_database
+            .operation_store()
+            .enroll_remote_once(RemoteEnrollmentRequest {
+                workspace_id,
+                owner_principal_id: owner_id,
+                operation_id: OperationId::new(),
+                correlation_id: Uuid::now_v7(),
+                subject: format!("e2e-remote-{}", Uuid::now_v7()),
+                principal_id: remote_id,
+                grants: remote_grants,
+                pairing_verifier: config
+                    .derived_remote_signing_key(remote_id)
+                    .verifying_key()
+                    .to_bytes(),
+                max_remote_clients: 16,
+            })
+            .await
+            .expect("durable remote enrollment");
+        let enrollment_path = config
+            .reconcile_remote_enrollment(&record)
+            .expect("remote artifact reconciliation")
+            .enrollment_path;
+        drop(config);
         drop(bootstrap_database);
         let mut daemon_command = Command::new(env!("CARGO_BIN_EXE_cortexd-e2e"));
         daemon_command

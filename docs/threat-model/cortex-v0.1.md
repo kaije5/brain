@@ -33,6 +33,8 @@ protected artifact and local verifier manifest. An interrupted artifact write
 therefore leaves no unaudited active remote mapping; the trusted owner retries
 the same request to reconcile the fixed identity. This does not remove the risk
 of a compromised local owner account or unsafe handling of the protected file.
+The verifier manifest is not an authorization source: daemon startup rejects
+any remote entry that does not exactly match a committed durable enrollment.
 The stateless relay and external ChatGPT connector remain external dependencies;
 their availability and account-level configuration are outside the local
 daemon's control. v0.1 also cannot recover a platform-secret-store credential

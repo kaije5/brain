@@ -42,6 +42,9 @@ event. It then reconciles the protected artifact from that durable mapping. If
 the local file write is interrupted, the command returns a redacted unavailable
 result; re-run the same owner command to reconcile the same identity. It never
 creates a second principal or prints the private enrollment key.
+At startup, the daemon accepts a local verifier-manifest entry only when it
+exactly matches that committed mapping; a copied or forged manifest cannot
+bootstrap a remote principal or grant.
 
 Stop `cortexd` with `Ctrl+C`, then start it again using the same
 `CORTEX_DATABASE` before starting the gateway. The restart loads the new

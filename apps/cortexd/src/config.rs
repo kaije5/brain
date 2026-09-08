@@ -193,50 +193,6 @@ impl DaemonConfig {
         self.workspace_id
     }
 
-    /// Creates a distinct, durable local IPC enrollment for a remote paired principal.
-    /// Initial grants are inserted only when the principal is first created, so later
-    /// revocations survive daemon restarts.
-    ///
-    /// # Errors
-    /// Returns a redacted configuration error for duplicates, unsafe bounds, or persistence
-    /// failures.
-    pub fn enroll_remote_principal(
-        &mut self,
-        principal_id: PrincipalId,
-        grants: &[Capability],
-    ) -> Result<PathBuf, crate::DaemonError> {
-        if principal_id == self.principal_id
-            || grants.is_empty()
-            || self.remote_clients.len() >= MAX_REMOTE_CLIENTS
-            || self
-                .remote_clients
-                .iter()
-                .any(|client| client.principal_id == principal_id)
-        {
-            return Err(crate::DaemonError::InvalidConfiguration);
-        }
-        let signer = fresh_signing_key();
-        let enrollment_path = remote_enrollment_path(&self.database_path, principal_id);
-        let enrollment = PrivateEnrollment {
-            endpoint_name: self.endpoint_name.clone(),
-            principal_id: principal_id.into(),
-            signing_key: signer.to_bytes(),
-        };
-        write_private_bytes(
-            &enrollment_path,
-            &serde_json::to_vec(&enrollment)
-                .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
-        )?;
-        self.remote_clients.push(RemoteClientConfig {
-            principal_id,
-            pairing_verifier: signer.verifying_key(),
-            bootstrap_grants: grants.to_vec(),
-            subject: String::new(),
-        });
-        write_remote_clients(&self.database_path, &self.remote_clients)?;
-        Ok(enrollment_path)
-    }
-
     /// Reconciles the protected local artifact and verifier manifest for an enrollment that has
     /// already committed through the daemon's `SQLite` operation/audit transaction. This method
     /// never creates a new identity: the durable record fixes the subject, principal, grants, and
