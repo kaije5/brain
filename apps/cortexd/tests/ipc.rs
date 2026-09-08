@@ -133,6 +133,66 @@ async fn durable_remote_enrollment_commits_before_artifact_reconciliation_and_re
 }
 
 #[tokio::test]
+async fn remote_enrollment_canonicalizes_reordered_duplicate_grants_before_replay() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let database_path = directory.path().join("cortex.db");
+    let config = DaemonConfig::from_database_path(database_path.clone()).expect("config");
+    let workspace_id = config.workspace_id();
+    let owner_id = PrincipalId::try_from(config.owner_principal_id()).expect("owner id");
+    let database = SqliteDatabase::connect_and_migrate(&database_path)
+        .await
+        .expect("database");
+    database
+        .repositories()
+        .bootstrap_owner(workspace_id, owner_id, CapabilityCatalog::all())
+        .await
+        .expect("owner bootstrap");
+    let principal_id = PrincipalId::new();
+    let operation_id = OperationId::new();
+    let correlation_id = Uuid::now_v7();
+    let canonical = RemoteEnrollmentRequest {
+        workspace_id,
+        owner_principal_id: owner_id,
+        operation_id,
+        correlation_id,
+        subject: "canonical-grants-subject".to_owned(),
+        principal_id,
+        grants: vec![Capability::NoteCreate, Capability::MemorySearch],
+        pairing_verifier: config
+            .derived_remote_signing_key(principal_id)
+            .verifying_key()
+            .to_bytes(),
+        max_remote_clients: 16,
+    };
+    let first = database
+        .operation_store()
+        .enroll_remote_once(canonical.clone())
+        .await
+        .expect("canonical enrollment");
+    let replay = database
+        .operation_store()
+        .enroll_remote_once(RemoteEnrollmentRequest {
+            grants: vec![
+                Capability::MemorySearch,
+                Capability::NoteCreate,
+                Capability::MemorySearch,
+            ],
+            ..canonical
+        })
+        .await
+        .expect("reordered duplicate replay");
+    assert_eq!(replay, first);
+    assert_eq!(
+        database
+            .audit_port()
+            .count_for_correlation(workspace_id, correlation_id)
+            .await
+            .expect("audit count"),
+        1
+    );
+}
+
+#[tokio::test]
 async fn concurrent_remote_enrollment_converges_on_one_canonical_identity_and_audit() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let database_path = directory.path().join("cortex.db");

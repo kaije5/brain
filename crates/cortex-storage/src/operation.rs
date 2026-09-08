@@ -1,6 +1,7 @@
 use cortex_application::{
     AggregateChange, ApplicationError, AtomicMutation, AtomicMutationPort, Capability,
-    MutationResult, OperationIdentity, OperationResultRepository, RecordedOperation,
+    CapabilityCatalog, MutationResult, OperationIdentity, OperationResultRepository,
+    RecordedOperation,
 };
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion, Note, OperationId,
@@ -56,9 +57,9 @@ impl OperationStore {
     #[allow(clippy::too_many_lines)] // The transaction's ordered durable boundary is review-critical.
     pub async fn enroll_remote_once(
         &self,
-        request: RemoteEnrollmentRequest,
+        mut request: RemoteEnrollmentRequest,
     ) -> Result<RemoteEnrollmentRecord, ApplicationError> {
-        request.validate()?;
+        request.canonicalize()?;
         if let Some(record) = self.load_remote_operation(&request).await? {
             return Ok(record);
         }
@@ -260,12 +261,14 @@ pub struct RemoteEnrollmentRequest {
 }
 
 impl RemoteEnrollmentRequest {
-    fn validate(&self) -> Result<(), ApplicationError> {
+    fn canonicalize(&mut self) -> Result<(), ApplicationError> {
+        self.grants.sort_unstable();
+        self.grants.dedup();
         if self.subject.trim().is_empty()
             || self.subject.len() > 256
             || self.subject.chars().any(char::is_control)
             || self.grants.is_empty()
-            || self.grants.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.grants.len() > CapabilityCatalog::all().len()
             || self.max_remote_clients == 0
         {
             return Err(ApplicationError::Validation {

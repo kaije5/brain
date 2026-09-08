@@ -506,15 +506,11 @@ impl LocalDaemon {
             return Err(DaemonError::PermissionDenied);
         }
         let payload: EnrollmentPayload = decode_payload(&request.payload)?;
-        let mut grants = payload
+        let grants = payload
             .grants
             .iter()
             .map(|grant| Capability::from_mcp_name(grant).ok_or(DaemonError::InvalidRequest))
             .collect::<Result<Vec<_>, _>>()?;
-        grants.sort_unstable();
-        if grants.len() != payload.grants.len() {
-            return Err(DaemonError::InvalidRequest);
-        }
         let config = DaemonConfig::from_database_path(self.database_path.clone())?;
         let proposed_principal_id = PrincipalId::new();
         let record = self
