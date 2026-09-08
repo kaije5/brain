@@ -1,10 +1,50 @@
 mod support;
 
-use support::{Harness, assert_deployed_daemon_rejects_missing_model_secret};
+#[cfg(windows)]
+use support::assert_deployed_daemon_rejects_missing_model_secret;
+use support::{Harness, configure_model_secret_for_platform};
 
+#[cfg(windows)]
 #[tokio::test]
 async fn deployed_model_secret_reference_must_resolve_before_startup() {
     assert_deployed_daemon_rejects_missing_model_secret().await;
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_normal_harness_exercises_the_platform_secret_reference() {
+    let mut command = tokio::process::Command::new("cortexd-fixture");
+    configure_model_secret_for_platform(&mut command, true, Some("keyring:cortex/test"));
+
+    let configured_secret = command
+        .as_std()
+        .get_envs()
+        .find(|(name, _)| {
+            name.to_string_lossy()
+                .eq_ignore_ascii_case("CORTEX_MODEL_SECRET_REF")
+        })
+        .and_then(|(_, value)| value);
+    assert_eq!(
+        configured_secret,
+        Some(std::ffi::OsStr::new("keyring:cortex/test"))
+    );
+}
+
+#[test]
+fn non_windows_model_environment_explicitly_removes_an_inherited_secret() {
+    let mut command = tokio::process::Command::new("cortexd-fixture");
+    command.env("CORTEX_MODEL_SECRET_REF", "keyring:inherited/value");
+    configure_model_secret_for_platform(&mut command, false, None);
+
+    let configured_secret = command
+        .as_std()
+        .get_envs()
+        .find(|(name, _)| {
+            name.to_string_lossy()
+                .eq_ignore_ascii_case("CORTEX_MODEL_SECRET_REF")
+        })
+        .map(|(_, value)| value);
+    assert!(matches!(configured_secret, Some(None)));
 }
 
 #[tokio::test]

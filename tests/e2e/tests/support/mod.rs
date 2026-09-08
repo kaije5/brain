@@ -55,6 +55,18 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+pub fn configure_model_secret_for_platform(
+    command: &mut Command,
+    is_windows: bool,
+    secret_reference: Option<&str>,
+) {
+    command.env_remove("CORTEX_MODEL_SECRET_REF");
+    if is_windows && let Some(reference) = secret_reference {
+        command.env("CORTEX_MODEL_SECRET_REF", reference);
+    }
+}
+
+#[cfg(windows)]
 pub async fn assert_deployed_daemon_rejects_missing_model_secret() {
     let directory = TempDir::new().expect("temporary Cortex directory");
     let database_path = directory.path().join("cortex.db");
@@ -82,6 +94,7 @@ pub async fn assert_deployed_daemon_rejects_missing_model_secret() {
 
 pub struct Harness {
     _directory: TempDir,
+    #[cfg(windows)]
     _model_secret: PlatformSecretFixture,
     database_path: PathBuf,
     database: SqliteDatabase,
@@ -117,6 +130,7 @@ impl Harness {
         let fake_model = FakeModelState::new();
         let (model_base_url, fake_model_cancellation, fake_model_serving) =
             start_fake_model_endpoint(fake_model.clone()).await;
+        #[cfg(windows)]
         let model_secret = PlatformSecretFixture::new();
         let owner_grant_fixture = owner_grants.clone();
         let mut config = DaemonConfig::from_database_path(database_path.clone())
@@ -138,16 +152,24 @@ impl Harness {
             .await
             .expect("owner grant fixture");
         drop(bootstrap_database);
-        let daemon_process = Command::new(env!("CARGO_BIN_EXE_cortexd-e2e"))
+        let mut daemon_command = Command::new(env!("CARGO_BIN_EXE_cortexd-e2e"));
+        daemon_command
             .env("CORTEX_DATABASE", &database_path)
             .env("CORTEX_MODEL_BASE_URL", &model_base_url)
             .env("CORTEX_MODEL_NAME", "nemotron-test")
-            .env("CORTEX_MODEL_SECRET_REF", model_secret.reference())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("deployed cortexd process");
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        let model_secret_reference = Some(model_secret.reference());
+        #[cfg(not(windows))]
+        let model_secret_reference = None;
+        configure_model_secret_for_platform(
+            &mut daemon_command,
+            cfg!(windows),
+            model_secret_reference,
+        );
+        let daemon_process = daemon_command.spawn().expect("deployed cortexd process");
         let owner =
             AuthenticatedIpcClient::from_database_path(&database_path).expect("owner enrollment");
         let remote = AuthenticatedIpcClient::from_enrollment_path(&enrollment_path)
@@ -161,6 +183,7 @@ impl Harness {
         let gateway = RemoteGateway::start(remote_id, remote.clone()).await;
         Self {
             _directory: directory,
+            #[cfg(windows)]
             _model_secret: model_secret,
             database_path,
             database,
@@ -358,23 +381,22 @@ impl Harness {
     }
 }
 
+#[cfg(windows)]
 struct PlatformSecretFixture {
     target: String,
 }
 
+#[cfg(windows)]
 impl PlatformSecretFixture {
     fn new() -> Self {
         let target = format!("keyring:cortex/e2e-model-{}", Uuid::now_v7());
-        #[cfg(windows)]
-        {
-            let username = target
-                .strip_prefix("keyring:cortex/")
-                .expect("fixture keyring target");
-            windows_native_keyring_store::Store::new()
-                .and_then(|store| store.build("cortex", username, None))
-                .and_then(|entry| entry.set_secret(b"fixture-not-a-live-secret"))
-                .expect("create platform secret-store fixture");
-        }
+        let username = target
+            .strip_prefix("keyring:cortex/")
+            .expect("fixture keyring target");
+        windows_native_keyring_store::Store::new()
+            .and_then(|store| store.build("cortex", username, None))
+            .and_then(|entry| entry.set_secret(b"fixture-not-a-live-secret"))
+            .expect("create platform secret-store fixture");
         Self { target }
     }
 
@@ -383,15 +405,13 @@ impl PlatformSecretFixture {
     }
 }
 
+#[cfg(windows)]
 impl Drop for PlatformSecretFixture {
     fn drop(&mut self) {
-        #[cfg(windows)]
-        {
-            if let Some(username) = self.target.strip_prefix("keyring:cortex/") {
-                let _ = windows_native_keyring_store::Store::new()
-                    .and_then(|store| store.build("cortex", username, None))
-                    .and_then(|entry| entry.delete_credential());
-            }
+        if let Some(username) = self.target.strip_prefix("keyring:cortex/") {
+            let _ = windows_native_keyring_store::Store::new()
+                .and_then(|store| store.build("cortex", username, None))
+                .and_then(|entry| entry.delete_credential());
         }
     }
 }
