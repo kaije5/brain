@@ -44,7 +44,7 @@ fn documented_brain_commands_parse_and_map_to_the_real_daemon_contract() {
 fn is_daemon_command(cli: &Cli) -> bool {
     !matches!(
         cli.command,
-        brain::Command::Config(_) | brain::Command::Secret(_)
+        Some(brain::Command::Config(_) | brain::Command::Secret(_))
     )
 }
 

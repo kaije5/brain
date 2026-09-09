@@ -35,6 +35,7 @@ enum RunError {
     Client(brain::ClientError),
     Local(LocalOpError),
     MissingSecret,
+    TuiUnavailable,
 }
 
 impl RunError {
@@ -45,17 +46,24 @@ impl RunError {
             Self::Local(LocalOpError::InvalidProfile) => "invalid_profile",
             Self::Local(LocalOpError::MissingSecret) | Self::MissingSecret => "missing_secret",
             Self::Local(_) => "secret_store_unavailable",
+            Self::TuiUnavailable => "interactive_terminal_unavailable",
         }
     }
 }
 
 async fn run(cli: &Cli) -> Result<Value, RunError> {
-    match &cli.command {
-        Command::Config(ConfigCommand::Init) => {
+    if cli.command.is_none() {
+        brain::tui::run_interactive()
+            .await
+            .map_err(|_| RunError::TuiUnavailable)?;
+        return Ok(json!({"interactive": true}));
+    }
+    match cli.command.as_ref() {
+        Some(Command::Config(ConfigCommand::Init)) => {
             let path = init_config(&default_database_path()).map_err(RunError::Local)?;
             Ok(json!({"config_path": path.to_string_lossy()}))
         }
-        Command::Secret(SecretCommand::Import { profile }) => {
+        Some(Command::Secret(SecretCommand::Import { profile })) => {
             let mut secret = String::new();
             std::io::stdin()
                 .read_line(&mut secret)

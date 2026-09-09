@@ -4,6 +4,7 @@ mod cli;
 mod client;
 mod local_ops;
 mod render;
+pub mod tui;
 
 pub use cli::{
     Cli, Command, CommandRequest, ConfigCommand, Output, RemoteCommand, SecretCommand, TaskCommand,
