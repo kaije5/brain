@@ -16,6 +16,18 @@ async fn database() -> (TempDir, SqliteDatabase) {
     (temp, database)
 }
 
+async fn ensure_profile(database: &SqliteDatabase, id: &str) {
+    database
+        .model_routing_store()
+        .upsert_profile(&StoredProviderProfile {
+            id: id.to_owned(),
+            enabled: true,
+            secret_reference: None,
+        })
+        .await
+        .expect("profile created");
+}
+
 #[tokio::test]
 async fn provider_profiles_round_trip_without_secret_material_expansion() -> Result<(), String> {
     let (_temp, database) = database().await;
@@ -59,6 +71,7 @@ async fn provider_profiles_round_trip_without_secret_material_expansion() -> Res
 async fn catalog_refresh_replaces_all_prior_evidence_for_a_profile() -> Result<(), String> {
     let (_temp, database) = database().await;
     let store = database.model_routing_store();
+    ensure_profile(&database, "nim-dev").await;
 
     let first_refresh = vec![StoredCapabilityEvidence {
         model_id: "retired-model".to_owned(),
@@ -87,8 +100,14 @@ async fn catalog_refresh_replaces_all_prior_evidence_for_a_profile() -> Result<(
         .await
         .map_err(|error| debug_error(&error))?;
 
-    let evidence = store.load_catalog("nim-dev").await.map_err(|error| debug_error(&error))?;
-    assert_eq!(evidence, second_refresh, "refresh replaces prior evidence");
+    let mut evidence = store
+        .load_catalog("nim-dev")
+        .await
+        .map_err(|error| debug_error(&error))?;
+    evidence.sort_by_key(|entry| (entry.model_id.clone(), format!("{:?}", entry.capability)));
+    let mut expected = second_refresh;
+    expected.sort_by_key(|entry| (entry.model_id.clone(), format!("{:?}", entry.capability)));
+    assert_eq!(evidence, expected, "refresh replaces prior evidence");
     Ok(())
 }
 
@@ -96,6 +115,7 @@ async fn catalog_refresh_replaces_all_prior_evidence_for_a_profile() -> Result<(
 async fn catalog_evidence_is_scoped_per_profile() -> Result<(), String> {
     let (_temp, database) = database().await;
     let store = database.model_routing_store();
+    ensure_profile(&database, "nim-dev").await;
     let evidence = vec![StoredCapabilityEvidence {
         model_id: "model-a".to_owned(),
         capability: StoredCapability::StructuredOutput,
