@@ -72,15 +72,27 @@ cargo run -p brain
 ```
 
 The default tab is agent chat; prompts reuse the daemon's bounded,
-policy-checked agent loop (`cortex_agent_run`). Switch tabs with `Tab`
-(also `1`-`4`), send with `Enter`, quit with `q` or `Esc`:
+policy-checked agent loop (`cortex_agent_run`). Switch tabs with `Tab` or
+`Shift+Tab`, send with `Enter`, and quit with `Ctrl+C`. `Esc` goes back to
+Chat or cancels a settings prompt. Text fields accept ordinary characters,
+including `q` and digits; `1`-`4` select tabs only outside text fields.
+Settings prompts keep focus until confirmed or cancelled.
 
 - **Tasks** lists canonical tasks through the same authorized IPC path as the
-  CLI.
-- **Notes** searches notes and memories.
+  CLI. Press `r` to refresh.
+- **Notes** searches notes and memories. Type at least two characters and
+  press `Enter`.
 - **Settings** shows the local `cortexd.toml` values and the daemon's model
-  status; provider keys are never displayed or edited as raw values here -
-  import or rotate them through the keyring-backed `SecretRef` flow above.
+  status. Press `Enter` or `e` to edit, then `n` to add a profile and endpoint.
+  Use Up/Down to select a row: `Enter` edits the default profile or endpoint,
+  `i` imports a masked token into the system keyring, `t` toggles a provider,
+  and `d` requests deletion. Press `w` to save; restart the daemon to apply.
+  `Esc` asks before discarding unsaved settings; imported keyring tokens
+  remain stored even if the settings draft is discarded.
+
+Cyan marks the current selection, green indicates success, amber marks
+warnings or unsaved changes, and red indicates errors. Text labels accompany
+these colors. The footer shows shortcuts for the current screen.
 
 When no eligible model is configured or the provider is unavailable, the chat
 tab shows an explicit degraded state while tasks, notes, and settings keep

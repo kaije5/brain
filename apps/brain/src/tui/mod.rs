@@ -1,17 +1,11 @@
 mod runner;
+mod view;
 
 pub use runner::run_interactive;
+pub use view::render;
 
 use crate::local_ops::{LocalOpError, SecretWriter, import_secret, validate_profile_id};
-use ratatui::{
-    Terminal,
-    buffer::Buffer,
-    layout::Rect,
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::Widget,
-    widgets::{Block, Borders, List, ListItem, Paragraph},
-};
+use ratatui::Terminal;
 
 /// Top-level TUI tabs. Chat is the default view; everything is a view over
 /// the same typed daemon capabilities the one-shot CLI uses — the TUI holds
@@ -82,6 +76,8 @@ pub struct SettingsEditor {
     confirm_delete: Option<String>,
     error: Option<String>,
     status: Option<String>,
+    dirty: bool,
+    confirm_discard: bool,
 }
 
 impl SettingsEditor {
@@ -104,6 +100,8 @@ impl SettingsEditor {
             confirm_delete: None,
             error: None,
             status: None,
+            dirty: false,
+            confirm_discard: false,
         }
     }
 
@@ -162,12 +160,13 @@ impl SettingsEditor {
     }
 
     fn selected_profile(&mut self) -> Option<&mut ProfileDraft> {
-        self.profiles.get_mut(self.cursor.saturating_sub(1))
+        self.profiles.get_mut(self.cursor.checked_sub(1)?)
     }
 
     pub fn toggle_enabled(&mut self) {
         if let Some(profile) = self.selected_profile() {
             profile.enabled = !profile.enabled;
+            self.dirty = true;
         }
     }
 
@@ -182,6 +181,7 @@ impl SettingsEditor {
     pub fn cancel_pending(&mut self) {
         self.input = None;
         self.confirm_delete = None;
+        self.confirm_discard = false;
     }
 
     pub fn begin_text(&mut self, purpose: TextPurpose) {
@@ -233,6 +233,7 @@ impl SettingsEditor {
                 && let Some(index) = self.profiles.iter().position(|profile| profile.id == id)
             {
                 self.profiles.remove(index);
+                self.dirty = true;
                 if self.default_profile.as_deref() == Some(id.as_str()) {
                     self.default_profile = None;
                 }
@@ -249,8 +250,10 @@ impl SettingsEditor {
             TextPurpose::DefaultProfile => {
                 if value.is_empty() {
                     self.default_profile = None;
+                    self.dirty = true;
                 } else if self.profiles.iter().any(|profile| profile.id == value) {
                     self.default_profile = Some(value);
+                    self.dirty = true;
                 } else {
                     self.error = Some(format!("unknown profile `{value}`"));
                     self.input = Some((TextPurpose::DefaultProfile, value));
@@ -269,6 +272,7 @@ impl SettingsEditor {
                         secret_ref: None,
                         has_credential: false,
                     });
+                    self.dirty = true;
                     self.cursor = self.row_count() - 1;
                     self.input = Some((TextPurpose::BaseUrl(value), String::new()));
                 }
@@ -279,6 +283,7 @@ impl SettingsEditor {
                         self.error = Some("base_url must be a non-empty endpoint URL".to_owned());
                     } else {
                         profile.base_url = value;
+                        self.dirty = true;
                     }
                 }
             }
@@ -298,6 +303,7 @@ impl SettingsEditor {
                         {
                             profile.secret_ref = Some(secret_ref);
                             profile.has_credential = true;
+                            self.dirty = true;
                         }
                         self.status = Some(format!("credential imported for `{id}`"));
                     }
@@ -386,6 +392,7 @@ impl SettingsEditor {
             return Err("config could not be replaced".to_owned());
         }
         self.status = Some("settings saved; the daemon applies them on next start".to_owned());
+        self.dirty = false;
         Ok(())
     }
 }
@@ -479,6 +486,9 @@ impl App {
     /// Stages the current input as a user prompt. The runner performs the
     /// policy-checked `cortex_agent_run` request through the daemon.
     pub fn submit_prompt(&mut self) {
+        if self.chat_status == ChatStatus::Waiting {
+            return;
+        }
         let prompt = self.chat_input.trim().to_owned();
         if prompt.is_empty() {
             return;
@@ -490,8 +500,12 @@ impl App {
 
     #[must_use]
     pub fn pending_prompt(&self) -> Option<String> {
-        (self.chat_status == ChatStatus::Waiting && self.transcript.len() % 2 == 1)
-            .then(|| self.transcript[self.transcript.len() - 1].1.clone())
+        (self.chat_status == ChatStatus::Waiting
+            && self
+                .transcript
+                .last()
+                .is_some_and(|(role, _)| role == "user"))
+        .then(|| self.transcript[self.transcript.len() - 1].1.clone())
     }
 
     pub fn receive_agent_reply(&mut self, reply: String) {
@@ -657,10 +671,21 @@ impl App {
         else {
             return Err("no settings loaded".to_owned());
         };
-        match self.editor.as_mut() {
-            Some(editor) => editor.save(std::path::Path::new(&path)),
-            None => Err("not editing".to_owned()),
+        let editor = self
+            .editor
+            .as_mut()
+            .ok_or_else(|| "not editing".to_owned())?;
+        editor.save(std::path::Path::new(&path))?;
+        if let Some(summary) = self.settings.as_mut() {
+            summary.default_profile.clone_from(&editor.default_profile);
+            summary.profiles = editor
+                .profiles
+                .iter()
+                .map(|p| (p.id.clone(), p.base_url.clone(), p.enabled))
+                .collect();
         }
+        "Settings saved; restart the daemon to apply.".clone_into(&mut self.status_line);
+        Ok(())
     }
 
     pub fn set_status_line(&mut self, text: String) {
@@ -693,258 +718,4 @@ pub fn render_to_string(app: &App, width: u16, height: u16) -> String {
         text.push('\n');
     }
     text
-}
-
-/// Renders one frame. Kept as a free function over `&App` so tests can drive
-/// it with a `TestBackend`.
-pub fn render(app: &App, area: Rect, buffer: &mut Buffer) {
-    let header_height = 3;
-    let status_height = 1;
-    let body = Rect::new(
-        area.x,
-        area.y + header_height,
-        area.width,
-        area.height.saturating_sub(header_height + status_height),
-    );
-    render_header(app, area, buffer);
-    match app.tab {
-        Tab::Chat => render_chat(app, body, buffer),
-        Tab::Tasks => render_tasks(app, body, buffer),
-        Tab::Notes => render_notes(app, body, buffer),
-        Tab::Settings => render_settings(app, body, buffer),
-    }
-    render_status_line(
-        app,
-        Rect::new(area.x, area.bottom() - 1, area.width, 1),
-        buffer,
-    );
-}
-
-fn render_header(app: &App, area: Rect, buffer: &mut Buffer) {
-    let spans: Vec<Span> = TAB_LABELS
-        .iter()
-        .flat_map(|(label, tab)| {
-            let style = if *tab == app.tab {
-                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            vec![Span::styled(format!(" {label} "), style), Span::raw(" ")]
-        })
-        .collect();
-    Paragraph::new(Line::from(spans))
-        .block(Block::default().borders(Borders::BOTTOM))
-        .render(area, buffer);
-}
-
-fn render_chat(app: &App, area: Rect, buffer: &mut Buffer) {
-    let input_height = 3;
-    let transcript_area = Rect::new(
-        area.x,
-        area.y,
-        area.width,
-        area.height.saturating_sub(input_height),
-    );
-    let input_area = Rect::new(
-        area.x,
-        transcript_area.bottom(),
-        area.width,
-        area.height.min(input_height),
-    );
-    let mut lines: Vec<Line> = Vec::new();
-    if let ChatStatus::Degraded(code) = &app.chat_status {
-        lines.push(Line::from(Span::styled(
-            format!("DEGRADED: model inference unavailable ({code}). Tasks, notes and settings keep working."),
-            Style::default().fg(ratatui::style::Color::Red),
-        )));
-    }
-    for (role, text) in &app.transcript {
-        lines.push(Line::from(Span::styled(
-            format!("{role}: {text}"),
-            if role == "user" {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            },
-        )));
-    }
-    if app.chat_status == ChatStatus::Waiting {
-        lines.push(Line::from("agent: …"));
-    }
-    Paragraph::new(lines).render(transcript_area, buffer);
-    Paragraph::new(app.chat_input.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .title("prompt (Enter to send)"),
-        )
-        .render(input_area, buffer);
-}
-
-fn render_tasks(app: &App, area: Rect, buffer: &mut Buffer) {
-    let items: Vec<ListItem> = app
-        .tasks
-        .iter()
-        .map(|(title, status)| ListItem::new(format!("[{status}] {title}")))
-        .collect();
-    List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Tasks"))
-        .render(area, buffer);
-}
-
-fn render_notes(app: &App, area: Rect, buffer: &mut Buffer) {
-    let input_height = 1;
-    let query_area = Rect::new(area.x, area.y, area.width, input_height);
-    let results_area = Rect::new(
-        area.x,
-        area.y + input_height,
-        area.width,
-        area.height.saturating_sub(input_height),
-    );
-    Paragraph::new(format!("search: {}", app.notes_query)).render(query_area, buffer);
-    let items: Vec<ListItem> = app
-        .note_results
-        .iter()
-        .map(|snippet| ListItem::new(snippet.clone()))
-        .collect();
-    List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .title("Notes and memories"),
-        )
-        .render(results_area, buffer);
-}
-
-fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
-    if let Some(editor) = app.settings_editor() {
-        render_settings_editor(editor, area, buffer);
-        return;
-    }
-    let mut lines: Vec<Line> = Vec::new();
-    match &app.settings {
-        None => lines.push(Line::from("settings unavailable")),
-        Some(summary) => {
-            lines.push(Line::from(format!("config: {}", summary.config_path)));
-            lines.push(Line::from(format!(
-                "default profile: {}",
-                summary
-                    .default_profile
-                    .as_deref()
-                    .unwrap_or("(none configured)")
-            )));
-            lines.push(Line::from(format!(
-                "model status: {}",
-                summary.model_status
-            )));
-            lines.push(Line::from("provider profiles:"));
-            for (id, base_url, enabled) in &summary.profiles {
-                lines.push(Line::from(format!(
-                    "  {id} @ {base_url} [{}]",
-                    if *enabled { "enabled" } else { "disabled" }
-                )));
-            }
-            lines.push(Line::from(
-                "secrets are keyring-backed: import with `brain secret import --profile <id>`.",
-            ));
-        }
-    }
-    Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Settings (cortexd.toml)"),
-        )
-        .render(area, buffer);
-}
-
-fn render_settings_editor(editor: &SettingsEditor, area: Rect, buffer: &mut Buffer) {
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from("default profile: <none>"));
-    for (offset, profile) in std::iter::once(("(default profile)", None)).chain(
-        editor
-            .profiles()
-            .iter()
-            .map(|profile| (profile.id.as_str(), Some(profile))),
-    ) {
-        let _ = offset;
-        let _ = profile;
-    }
-    // Rows: index 0 selects the default profile; indices 1.. select profiles.
-    let mut rows: Vec<String> = vec![format!(
-        "{} [default profile: {}]",
-        if editor.cursor() == 0 { ">" } else { " " },
-        editor.default_profile().unwrap_or("(none)")
-    )];
-    for (index, profile) in editor.profiles().iter().enumerate() {
-        let marker = if editor.cursor() == index + 1 {
-            ">"
-        } else {
-            " "
-        };
-        let credential = if profile.secret_ref.is_some() || profile.has_credential {
-            " keyring-ref"
-        } else {
-            ""
-        };
-        rows.push(format!(
-            "{marker} {} @ {} [{}]{}",
-            profile.id,
-            profile.base_url,
-            if profile.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            },
-            credential
-        ));
-    }
-    lines.extend(rows.into_iter().map(Line::from));
-    if let Some(purpose) = editor.pending_purpose() {
-        let prompt = match purpose {
-            TextPurpose::DefaultProfile => "default profile id".to_owned(),
-            TextPurpose::NewProfileId => "new profile id".to_owned(),
-            TextPurpose::BaseUrl(id) => format!("base_url for `{id}`"),
-            TextPurpose::Secret(id) => format!("secret for `{id}` (hidden)"),
-        };
-        let shown = match purpose {
-            TextPurpose::Secret(_) => "*".repeat(editor.pending_text().unwrap_or("").len()),
-            _ => editor.pending_text().unwrap_or("").to_owned(),
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{prompt}: {shown} (Enter to confirm, Esc to cancel)"),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-    }
-    if editor.pending_purpose().is_none() {
-        lines.push(Line::from(
-            "Enter: edit · n: new profile · i: import secret · t: enable/disable · d: delete · w: save · Esc: done",
-        ));
-    }
-    if let Some(id) = &editor.confirm_delete {
-        lines.push(Line::from(Span::styled(
-            format!("delete profile `{id}`? Enter to confirm"),
-            Style::default().fg(ratatui::style::Color::Red),
-        )));
-    }
-    if let Some(error) = editor.error() {
-        lines.push(Line::from(Span::styled(
-            format!("error: {error}"),
-            Style::default().fg(ratatui::style::Color::Red),
-        )));
-    }
-    if let Some(status) = editor.status() {
-        lines.push(Line::from(status));
-    }
-    Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Settings editor (cortexd.toml)"),
-        )
-        .render(area, buffer);
-}
-
-fn render_status_line(app: &App, area: Rect, buffer: &mut Buffer) {
-    Paragraph::new(app.status_line.as_str()).render(area, buffer);
 }
