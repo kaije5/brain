@@ -75,6 +75,29 @@ impl DaemonConfig {
     /// # Errors
     /// Returns a safe configuration error when the database path is absent.
     pub fn from_database_path(database_path: PathBuf) -> Result<Self, crate::DaemonError> {
+        Self::from_local_settings(database_path, None)
+    }
+
+    /// Loads a daemon configuration from the local `cortexd.toml` settings
+    /// (when present) with documented defaults when the file is absent.
+    ///
+    /// # Errors
+    /// Returns a safe configuration error when the database path is absent or
+    /// durable local artifacts cannot be reconciled.
+    pub fn from_local_settings(
+        database_path: PathBuf,
+        settings: Option<&crate::settings::LocalSettings>,
+    ) -> Result<Self, crate::DaemonError> {
+        Self::from_database_path_with_endpoint(
+            database_path,
+            settings.and_then(crate::settings::LocalSettings::endpoint_override),
+        )
+    }
+
+    fn from_database_path_with_endpoint(
+        database_path: PathBuf,
+        endpoint_override: Option<&str>,
+    ) -> Result<Self, crate::DaemonError> {
         if database_path.as_os_str().is_empty() {
             return Err(crate::DaemonError::InvalidConfiguration);
         }
@@ -111,7 +134,10 @@ impl DaemonConfig {
         }
         let config = Self::with_fresh_pairing(
             database_path,
-            format!("cortexd-{}", uuid::Uuid::now_v7()),
+            endpoint_override.map_or_else(
+                || format!("cortexd-{}", uuid::Uuid::now_v7()),
+                str::to_owned,
+            ),
             WorkspaceId::new(),
             PrincipalId::new(),
             discovery_path,
@@ -179,6 +205,12 @@ impl DaemonConfig {
     pub fn with_bootstrap_grants(mut self, grants: Vec<Capability>) -> Self {
         self.bootstrap_grants = grants;
         self
+    }
+
+    /// Returns the local IPC endpoint name for diagnostics and tests.
+    #[must_use]
+    pub fn endpoint_name(&self) -> &str {
+        &self.endpoint_name
     }
 
     /// Returns the daemon owner identity for local administration and enrollment setup.

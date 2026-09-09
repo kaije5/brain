@@ -70,10 +70,7 @@ pub struct ProviderProfile {
 impl ProviderProfile {
     /// # Errors
     /// Returns a validation error when the embedded profile id is invalid.
-    pub fn new(
-        id: ProviderProfileId,
-        enabled: bool,
-    ) -> Result<Self, ApplicationError> {
+    pub fn new(id: ProviderProfileId, enabled: bool) -> Result<Self, ApplicationError> {
         Ok(Self {
             id,
             enabled,
@@ -120,7 +117,11 @@ impl DiscoveredModel {
     }
 
     #[must_use]
-    pub fn with_evidence(mut self, capability: ModelCapability, observed_at: DateTime<Utc>) -> Self {
+    pub fn with_evidence(
+        mut self,
+        capability: ModelCapability,
+        observed_at: DateTime<Utc>,
+    ) -> Self {
         let observed = self
             .evidence
             .get(&capability)
@@ -145,9 +146,10 @@ impl DiscoveredModel {
     ) -> bool {
         self.evidence.get(&capability).is_some_and(|observed_at| {
             let age = now.signed_duration_since(*observed_at);
-            age >= chrono::Duration::zero() && age <= chrono::Duration::from_std(max_age).unwrap_or(
-                chrono::Duration::hours(24 * 365 * 100),
-            )
+            age >= chrono::Duration::zero()
+                && age
+                    <= chrono::Duration::from_std(max_age)
+                        .unwrap_or(chrono::Duration::hours(24 * 365 * 100))
         })
     }
 }
@@ -232,10 +234,9 @@ impl ModelCatalog {
         now: DateTime<Utc>,
     ) -> impl Iterator<Item = &'a DiscoveredModel> + use<'a> {
         self.models.iter().filter(move |model| {
-            policy
-                .required
-                .iter()
-                .all(|capability| model.has_fresh_evidence(*capability, now, policy.max_evidence_age))
+            policy.required.iter().all(|capability| {
+                model.has_fresh_evidence(*capability, now, policy.max_evidence_age)
+            })
         })
     }
 }
@@ -282,20 +283,22 @@ impl ModelRouter {
             .collect();
 
         candidates.sort_by(|(profile_left, model_left), (profile_right, model_right)| {
-            let preference =
-                |model: &DiscoveredModel| policy.preference.iter().position(|id| id == model.model_id());
-            let rank = |model: &DiscoveredModel| {
-                preference(model).unwrap_or(usize::MAX)
+            let preference = |model: &DiscoveredModel| {
+                policy
+                    .preference
+                    .iter()
+                    .position(|id| id == model.model_id())
             };
+            let rank = |model: &DiscoveredModel| preference(model).unwrap_or(usize::MAX);
             rank(model_left)
                 .cmp(&rank(model_right))
-                .then_with(|| model_left.model_id().as_str().cmp(model_right.model_id().as_str()))
                 .then_with(|| {
-                    profile_left
-                        .id()
+                    model_left
+                        .model_id()
                         .as_str()
-                        .cmp(profile_right.id().as_str())
+                        .cmp(model_right.model_id().as_str())
                 })
+                .then_with(|| profile_left.id().as_str().cmp(profile_right.id().as_str()))
         });
 
         candidates

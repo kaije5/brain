@@ -19,7 +19,11 @@ fn evidence_now() -> DateTime<Utc> {
     Utc::now()
 }
 
-fn discovered(id: &str, observed_at: DateTime<Utc>, capabilities: &[ModelCapability]) -> DiscoveredModel {
+fn discovered(
+    id: &str,
+    observed_at: DateTime<Utc>,
+    capabilities: &[ModelCapability],
+) -> DiscoveredModel {
     let mut model = DiscoveredModel::new(ModelId::new(id).expect("valid model id"));
     for capability in capabilities {
         model = model.with_evidence(*capability, observed_at);
@@ -28,8 +32,7 @@ fn discovered(id: &str, observed_at: DateTime<Utc>, capabilities: &[ModelCapabil
 }
 
 fn agent_policy() -> RoleRoutingPolicy {
-    RoleRoutingPolicy::agent_default(Duration::from_hours(24))
-        .expect("valid default policy")
+    RoleRoutingPolicy::agent_default(Duration::from_hours(24)).expect("valid default policy")
 }
 
 #[test]
@@ -56,17 +59,17 @@ fn router_selects_only_models_with_fresh_required_capability_evidence() {
     let catalog = ModelCatalog::new(vec![discovered(
         "meta/llama-3.1-70b-instruct",
         fresh,
-        &[ModelCapability::ToolCalling, ModelCapability::StructuredOutput],
+        &[
+            ModelCapability::ToolCalling,
+            ModelCapability::StructuredOutput,
+        ],
     )]);
 
     let selection =
         ModelRouter::select(&agent_policy(), &[profile("nim-dev", true)], &catalog, now)
             .expect("eligible model exists");
 
-    assert_eq!(
-        selection.model_id.as_str(),
-        "meta/llama-3.1-70b-instruct"
-    );
+    assert_eq!(selection.model_id.as_str(), "meta/llama-3.1-70b-instruct");
 }
 
 #[test]
@@ -79,8 +82,7 @@ fn router_skips_models_missing_required_capabilities() {
         &[ModelCapability::ToolCalling],
     )]);
 
-    let result =
-        ModelRouter::select(&agent_policy(), &[profile("nim-dev", true)], &catalog, now);
+    let result = ModelRouter::select(&agent_policy(), &[profile("nim-dev", true)], &catalog, now);
 
     assert_eq!(result, Err(ApplicationError::NoSuitableModel));
 }
@@ -92,11 +94,13 @@ fn router_treats_stale_evidence_as_ineligible() {
     let catalog = ModelCatalog::new(vec![discovered(
         "meta/llama-3.1-70b-instruct",
         stale,
-        &[ModelCapability::ToolCalling, ModelCapability::StructuredOutput],
+        &[
+            ModelCapability::ToolCalling,
+            ModelCapability::StructuredOutput,
+        ],
     )]);
 
-    let result =
-        ModelRouter::select(&agent_policy(), &[profile("nim-dev", true)], &catalog, now);
+    let result = ModelRouter::select(&agent_policy(), &[profile("nim-dev", true)], &catalog, now);
 
     assert_eq!(result, Err(ApplicationError::NoSuitableModel));
 }
@@ -108,7 +112,10 @@ fn router_skips_disabled_profiles_without_falling_back() {
     let catalog = ModelCatalog::new(vec![discovered(
         "meta/llama-3.1-70b-instruct",
         fresh,
-        &[ModelCapability::ToolCalling, ModelCapability::StructuredOutput],
+        &[
+            ModelCapability::ToolCalling,
+            ModelCapability::StructuredOutput,
+        ],
     )]);
 
     let result = ModelRouter::select(&agent_policy(), &[profile("nim-dev", false)], &catalog, now);
@@ -140,13 +147,8 @@ fn router_orders_by_preference_then_stable_model_identifier() {
     )
     .expect("valid policy");
 
-    let selection = ModelRouter::select(
-        &policy,
-        &[profile("nim-dev", true)],
-        &catalog,
-        now,
-    )
-    .expect("eligible model exists");
+    let selection = ModelRouter::select(&policy, &[profile("nim-dev", true)], &catalog, now)
+        .expect("eligible model exists");
     assert_eq!(selection.model_id.as_str(), "preferred-model");
 
     let without_preference = RoleRoutingPolicy::new(
@@ -196,20 +198,23 @@ fn catalog_refresh_replaces_prior_discovery_results() {
     let mut catalog = ModelCatalog::new(vec![discovered(
         "retired-model",
         fresh,
-        &[ModelCapability::ToolCalling, ModelCapability::StructuredOutput],
+        &[
+            ModelCapability::ToolCalling,
+            ModelCapability::StructuredOutput,
+        ],
     )]);
 
     catalog.refresh(vec![discovered(
         "meta/llama-3.1-70b-instruct",
         fresh,
-        &[ModelCapability::ToolCalling, ModelCapability::StructuredOutput],
+        &[
+            ModelCapability::ToolCalling,
+            ModelCapability::StructuredOutput,
+        ],
     )]);
 
     let selection =
         ModelRouter::select(&agent_policy(), &[profile("nim-dev", true)], &catalog, now)
             .expect("refreshed model is eligible");
-    assert_eq!(
-        selection.model_id.as_str(),
-        "meta/llama-3.1-70b-instruct"
-    );
+    assert_eq!(selection.model_id.as_str(), "meta/llama-3.1-70b-instruct");
 }

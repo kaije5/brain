@@ -5,9 +5,15 @@ use crate::PolicyDeny;
 /// Safe public failures returned by the application boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ApplicationError {
-    Validation { field: &'static str },
-    NotFound { entity: &'static str },
-    Conflict { entity: &'static str },
+    Validation {
+        field: &'static str,
+    },
+    NotFound {
+        entity: &'static str,
+    },
+    Conflict {
+        entity: &'static str,
+    },
     PermissionDenied,
     PolicyDenied(PolicyDeny),
     Storage(String),
@@ -17,7 +23,9 @@ pub enum ApplicationError {
     /// evidence for the role's required capabilities. Never silently falls
     /// back to a substitute model or provider.
     NoSuitableModel,
-    MalformedModelOutput { reason: &'static str },
+    MalformedModelOutput {
+        reason: &'static str,
+    },
     Internal,
 }
 

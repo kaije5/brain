@@ -26,6 +26,7 @@ impl SecretStore for PlatformSecretStore {
 
         #[cfg(not(windows))]
         {
+            let _ = reference;
             Err(ApplicationError::Internal)
         }
     }
