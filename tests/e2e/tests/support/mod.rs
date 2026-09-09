@@ -15,6 +15,7 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
+    routing::get,
     routing::post,
 };
 use cortex_application::{
@@ -71,17 +72,29 @@ pub async fn assert_deployed_daemon_rejects_missing_model_secret() {
     let directory = TempDir::new().expect("temporary Cortex directory");
     let database_path = directory.path().join("cortex.db");
     let missing_reference = format!("keyring:cortex/e2e-missing-{}", Uuid::now_v7());
+    std::fs::write(
+        directory.path().join("cortexd.toml"),
+        format!(
+            "[models]
+default_profile = \"e2e\"
+
+[models.profiles.e2e]
+base_url = \"http://127.0.0.1:9/\"
+secret_ref = \"{missing_reference}\"
+"
+        ),
+    )
+    .expect("settings fixture");
     let mut process = Command::new(env!("CARGO_BIN_EXE_cortexd-e2e"))
         .env("CORTEX_DATABASE", database_path)
-        .env("CORTEX_MODEL_BASE_URL", "http://127.0.0.1:9/v1/")
-        .env("CORTEX_MODEL_NAME", "nemotron-test")
-        .env("CORTEX_MODEL_SECRET_REF", missing_reference)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .expect("deployed cortexd process");
-    match tokio::time::timeout(Duration::from_secs(2), process.wait()).await {
+    // Startup includes bounded provider discovery (5 s timeout) before the
+    // composition root rejects the unresolvable secret reference.
+    match tokio::time::timeout(Duration::from_secs(15), process.wait()).await {
         Ok(Ok(status)) => assert!(!status.success(), "missing model secret was accepted"),
         Ok(Err(error)) => panic!("failed to observe deployed cortexd exit: {error}"),
         Err(_) => {
@@ -175,23 +188,29 @@ impl Harness {
             .enrollment_path;
         drop(config);
         drop(bootstrap_database);
-        let mut daemon_command = Command::new(env!("CARGO_BIN_EXE_cortexd-e2e"));
-        daemon_command
-            .env("CORTEX_DATABASE", &database_path)
-            .env("CORTEX_MODEL_BASE_URL", &model_base_url)
-            .env("CORTEX_MODEL_NAME", "nemotron-test")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
         #[cfg(windows)]
         let model_secret_reference = Some(model_secret.reference());
         #[cfg(not(windows))]
         let model_secret_reference = None;
-        configure_model_secret_for_platform(
-            &mut daemon_command,
-            cfg!(windows),
-            model_secret_reference,
+        let mut settings = format!(
+            "[models]
+default_profile = \"e2e\"
+
+[models.profiles.e2e]
+base_url = \"{model_base_url}\"
+"
         );
+        if let Some(reference) = model_secret_reference {
+            use std::fmt::Write as _;
+            let _ = writeln!(settings, "secret_ref = \"{reference}\"");
+        }
+        std::fs::write(directory.path().join("cortexd.toml"), settings).expect("settings fixture");
+        let mut daemon_command = Command::new(env!("CARGO_BIN_EXE_cortexd-e2e"));
+        daemon_command
+            .env("CORTEX_DATABASE", &database_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
         let daemon_process = daemon_command.spawn().expect("deployed cortexd process");
         let owner =
             AuthenticatedIpcClient::from_database_path(&database_path).expect("owner enrollment");
@@ -542,8 +561,11 @@ async fn start_fake_model_endpoint(
     let address = listener.local_addr().expect("fake model address");
     let cancellation = CancellationToken::new();
     let service = Router::new()
+        .route("/v1/models", get(fake_models))
         .route("/v1/embeddings", post(fake_embedding))
         .route("/v1/chat/completions", post(fake_chat))
+        .route("/embeddings", post(fake_embedding))
+        .route("/chat/completions", post(fake_chat))
         .with_state(state);
     let serving_cancellation = cancellation.clone();
     let serving = tokio::spawn(async move {
@@ -551,7 +573,14 @@ async fn start_fake_model_endpoint(
             .with_graceful_shutdown(serving_cancellation.cancelled_owned())
             .await
     });
-    (format!("http://{address}/v1/"), cancellation, serving)
+    (format!("http://{address}/"), cancellation, serving)
+}
+
+async fn fake_models(State(state): State<FakeModelState>) -> Response {
+    if !state.available.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    Json(json!({"data": [{"id": "nemotron-test"}]})).into_response()
 }
 
 async fn fake_embedding(State(state): State<FakeModelState>) -> Response {

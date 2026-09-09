@@ -125,7 +125,10 @@ fn nim_config_allows_https_and_loopback_http() {
 #[tokio::test]
 async fn discovery_hits_models_endpoint_and_normalizes_ids() {
     let fake = transport(
-        vec![Ok(models_page(&["meta/llama-3.1-70b-instruct", "zephyr-7b"]))],
+        vec![Ok(models_page(&[
+            "meta/llama-3.1-70b-instruct",
+            "zephyr-7b",
+        ]))],
         Vec::new(),
     );
     let discovery = NimDiscovery::new(config(), fake.clone());
@@ -139,7 +142,10 @@ async fn discovery_hits_models_endpoint_and_normalizes_ids() {
     let (endpoint, bearer) = &requests[0];
     assert_eq!(endpoint, "https://integrate.api.nvidia.com/v1/models");
     assert_eq!(bearer.as_deref(), Some("bearer-token"));
-    let mut ids: Vec<&str> = models.iter().map(|model| model.model_id().as_str()).collect();
+    let mut ids: Vec<&str> = models
+        .iter()
+        .map(|model| model.model_id().as_str())
+        .collect();
     ids.sort_unstable();
     assert_eq!(ids, ["meta/llama-3.1-70b-instruct", "zephyr-7b"]);
 }
@@ -162,7 +168,10 @@ async fn discovery_maps_transport_failure_to_a_safe_typed_error() {
 
     let result = discovery.discover(Some("token")).await;
 
-    assert!(matches!(result, Err(ApplicationError::InferenceUnavailable)));
+    assert!(matches!(
+        result,
+        Err(ApplicationError::InferenceUnavailable)
+    ));
 }
 
 #[tokio::test]
@@ -263,7 +272,10 @@ async fn refresh_failure_reports_a_degraded_state_without_fabricating_evidence()
 #[tokio::test]
 async fn reqwest_transport_sends_bearer_credentials_and_rejects_redirects() {
     use cortex_inference::ReqwestNimTransport;
-    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     let address = listener.local_addr().expect("address");
@@ -292,8 +304,9 @@ async fn reqwest_transport_sends_bearer_credentials_and_rejects_redirects() {
 
     let sent = responder.await.expect("responder task");
     assert!(result.is_ok(), "loopback GET succeeds: {result:?}");
-    assert!(sent
-        .to_ascii_lowercase()
-        .contains("authorization: bearer secret-bearer-value"));
+    assert!(
+        sent.to_ascii_lowercase()
+            .contains("authorization: bearer secret-bearer-value")
+    );
     assert!(sent.starts_with("GET /v1/models"));
 }

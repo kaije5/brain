@@ -42,7 +42,10 @@ async fn provider_profiles_round_trip_without_secret_material_expansion() -> Res
         .await
         .map_err(|error| debug_error(&error))?;
 
-    let profiles = store.list_profiles().await.map_err(|error| debug_error(&error))?;
+    let profiles = store
+        .list_profiles()
+        .await
+        .map_err(|error| debug_error(&error))?;
     assert_eq!(
         profiles,
         vec![StoredProviderProfile {
@@ -60,7 +63,10 @@ async fn provider_profiles_round_trip_without_secret_material_expansion() -> Res
         })
         .await
         .map_err(|error| debug_error(&error))?;
-    let profiles = store.list_profiles().await.map_err(|error| debug_error(&error))?;
+    let profiles = store
+        .list_profiles()
+        .await
+        .map_err(|error| debug_error(&error))?;
     assert_eq!(profiles.len(), 1, "upsert updates rather than duplicates");
     assert!(!profiles[0].enabled);
     assert!(profiles[0].secret_reference.is_none());
@@ -126,7 +132,10 @@ async fn catalog_evidence_is_scoped_per_profile() -> Result<(), String> {
         .await
         .map_err(|error| debug_error(&error))?;
 
-    let other = store.load_catalog("other-profile").await.map_err(|error| debug_error(&error))?;
+    let other = store
+        .load_catalog("other-profile")
+        .await
+        .map_err(|error| debug_error(&error))?;
     assert!(other.is_empty(), "evidence must not leak across profiles");
     Ok(())
 }

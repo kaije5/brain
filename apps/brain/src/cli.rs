@@ -33,6 +33,10 @@ pub enum Command {
     Memory(MemoryCommand),
     #[command(subcommand)]
     Remote(RemoteCommand),
+    #[command(subcommand)]
+    Config(ConfigCommand),
+    #[command(subcommand)]
+    Secret(SecretCommand),
     Ask {
         prompt: String,
     },
@@ -61,6 +65,21 @@ pub enum TaskCommand {
 #[derive(Clone, Debug, Subcommand)]
 pub enum MemoryCommand {
     Search(SearchArgs),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Writes the documented `cortexd.toml` template beside the database.
+    Init,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Imports a provider credential from stdin into the OS keyring.
+    Import {
+        #[arg(long)]
+        profile: String,
+    },
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -157,6 +176,11 @@ pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
             true,
         ),
         Command::Ask { prompt } => ("cortex_agent_run", json!({"prompt":prompt}), false),
+        // `config` and `secret` are local client operations handled by the
+        // binary before any daemon request is built.
+        Command::Config(_) | Command::Secret(_) => {
+            return Err(CliCommandError::InvalidInput);
+        }
     };
     let operation_id = Uuid::now_v7();
     Ok(CommandRequest {

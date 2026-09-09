@@ -1,4 +1,6 @@
-use cortex_application::{Capability, CapabilityCatalog, CapabilityGrant, CommandContext, GrantPolicy};
+use cortex_application::{
+    Capability, CapabilityCatalog, CapabilityGrant, CommandContext, GrantPolicy,
+};
 use cortex_domain::{OperationId, PrincipalId, WorkspaceId};
 use cortex_inference::AuthorizedCapabilities;
 use uuid::Uuid;
@@ -16,20 +18,15 @@ fn granted(
     context: &CommandContext,
     capabilities: impl IntoIterator<Item = Capability>,
 ) -> GrantPolicy {
-    GrantPolicy::new(
-        capabilities
-            .into_iter()
-            .map(|capability| CapabilityGrant::new(context.workspace_id, context.principal_id, capability)),
-    )
+    GrantPolicy::new(capabilities.into_iter().map(|capability| {
+        CapabilityGrant::new(context.workspace_id, context.principal_id, capability)
+    }))
 }
 
 #[test]
 fn resolver_derives_the_exact_authorized_subset_from_policy() {
     let context = context();
-    let policy = granted(
-        &context,
-        [Capability::NoteSearch, Capability::TaskList],
-    );
+    let policy = granted(&context, [Capability::NoteSearch, Capability::TaskList]);
 
     let authorized = AuthorizedCapabilities::resolve(
         &context,
@@ -104,12 +101,8 @@ fn provider_content_cannot_expand_the_authorized_capability_set() {
         Capability::TaskList,
     ];
 
-    let authorized = AuthorizedCapabilities::resolve(
-        &context,
-        &policy,
-        injected_candidates,
-    )
-    .expect("resolution succeeds");
+    let authorized = AuthorizedCapabilities::resolve(&context, &policy, injected_candidates)
+        .expect("resolution succeeds");
 
     let tools: Vec<String> = authorized
         .inference_tools()

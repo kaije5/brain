@@ -36,15 +36,11 @@ impl NimConfig {
         secret_reference: Option<SecretRef>,
         timeout: Duration,
     ) -> Result<Self, ApplicationError> {
-        let mut base_url =
-            reqwest::Url::parse(base_url.as_ref()).map_err(|_| ApplicationError::Validation {
-                field: "endpoint",
-            })?;
+        let mut base_url = reqwest::Url::parse(base_url.as_ref())
+            .map_err(|_| ApplicationError::Validation { field: "endpoint" })?;
         let valid_scheme = matches!(base_url.scheme(), "http" | "https");
         let valid_authority = base_url.username().is_empty() && base_url.password().is_none();
-        let loopback = base_url
-            .host_str()
-            .is_some_and(is_loopback_host);
+        let loopback = base_url.host_str().is_some_and(is_loopback_host);
         let cleartext_remote = base_url.scheme() == "http" && !loopback;
         if !valid_scheme
             || !valid_authority
@@ -70,7 +66,10 @@ impl NimConfig {
     }
 
     fn models_endpoint(&self) -> String {
-        self.base_url.join("v1/models").expect("base path is joinable").to_string()
+        self.base_url
+            .join("v1/models")
+            .expect("base path is joinable")
+            .to_string()
     }
 
     fn chat_endpoint(&self) -> String {
@@ -156,12 +155,11 @@ impl<T: NimTransport> NimDiscovery<T> {
                 reason: "invalid NIM model list response",
             }
         })?;
-        let entries = parsed
-            .get("data")
-            .and_then(Value::as_array)
-            .ok_or(ApplicationError::MalformedModelOutput {
+        let entries = parsed.get("data").and_then(Value::as_array).ok_or(
+            ApplicationError::MalformedModelOutput {
                 reason: "NIM model list response contained no data array",
-            })?;
+            },
+        )?;
         if entries.len() > MAX_DISCOVERED_MODELS {
             return Err(ApplicationError::MalformedModelOutput {
                 reason: "NIM model list exceeded the configured discovery budget",
@@ -276,10 +274,7 @@ impl<T: NimTransport> NimDiscovery<T> {
     ///
     /// # Errors
     /// Returns typed inference failures; never invents eligibility.
-    pub async fn refresh(
-        &self,
-        bearer: Option<&str>,
-    ) -> Result<ModelCatalog, ApplicationError> {
+    pub async fn refresh(&self, bearer: Option<&str>) -> Result<ModelCatalog, ApplicationError> {
         let discovered = self.discover(bearer).await?;
         let mut probed = Vec::with_capacity(discovered.len());
         for model in discovered {
@@ -298,14 +293,13 @@ pub struct ReqwestNimTransport {
 
 impl ReqwestNimTransport {
     fn client(&self) -> &reqwest::Client {
-        self.client
-            .get_or_init(|| {
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .no_proxy()
-                    .build()
-                    .expect("statically valid transport client configuration")
-            })
+        self.client.get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
+                .build()
+                .expect("statically valid transport client configuration")
+        })
     }
 
     fn auth_header(bearer: Option<&str>) -> reqwest::header::HeaderMap {

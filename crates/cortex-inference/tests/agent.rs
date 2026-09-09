@@ -659,5 +659,9 @@ async fn provider_failure_fails_the_turn_safely_without_side_effects() {
         .await;
 
     assert_eq!(outcome, Err(ApplicationError::InferenceUnavailable));
-    assert_eq!(service.recorded_calls(), 0, "no tool executes when the provider fails");
+    assert_eq!(
+        service.recorded_calls(),
+        0,
+        "no tool executes when the provider fails"
+    );
 }
