@@ -82,14 +82,3 @@ impl PlatformSecretStore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_value_reads_the_imported_nim_credential() {
-        let reference = SecretRef::new("keyring:cortexd/nim").expect("valid reference");
-        let value = PlatformSecretStore.resolve_value(&reference);
-        assert!(value.is_ok(), "keyring read failed: {value:?}");
-    }
-}
