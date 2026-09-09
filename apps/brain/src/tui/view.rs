@@ -392,7 +392,10 @@ fn render_editor_details(editor: &SettingsEditor, area: Rect, buffer: &mut Buffe
             "Enter: edit URL · i: import token · t: toggle · d: delete"
         }));
         lines.push(Line::from(
-            "Up/Down: select · n: new · a: add NVIDIA NIM · w: save · Esc: back",
+            "Up/Down: select · n: new · a: add NVIDIA NIM · Esc: back",
+        ));
+        lines.push(Line::from(
+            "Confirming an API key or URL saves immediately · w: save other changes",
         ));
         if let Some(error) = editor.error() {
             lines.push(Line::styled(

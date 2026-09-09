@@ -156,7 +156,21 @@ fn handle_settings_enter(app: &mut App) {
         return;
     };
     if editor.pending_purpose().is_some() || editor.pending_confirm().is_some() {
+        // Confirming an API key or endpoint URL completes a usable profile,
+        // so the draft persists immediately instead of waiting for `w`.
+        let autosave = matches!(
+            editor.pending_purpose(),
+            Some(super::TextPurpose::Secret(_) | super::TextPurpose::BaseUrl(_))
+        );
         let _ = app.confirm_text_with_store(&crate::local_ops::PlatformSecretWriter);
+        if autosave
+            && app
+                .settings_editor()
+                .is_some_and(|editor| editor.error().is_none())
+            && let Err(message) = app.save_settings()
+        {
+            app.set_status_line(format!("settings: {message}"));
+        }
         return;
     }
     if editor.provider_picker().is_some() {
@@ -532,6 +546,55 @@ mod tests {
         assert!(editor.pending_purpose().is_none());
         assert!(editor.error().is_some());
         assert_eq!(editor.profiles().len(), 1);
+    }
+
+    #[test]
+    fn confirming_a_url_saves_the_draft_without_pressing_w() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("cortexd.toml");
+        let mut app = App::new();
+        app.select_tab(Tab::Settings);
+        app.set_settings_summary(SettingsSummary {
+            config_path: path.to_string_lossy().into_owned(),
+            default_profile: Some("nim".to_owned()),
+            profiles: vec![("nim".to_owned(), "https://old.example/v1".to_owned(), true)],
+            model_status: "ready".to_owned(),
+        });
+        app.start_settings_edit();
+        // Cursor row 1: Enter opens the endpoint URL prompt for `nim`.
+        app.editor_down();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        for c in "https://integrate.api.nvidia.com/v1".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let contents = std::fs::read_to_string(&path).expect("draft saved automatically");
+        assert!(contents.contains("https://integrate.api.nvidia.com/v1"));
+        assert!(
+            !app.settings_editor().unwrap().dirty,
+            "the autosave clears the dirty flag"
+        );
+    }
+
+    #[test]
+    fn a_rejected_confirm_does_not_autosave() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("cortexd.toml");
+        let mut app = App::new();
+        app.select_tab(Tab::Settings);
+        app.set_settings_summary(SettingsSummary {
+            config_path: path.to_string_lossy().into_owned(),
+            default_profile: Some("nim".to_owned()),
+            profiles: vec![("nim".to_owned(), "https://old.example/v1".to_owned(), true)],
+            model_status: "ready".to_owned(),
+        });
+        app.start_settings_edit();
+        app.editor_down();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        // Confirming an empty endpoint is rejected; nothing may be written.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!path.exists());
+        assert!(app.settings_editor().unwrap().error().is_some());
     }
 
     #[test]

@@ -90,7 +90,8 @@ Settings prompts keep focus until confirmed or cancelled.
   profile becomes the default and the key goes straight into the keyring.
   Use Up/Down to select a row: `Enter` edits the default profile or endpoint,
   `i` imports a masked token into the system keyring, `t` toggles a provider,
-  and `d` requests deletion. Press `w` to save; restart the daemon to apply.
+  and `d` requests deletion. Confirming an API key or endpoint URL saves
+  immediately; press `w` to save other changes. Restart the daemon to apply.
   `Esc` asks before discarding unsaved settings; imported keyring tokens
   remain stored even if the settings draft is discarded.
 
