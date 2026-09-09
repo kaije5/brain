@@ -1,4 +1,13 @@
-use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use rustls::{
     ClientConfig, RootCertStore,
@@ -20,6 +29,32 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TUNNEL_FRAME_BYTES: usize = 64 * 1024;
 const MAX_HEADER_VALUE_BYTES: usize = 16 * 1024;
 const TUNNEL_PROTOCOL_VERSION: u16 = 1;
+// MCP permits a 64 KiB HTTP response, so the local response budget matches the tunnel frame
+// budget instead of a fraction of it. A response that still cannot fit one frame (for example
+// after JSON escaping) is replaced by a bounded error response rather than dropping the tunnel.
+const MAX_LOCAL_RESPONSE_BYTES: usize = MAX_TUNNEL_FRAME_BYTES;
+
+/// Signals that one tunnel session reached healthy establishment, so reconnect backoff can
+/// reset even though the session later ended with a transport error.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectionHealth(Arc<AtomicBool>);
+
+impl ConnectionHealth {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_established(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Returns whether establishment was observed since the last call and clears the flag.
+    #[must_use]
+    pub fn take_established(&self) -> bool {
+        self.0.swap(false, Ordering::AcqRel)
+    }
+}
 
 /// Vendor-neutral destination for the stateless relay.
 #[derive(Clone, Eq, PartialEq)]
@@ -107,11 +142,15 @@ impl RetryPolicy {
 }
 
 /// One statically-dispatched outbound relay adapter.
+///
+/// Implementations must call [`ConnectionHealth::mark_established`] once a session is
+/// registered with the relay so the reconnect loop can reset its backoff.
 pub trait TunnelConnector: Clone + Send + Sync + 'static {
     fn connect_and_forward(
         &self,
         relay: &RelayEndpoint,
         local_addr: SocketAddr,
+        health: ConnectionHealth,
         cancellation: CancellationToken,
     ) -> impl Future<Output = Result<(), GatewayError>> + Send;
 }
@@ -190,6 +229,7 @@ impl TunnelConnector for RustlsTunnelConnector {
         &self,
         relay: &RelayEndpoint,
         local_addr: SocketAddr,
+        health: ConnectionHealth,
         cancellation: CancellationToken,
     ) -> Result<(), GatewayError> {
         if !local_addr.ip().is_loopback() {
@@ -217,7 +257,9 @@ impl TunnelConnector for RustlsTunnelConnector {
             },
         )
         .await?;
-        let acknowledgement: RelayFrame = read_tunnel_frame(&mut tls).await?;
+        let acknowledgement: RelayFrame =
+            cancellable_timeout(&cancellation, read_bounded_frame::<_, RelayFrame>(&mut tls))
+                .await?;
         if !matches!(
             acknowledgement,
             RelayFrame::Registered {
@@ -226,12 +268,18 @@ impl TunnelConnector for RustlsTunnelConnector {
         ) {
             return Err(GatewayError::TunnelUnavailable);
         }
+        health.mark_established();
         loop {
-            let request = tokio::select! {
+            // Waiting for the next frame prefix must not carry the partial-frame deadline:
+            // a healthy relay sends nothing until a request arrives, and there is no heartbeat
+            // frame. Cancellation is the only way out of an idle wait; once a frame has started,
+            // the remainder is bounded by the partial-frame deadline.
+            let length = tokio::select! {
                 biased;
                 () = cancellation.cancelled() => return Ok(()),
-                result = read_tunnel_frame::<_, RelayFrame>(&mut tls) => result?,
+                length = read_frame_length(&mut tls) => length?,
             };
+            let request = read_frame_payload::<_, RelayFrame>(&mut tls, length).await?;
             let RelayFrame::Request(request) = request else {
                 return Err(GatewayError::TunnelUnavailable);
             };
@@ -264,24 +312,60 @@ impl RustlsTunnelConnector {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let mut body = Vec::new();
+        let mut oversized = false;
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|_| GatewayError::TunnelUnavailable)?
         {
-            if body.len().saturating_add(chunk.len()) > MAX_TUNNEL_FRAME_BYTES / 2 {
-                return Err(GatewayError::TunnelUnavailable);
+            let next_len = body.len().saturating_add(chunk.len());
+            if next_len > MAX_LOCAL_RESPONSE_BYTES {
+                oversized = true;
+                break;
             }
             body.extend_from_slice(&chunk);
         }
+        let request_id = request.request_id;
+        if oversized {
+            return Ok(bounded_error_response(request_id));
+        }
         let body = String::from_utf8(body).map_err(|_| GatewayError::TunnelUnavailable)?;
-        Ok(RelayResponse {
+        let response = RelayResponse {
             version: TUNNEL_PROTOCOL_VERSION,
-            request_id: request.request_id,
+            request_id,
             status,
             content_type,
             body,
-        })
+        };
+        // JSON escaping can grow the body beyond the frame budget even when the raw response
+        // fit; fall back to a bounded error response instead of tearing down the session.
+        if frame_size(&response).is_some_and(|size| size <= MAX_TUNNEL_FRAME_BYTES) {
+            Ok(response)
+        } else {
+            Ok(bounded_error_response(request_id))
+        }
+    }
+}
+
+/// Exact encoded tunnel frame size for a response, or `None` if it cannot be encoded.
+fn frame_size(response: &RelayResponse) -> Option<usize> {
+    let mut envelope = response.clone();
+    envelope.body.clear();
+    let envelope = serde_json::to_vec(&ClientFrame::Response(envelope))
+        .ok()?
+        .len();
+    // The empty `""` body in the envelope is replaced one-for-one by the quoted, escaped body.
+    let body = serde_json::to_vec(&response.body).ok()?.len();
+    Some(envelope + body)
+}
+
+fn bounded_error_response(request_id: uuid::Uuid) -> RelayResponse {
+    RelayResponse {
+        version: TUNNEL_PROTOCOL_VERSION,
+        request_id,
+        status: 500,
+        content_type: Some("application/json".to_owned()),
+        body: r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"local response exceeded the tunnel frame budget"}}"#.to_owned(),
     }
 }
 
@@ -315,7 +399,7 @@ struct RelayRequest {
     body: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct RelayResponse {
     version: u16,
     request_id: uuid::Uuid,
@@ -345,20 +429,14 @@ fn validate_relay_request(request: &RelayRequest) -> Result<(), GatewayError> {
     Ok(())
 }
 
-async fn read_tunnel_frame<S, T>(stream: &mut S) -> Result<T, GatewayError>
+/// Reads a frame whose start has already been observed; the remainder is bounded by the
+/// partial-frame deadline so a stalled frame cannot wedge the session.
+async fn read_frame_payload<S, T>(stream: &mut S, length: usize) -> Result<T, GatewayError>
 where
     S: AsyncRead + Unpin,
     T: for<'de> Deserialize<'de>,
 {
     timeout(FRAME_TIMEOUT, async {
-        let length = stream
-            .read_u32_le()
-            .await
-            .map_err(|_| GatewayError::TunnelUnavailable)?;
-        let length = usize::try_from(length).map_err(|_| GatewayError::TunnelUnavailable)?;
-        if length == 0 || length > MAX_TUNNEL_FRAME_BYTES {
-            return Err(GatewayError::TunnelUnavailable);
-        }
         let mut bytes = vec![0; length];
         stream
             .read_exact(&mut bytes)
@@ -368,6 +446,33 @@ where
     })
     .await
     .map_err(|_| GatewayError::TunnelUnavailable)?
+}
+
+/// Reads one full frame under the partial-frame deadline. Used for the bounded registration
+/// handshake; the request loop waits for frame starts without this deadline.
+async fn read_bounded_frame<S, T>(stream: &mut S) -> Result<T, GatewayError>
+where
+    S: AsyncRead + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    let length = read_frame_length(stream).await?;
+    read_frame_payload(stream, length).await
+}
+
+/// Reads a frame length prefix with no deadline. Callers must make this wait cancellable.
+async fn read_frame_length<S>(stream: &mut S) -> Result<usize, GatewayError>
+where
+    S: AsyncRead + Unpin,
+{
+    let length = stream
+        .read_u32_le()
+        .await
+        .map_err(|_| GatewayError::TunnelUnavailable)?;
+    let length = usize::try_from(length).map_err(|_| GatewayError::TunnelUnavailable)?;
+    if length == 0 || length > MAX_TUNNEL_FRAME_BYTES {
+        return Err(GatewayError::TunnelUnavailable);
+    }
+    Ok(length)
 }
 
 async fn write_tunnel_frame<S, T>(stream: &mut S, value: &T) -> Result<(), GatewayError>
@@ -438,16 +543,25 @@ impl<C: TunnelConnector> TunnelClient<C> {
             if cancellation.is_cancelled() {
                 return Ok(());
             }
+            let health = ConnectionHealth::new();
             let result = self
                 .connector
-                .connect_and_forward(&self.relay, self.local_addr, cancellation.clone())
+                .connect_and_forward(
+                    &self.relay,
+                    self.local_addr,
+                    health.clone(),
+                    cancellation.clone(),
+                )
                 .await;
             if cancellation.is_cancelled() {
                 return Ok(());
             }
-            if result.is_ok() {
+            // A session that registered with the relay was healthy; its failure should not
+            // compound backoff, otherwise idle tunnels oscillate between long disconnects.
+            if health.take_established() {
                 attempt = 0;
             }
+            let _ = result;
             let delay = self.retry.delay(attempt);
             attempt = attempt.saturating_add(1);
             tracing::warn!(
@@ -503,9 +617,19 @@ fn valid_identifier(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{RelayRequest, validate_relay_request};
-    use std::collections::HashMap;
+    use super::{RelayFrame, RelayRequest, RustlsTunnelConnector, validate_relay_request};
+    use std::{collections::HashMap, net::SocketAddr};
+    use tokio::{io::duplex, net::TcpListener};
     use uuid::Uuid;
+
+    fn test_connector() -> RustlsTunnelConnector {
+        RustlsTunnelConnector::with_client_identity(
+            include_bytes!("../tests/fixtures/ca.pem"),
+            include_bytes!("../tests/fixtures/client.pem"),
+            include_bytes!("../tests/fixtures/client.key"),
+        )
+        .expect("client TLS identity")
+    }
 
     #[test]
     fn relay_requests_require_uuid_v7_and_an_authorization_header() {
@@ -535,4 +659,121 @@ mod tests {
         );
         assert!(validate_relay_request(&missing_authorization).is_err());
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_partial_frame_is_still_bounded_by_the_frame_deadline() {
+        let (mut client_side, mut server_side) = duplex(256);
+        server_side
+            .write_all(&50_u32.to_le_bytes())
+            .await
+            .expect("length prefix");
+        server_side
+            .write_all(&b"[trunc"[..])
+            .await
+            .expect("partial payload");
+        drop(server_side);
+        let result = super::read_bounded_frame::<_, RelayFrame>(&mut client_side).await;
+        assert!(
+            matches!(result, Err(super::GatewayError::TunnelUnavailable)),
+            "partial frames must hit the partial-frame deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_wait_for_the_next_frame_is_not_bounded_by_the_frame_deadline() {
+        let (mut client_side, mut server_side) = duplex(256);
+        // There is no heartbeat frame, so a registered relay legitimately sends nothing for
+        // longer than the partial-frame deadline; the frame must still arrive and parse.
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(3 * super::FRAME_TIMEOUT).await;
+            let frame = serde_json::to_vec(&serde_json::json!({
+                "type": "registered",
+                "version": 1
+            }))
+            .expect("frame encoding");
+            server_side
+                .write_all(
+                    &u32::try_from(frame.len())
+                        .expect("bounded frame")
+                        .to_le_bytes(),
+                )
+                .await
+                .expect("length prefix");
+            server_side.write_all(&frame).await.expect("frame body");
+        });
+        let frame = super::read_bounded_frame::<_, RelayFrame>(&mut client_side)
+            .await
+            .expect("frame after long idle period");
+        writer.await.expect("writer task");
+        assert!(matches!(frame, RelayFrame::Registered { version: 1 }));
+    }
+
+    /// Answers one loopback HTTP request with a fixed status and body.
+    async fn serve_one_response(status_line: &'static str, body: Vec<u8>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("connection");
+            let mut request = vec![0_u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "{status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("headers");
+            socket.write_all(&body).await.expect("body");
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn legal_responses_up_to_the_mcp_http_budget_pass_through() {
+        let connector = test_connector();
+        let body = vec![b'a'; 60_000];
+        let local_addr = serve_one_response("HTTP/1.1 200 OK", body).await;
+        let request = RelayRequest {
+            version: 1,
+            request_id: Uuid::now_v7(),
+            method: "POST".to_owned(),
+            path: "/mcp".to_owned(),
+            headers: HashMap::from([("authorization".to_owned(), "Bearer t".to_owned())]),
+            body: "{}".to_owned(),
+        };
+        let response = connector
+            .forward_local(local_addr, request)
+            .await
+            .expect("response forwarded");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.len(), 60_000);
+    }
+
+    #[tokio::test]
+    async fn oversized_local_responses_degrade_to_a_bounded_error_without_dropping_the_session() {
+        let connector = test_connector();
+        let local_addr = serve_one_response("HTTP/1.1 200 OK", vec![b'a'; 70_000]).await;
+        let request = RelayRequest {
+            version: 1,
+            request_id: Uuid::now_v7(),
+            method: "POST".to_owned(),
+            path: "/mcp".to_owned(),
+            headers: HashMap::from([("authorization".to_owned(), "Bearer t".to_owned())]),
+            body: "{}".to_owned(),
+        };
+        let response = connector
+            .forward_local(local_addr, request)
+            .await
+            .expect("session survives an oversized local response");
+        assert_eq!(response.status, 500);
+        assert!(response.body.contains("exceeded the tunnel frame budget"));
+        // The degraded response itself must fit one tunnel frame.
+        assert!(
+            super::frame_size(&response).is_some_and(|size| size <= super::MAX_TUNNEL_FRAME_BYTES)
+        );
+    }
+
+    // Keep tokio traits in scope for the helpers above.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 }

@@ -12,7 +12,8 @@ pub use transport::{
     GatewayConfig, GatewayRateLimit, GatewayTransport, PrincipalRegistry, bind_loopback,
 };
 pub use tunnel::{
-    RelayEndpoint, RetryPolicy, RustlsTunnelConnector, TunnelClient, TunnelConnector,
+    ConnectionHealth, RelayEndpoint, RetryPolicy, RustlsTunnelConnector, TunnelClient,
+    TunnelConnector,
 };
 
 /// Stable, non-sensitive gateway failure categories.

@@ -9,8 +9,8 @@ use std::{
 
 use cortex_mcp::McpPrincipal as LocalMcpPrincipal;
 use cortex_mcp_gateway::{
-    GatewayConfig, GatewayError, GatewayTransport, PrincipalRegistry, RelayEndpoint, RetryPolicy,
-    RustlsTunnelConnector, TunnelClient, TunnelConnector,
+    ConnectionHealth, GatewayConfig, GatewayError, GatewayTransport, PrincipalRegistry,
+    RelayEndpoint, RetryPolicy, RustlsTunnelConnector, TunnelClient, TunnelConnector,
 };
 use cortexd::{DaemonConfig, LocalDaemon};
 use rustls::{
@@ -181,10 +181,113 @@ async fn mutual_tls_relay_registration_forwards_one_bounded_request_to_loopback_
     )
     .expect("relay endpoint");
     let tunnel_result = connector
-        .connect_and_forward(&endpoint, gateway_addr, cancellation.clone())
+        .connect_and_forward(
+            &endpoint,
+            gateway_addr,
+            ConnectionHealth::new(),
+            cancellation.clone(),
+        )
         .await;
     relay_task.await.expect("relay task");
     tunnel_result.expect("registered forwarding session");
+    cancellation.cancel();
+    gateway_task
+        .await
+        .expect("gateway task")
+        .expect("gateway shutdown");
+}
+
+/// A registered tunnel with no traffic must stay connected: the partial-frame deadline must
+/// not apply to the idle wait for the next frame, since there is no heartbeat protocol.
+#[tokio::test]
+async fn an_idle_registered_tunnel_remains_connected_beyond_the_frame_deadline() {
+    let directory = TempDir::new().expect("temporary directory");
+    let daemon = LocalDaemon::start(DaemonConfig::for_test(directory.path()))
+        .await
+        .expect("daemon starts");
+    let principal_id = cortex_domain::PrincipalId::new();
+    let mut principals = PrincipalRegistry::new();
+    principals.insert(
+        principal_id,
+        LocalMcpPrincipal::from_authenticated(daemon.paired_client()),
+    );
+    let cancellation = CancellationToken::new();
+    let gateway_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("gateway listener");
+    let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+    let gateway = GatewayTransport::new(
+        support::resolver("paired-subject", principal_id),
+        principals,
+        cancellation.clone(),
+    );
+    let gateway_task = tokio::spawn(gateway.serve(gateway_listener, cancellation.clone()));
+
+    let relay_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("relay listener");
+    let relay_addr = relay_listener.local_addr().expect("relay address");
+    let relay_acceptor = test_relay_acceptor();
+    let relay_cancellation = cancellation.clone();
+    let relay_task = tokio::spawn(async move {
+        let (tcp, _) = relay_listener.accept().await.expect("outbound connection");
+        let mut tls = relay_acceptor
+            .accept(tcp)
+            .await
+            .expect("authenticated client TLS");
+        let registration = read_frame(&mut tls).await;
+        assert_eq!(registration["type"], "register");
+        write_frame(&mut tls, &json!({"type":"registered","version":1})).await;
+
+        // Idle for longer than the ten-second partial-frame deadline before sending work.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        let bearer =
+            support::encoded_token("paired-subject", "https://issuer.example", "cortex", 300);
+        write_frame(
+            &mut tls,
+            &json!({
+                "type":"request", "version":1, "request_id":Uuid::now_v7(),
+                "method":"POST", "path":"/mcp",
+                "headers":{
+                    "authorization":format!("Bearer {bearer}"),
+                    "accept":"application/json, text/event-stream",
+                    "content-type":"application/json"
+                },
+                "body":r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#
+            }),
+        )
+        .await;
+        let response = read_frame(&mut tls).await;
+        assert_eq!(response["type"], "response");
+        assert_eq!(response["status"], 200);
+        relay_cancellation.cancel();
+    });
+
+    let connector = RustlsTunnelConnector::with_client_identity(
+        include_bytes!("fixtures/ca.pem"),
+        include_bytes!("fixtures/client.pem"),
+        include_bytes!("fixtures/client.key"),
+    )
+    .expect("client TLS identity");
+    let endpoint = RelayEndpoint::new(
+        relay_addr.ip().to_string(),
+        relay_addr.port(),
+        "relay.test",
+        "route-1",
+        "cortex.example",
+    )
+    .expect("relay endpoint");
+    let tunnel_result = connector
+        .connect_and_forward(
+            &endpoint,
+            gateway_addr,
+            ConnectionHealth::new(),
+            cancellation.clone(),
+        )
+        .await;
+    relay_task.await.expect("relay task");
+    tunnel_result.expect("session survived the idle period");
     cancellation.cancel();
     gateway_task
         .await
@@ -239,6 +342,7 @@ impl TunnelConnector for FailingConnector {
         &self,
         _relay: &RelayEndpoint,
         _local_addr: SocketAddr,
+        _health: ConnectionHealth,
         _cancellation: CancellationToken,
     ) -> Result<(), GatewayError> {
         if self.attempts.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
@@ -246,6 +350,66 @@ impl TunnelConnector for FailingConnector {
         }
         Err(GatewayError::TunnelUnavailable)
     }
+}
+
+/// Fails every session but reports healthy establishment from the second attempt onward.
+#[derive(Clone)]
+struct FlappyConnector {
+    attempts: Arc<AtomicUsize>,
+}
+
+impl TunnelConnector for FlappyConnector {
+    async fn connect_and_forward(
+        &self,
+        _relay: &RelayEndpoint,
+        _local_addr: SocketAddr,
+        health: ConnectionHealth,
+        _cancellation: CancellationToken,
+    ) -> Result<(), GatewayError> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt >= 1 {
+            health.mark_established();
+        }
+        Err(GatewayError::TunnelUnavailable)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnect_backoff_resets_after_a_healthy_establishment() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let client = TunnelClient::new(
+        RelayEndpoint::new(
+            "relay.example",
+            443,
+            "relay.example",
+            "route-1",
+            "cortex.example",
+        )
+        .expect("valid relay"),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33118),
+        FlappyConnector {
+            attempts: Arc::clone(&attempts),
+        },
+        RetryPolicy::new(Duration::from_secs(1), Duration::from_secs(1000)).expect("valid policy"),
+    )
+    .expect("valid tunnel client");
+    let cancellation = CancellationToken::new();
+    let run = tokio::spawn(client.run(cancellation.clone()));
+    // With backoff reset after establishment, sessions start near t=0, 1s, 3s, 4s, 6s; without
+    // it the delays grow 1s, 2s, 4s, ... and only three sessions would have started by now.
+    for _ in 0..130 {
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+    }
+    cancellation.cancel();
+    run.await
+        .expect("run completes")
+        .expect("clean cancellation");
+    let started = attempts.load(Ordering::SeqCst);
+    assert!(
+        started >= 5,
+        "backoff must reset after healthy establishment, saw {started} sessions"
+    );
 }
 
 fn test_config() -> &'static str {

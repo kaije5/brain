@@ -198,9 +198,14 @@ pub struct ReqwestOpenAiTransport {
 
 impl Default for ReqwestOpenAiTransport {
     fn default() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        let client = reqwest::Client::builder()
+            // Prompts must never leave the configured loopback endpoint: no ambient proxy may
+            // observe them and no 307/308 redirect may replay the POST body elsewhere.
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .expect("statically valid transport client configuration");
+        Self { client }
     }
 }
 
@@ -345,6 +350,75 @@ fn map_transport_error(error: TransportError) -> ApplicationError {
         TransportError::ResponseTooLarge => ApplicationError::MalformedModelOutput {
             reason: "provider response exceeded configured byte limit",
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::timeout,
+    };
+
+    use super::{OpenAiTransport, ReqwestOpenAiTransport};
+
+    #[tokio::test]
+    async fn redirects_are_not_followed_and_request_bodies_are_not_replayed() {
+        let target = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("target listener");
+        let redirector = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirector listener");
+        let redirector_addr = redirector.local_addr().expect("redirector address");
+        let target_addr = target.local_addr().expect("target address");
+
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = redirector.accept().await.expect("transport connects");
+            let mut request = vec![0_u8; 4096];
+            let received = socket.read(&mut request).await.expect("request bytes");
+            request.truncate(received);
+            let location = format!("http://{target_addr}/chat/completions");
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("redirect written");
+            request
+        });
+
+        let transport = ReqwestOpenAiTransport::default();
+        let body =
+            json!({"model": "local", "messages": [{"role": "user", "content": "secret-prompt"}]});
+        let result = transport
+            .post_json(
+                &format!("http://{redirector_addr}/chat/completions"),
+                body,
+                Duration::from_secs(5),
+                1024 * 1024,
+            )
+            .await;
+
+        let sent = responder.await.expect("redirector task");
+        let sent = String::from_utf8(sent).expect("ASCII HTTP request");
+        assert!(
+            sent.contains("secret-prompt"),
+            "body reached the loopback redirector"
+        );
+        // The 307 response is returned as-is rather than followed: its empty body is all the
+        // transport sees, and the redirect target must never receive a connection.
+        assert!(result.is_ok());
+        let redirect_targeted = timeout(Duration::from_millis(300), target.accept()).await;
+        assert!(
+            redirect_targeted.is_err(),
+            "redirect target must not receive the replayed request"
+        );
     }
 }
 
