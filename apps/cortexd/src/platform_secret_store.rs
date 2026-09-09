@@ -47,3 +47,49 @@ fn keyring_target(reference: &SecretRef) -> Result<(&str, &str), ApplicationErro
         }),
     }
 }
+
+impl PlatformSecretStore {
+    /// Resolves the raw credential value for one reference. This is the
+    /// composition-root exception to the `SecretStore` contract: the value is
+    /// returned (zeroized on drop) so the daemon can authenticate provider
+    /// transports, and it must never be logged, serialized, or stored.
+    ///
+    /// # Errors
+    /// Returns a redacted error when the platform store rejects the read.
+    pub fn resolve_value(
+        &self,
+        reference: &SecretRef,
+    ) -> Result<zeroize::Zeroizing<String>, ApplicationError> {
+        #[cfg(windows)]
+        {
+            let (service, username) = keyring_target(reference)?;
+            let store = windows_native_keyring_store::Store::new()
+                .map_err(|_| ApplicationError::Internal)?;
+            let entry = store
+                .build(service, username, None)
+                .map_err(|_| ApplicationError::Internal)?;
+            let credential = entry.get_secret().map_err(|_| ApplicationError::Internal)?;
+            Ok(zeroize::Zeroizing::new(
+                String::from_utf8_lossy(&credential).into_owned(),
+            ))
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = reference;
+            Err(ApplicationError::Internal)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_value_reads_the_imported_nim_credential() {
+        let reference = SecretRef::new("keyring:cortexd/nim").expect("valid reference");
+        let value = PlatformSecretStore.resolve_value(&reference);
+        assert!(value.is_ok(), "keyring read failed: {value:?}");
+    }
+}

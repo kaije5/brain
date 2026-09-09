@@ -282,14 +282,16 @@ fn profile_and_secret(profiles: &[ProviderProfile], profile_id: &str) -> Option<
 
 /// Resolves the settings' default model profile through the SCRUM-41 runtime
 /// router: fresh NIM discovery builds the capability catalog, then the
-/// deterministic agent-role policy selects the model. Bearer credentials are
-/// resolved by the daemon composition root; discovery runs keyless today.
+/// deterministic agent-role policy selects the model. The bearer credential
+/// is resolved once by the daemon composition root (from the profile's
+/// `SecretRef`) and crosses only the transport boundary.
 ///
 /// Discovery and probes talk to the configured endpoint; failures surface as
 /// [`ModelResolution::Degraded`] rather than blocking deterministic operation.
 pub async fn resolve_default_model<T: NimTransport>(
     settings: Option<&LocalSettings>,
     transport: T,
+    bearer: Option<&str>,
 ) -> ModelResolution {
     let Some(settings) = settings else {
         return ModelResolution::Disabled;
@@ -322,7 +324,7 @@ pub async fn resolve_default_model<T: NimTransport>(
         };
     };
     let Ok(catalog) = NimDiscovery::new(discovery_config, transport)
-        .refresh(None)
+        .refresh(bearer)
         .await
     else {
         return ModelResolution::Degraded {

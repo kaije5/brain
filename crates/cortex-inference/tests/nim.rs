@@ -123,6 +123,22 @@ fn nim_config_allows_https_and_loopback_http() {
 }
 
 #[tokio::test]
+async fn versioned_base_urls_are_normalized_to_the_deployment_root() {
+    let fake = transport(vec![Ok(models_page(&["zephyr-7b"]))], Vec::new());
+    let config = NimConfig::new("https://integrate.api.nvidia.com/v1", None, TIMEOUT)
+        .expect("versioned base is valid");
+    let discovery = NimDiscovery::new(config, fake.clone());
+
+    discovery.discover(None).await.expect("discovery succeeds");
+
+    let requests = fake.lock().get_requests.clone();
+    assert_eq!(
+        requests[0].0, "https://integrate.api.nvidia.com/v1/models",
+        "a /v1 base must not be joined into /v1/v1/models"
+    );
+}
+
+#[tokio::test]
 async fn discovery_hits_models_endpoint_and_normalizes_ids() {
     let fake = transport(
         vec![Ok(models_page(&[

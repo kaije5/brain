@@ -55,6 +55,12 @@ impl NimConfig {
             path.push('/');
             base_url.set_path(&path);
         }
+        // Accept both deployment-root (`https://host`) and versioned
+        // (`https://host/v1`) bases: endpoint helpers join `v1/...` relative
+        // to the root, so a trailing version segment is normalized away.
+        if let Some(root) = base_url.path().strip_suffix("/v1/") {
+            base_url.set_path(&format!("{root}/"));
+        }
         if timeout.is_zero() {
             return Err(ApplicationError::Validation { field: "timeout" });
         }
@@ -239,10 +245,10 @@ impl<T: NimTransport> NimDiscovery<T> {
             .await
         {
             Ok(_) => Ok(true),
-            // A 4xx-style rejection from the endpoint means the model or
-            // deployment refused the capability; unavailable backends are
-            // surfaced as failures instead of silently recorded ineligibility.
-            Err(TransportError::Unavailable) => Ok(false),
+            // A 4xx-style rejection or an over-budget probe means this model
+            // did not demonstrate the capability; one slow model must not
+            // degrade the whole catalog refresh.
+            Err(TransportError::Unavailable | TransportError::Timeout) => Ok(false),
             Err(error) => Err(map_transport_error(error)),
         }
     }

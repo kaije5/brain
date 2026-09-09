@@ -19,6 +19,7 @@ struct FakeTransport {
 #[derive(Clone)]
 struct RecordedRequest {
     endpoint: String,
+    bearer: Option<String>,
     _body: Value,
     _timeout: Duration,
     _max_response_bytes: usize,
@@ -45,6 +46,18 @@ impl FakeTransport {
         self.requests.lock().map_or(0, |requests| requests.len())
     }
 
+    fn recordedbearers(&self) -> Vec<Option<String>> {
+        self.requests.lock().map_or_else(
+            |_| Vec::new(),
+            |requests| {
+                requests
+                    .iter()
+                    .map(|request| request.bearer.clone())
+                    .collect()
+            },
+        )
+    }
+
     fn requested_endpoints(&self) -> Vec<String> {
         self.requests.lock().map_or_else(
             |_| Vec::new(),
@@ -62,6 +75,7 @@ impl OpenAiTransport for FakeTransport {
     async fn post_json(
         &self,
         endpoint: &str,
+        bearer: Option<&str>,
         body: Value,
         timeout: Duration,
         max_response_bytes: usize,
@@ -71,6 +85,7 @@ impl OpenAiTransport for FakeTransport {
             .map_err(|_| TransportError::Unavailable)?
             .push(RecordedRequest {
                 endpoint: endpoint.to_owned(),
+                bearer: bearer.map(str::to_owned),
                 _body: body,
                 _timeout: timeout,
                 _max_response_bytes: max_response_bytes,
@@ -277,4 +292,24 @@ fn invalid_provider_configuration_is_rejected_before_transport() {
         ),
         Err(ApplicationError::Validation { field: "model" })
     ));
+}
+
+#[tokio::test]
+async fn resolvedbearer_crosses_the_transport_boundary() {
+    let transport = FakeTransport::returning(Ok(json!({
+        "choices": [{
+            "message": { "role": "assistant", "content": "ok" },
+            "finish_reason": "stop",
+        }],
+    })));
+    let provider = OpenAiCompatibleProvider::with_transport(config(), transport.clone())
+        .with_bearer(Some("nvapi-test-key".to_owned()));
+    provider.complete(request()).await.expect("completion ok");
+    let recorded = transport.recordedbearers();
+    assert!(
+        recorded
+            .iter()
+            .all(|bearer| bearer.as_deref() == Some("nvapi-test-key")),
+        "every request must carry the resolved bearer"
+    );
 }

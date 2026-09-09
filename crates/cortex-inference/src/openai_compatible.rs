@@ -69,10 +69,12 @@ pub struct OpenAiCompatibleConfig {
 }
 
 impl OpenAiCompatibleConfig {
-    /// Validates a local endpoint, model identifier, opaque secret reference, and timeout.
+    /// Validates the endpoint, model identifier, opaque secret reference, and timeout.
     ///
     /// # Errors
-    /// Returns a safe validation error for malformed or non-loopback configuration.
+    /// Returns a safe validation error for malformed endpoints. Loopback may
+    /// use cleartext HTTP; any remote endpoint must use HTTPS, matching the
+    /// NIM discovery adapter's transport boundary.
     pub fn new(
         base_url: impl AsRef<str>,
         model: impl Into<String>,
@@ -85,9 +87,10 @@ impl OpenAiCompatibleConfig {
         let valid_scheme = matches!(base_url.scheme(), "http" | "https");
         let valid_authority = base_url.username().is_empty() && base_url.password().is_none();
         let loopback = base_url.host_str().is_some_and(is_loopback_host);
+        let remote_https = base_url.scheme() == "https";
         if !valid_scheme
             || !valid_authority
-            || !loopback
+            || !(loopback || remote_https)
             || base_url.query().is_some()
             || base_url.fragment().is_some()
         {
@@ -184,6 +187,7 @@ pub trait OpenAiTransport: Send + Sync {
     async fn post_json(
         &self,
         endpoint: &str,
+        bearer: Option<&str>,
         body: Value,
         timeout: Duration,
         max_response_bytes: usize,
@@ -213,15 +217,18 @@ impl OpenAiTransport for ReqwestOpenAiTransport {
     async fn post_json(
         &self,
         endpoint: &str,
+        bearer: Option<&str>,
         body: Value,
         timeout: Duration,
         max_response_bytes: usize,
     ) -> Result<Vec<u8>, TransportError> {
-        let mut response = self
-            .client
-            .post(endpoint)
-            .timeout(timeout)
-            .json(&body)
+        let mut request = self.client.post(endpoint).timeout(timeout).json(&body);
+        if let Some(value) = bearer.and_then(|token| {
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).ok()
+        }) {
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|error| classify_reqwest_error(&error))?
@@ -264,6 +271,7 @@ fn classify_reqwest_error(error: &reqwest::Error) -> TransportError {
 #[derive(Clone)]
 pub struct OpenAiCompatibleProvider<T = ReqwestOpenAiTransport> {
     config: OpenAiCompatibleConfig,
+    bearer: Option<String>,
     transport: T,
 }
 
@@ -272,6 +280,7 @@ impl OpenAiCompatibleProvider<ReqwestOpenAiTransport> {
     pub fn new(config: OpenAiCompatibleConfig) -> Self {
         Self {
             config,
+            bearer: None,
             transport: ReqwestOpenAiTransport::default(),
         }
     }
@@ -280,12 +289,29 @@ impl OpenAiCompatibleProvider<ReqwestOpenAiTransport> {
 impl<T> OpenAiCompatibleProvider<T> {
     #[must_use]
     pub const fn with_transport(config: OpenAiCompatibleConfig, transport: T) -> Self {
-        Self { config, transport }
+        Self {
+            config,
+            bearer: None,
+            transport,
+        }
+    }
+
+    /// Attaches the resolved bearer credential for authenticated providers.
+    /// The value is held only for the process lifetime and is never exposed
+    /// through `Debug` or accessors.
+    #[must_use]
+    pub fn with_bearer(mut self, bearer: Option<String>) -> Self {
+        self.bearer = bearer;
+        self
     }
 
     #[must_use]
     pub const fn config(&self) -> &OpenAiCompatibleConfig {
         &self.config
+    }
+
+    fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
     }
 }
 
@@ -302,6 +328,7 @@ where
             .transport
             .post_json(
                 self.config.chat_endpoint(),
+                self.bearer(),
                 body,
                 self.config.timeout,
                 self.config.limits.response_bytes,
@@ -326,6 +353,7 @@ where
             .transport
             .post_json(
                 self.config.embedding_endpoint(),
+                self.bearer(),
                 json!({
                     "model": self.config.model,
                     "input": text,
@@ -399,6 +427,7 @@ mod tests {
         let result = transport
             .post_json(
                 &format!("http://{redirector_addr}/chat/completions"),
+                None,
                 body,
                 Duration::from_secs(5),
                 1024 * 1024,

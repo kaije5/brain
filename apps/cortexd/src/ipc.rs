@@ -358,9 +358,13 @@ impl LocalDaemon {
             config
                 .model_config
                 .map_or(DaemonEmbeddingProvider::Unavailable, |provider| {
-                    DaemonEmbeddingProvider::Configured(Arc::new(OpenAiCompatibleProvider::new(
-                        provider,
-                    )))
+                    let bearer = config
+                        .inference_bearer
+                        .as_ref()
+                        .map(|credential| credential.expose().to_owned());
+                    DaemonEmbeddingProvider::Configured(Arc::new(
+                        OpenAiCompatibleProvider::new(provider).with_bearer(bearer),
+                    ))
                 });
         let service = Arc::new(ApplicationService::new(
             GrantPolicy::new(grants.iter().copied()),

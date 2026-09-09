@@ -16,6 +16,29 @@ const MODEL_RESPONSE_BYTES: usize = 64 * 1024;
 const MODEL_EMBEDDING_INPUT_BYTES: usize = 32 * 1024;
 const MODEL_EMBEDDING_DIMENSIONS: usize = 4096;
 
+/// Raw inference credential held only by the daemon process. `Debug` is
+/// redacted so the value can never reach logs or diagnostics.
+#[derive(Clone, Default)]
+pub struct InferenceBearer(String);
+
+impl InferenceBearer {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for InferenceBearer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("InferenceBearer([redacted])")
+    }
+}
+
 /// Configuration owned locally by the daemon process, never by an IPC caller.
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -24,6 +47,7 @@ pub struct DaemonConfig {
     pub(crate) workspace_id: WorkspaceId,
     pub(crate) principal_id: PrincipalId,
     pub(crate) inference_secret: Option<SecretRef>,
+    pub(crate) inference_bearer: Option<InferenceBearer>,
     pub(crate) model_config: Option<OpenAiCompatibleConfig>,
     pub(crate) pairing_verifier: VerifyingKey,
     pub(crate) pairing_signer: SigningKey,
@@ -60,6 +84,7 @@ impl DaemonConfig {
             workspace_id,
             principal_id,
             inference_secret: None,
+            inference_bearer: None,
             model_config: None,
             pairing_verifier: signer.verifying_key(),
             pairing_signer: signer,
@@ -129,6 +154,7 @@ impl DaemonConfig {
                 principal_id: PrincipalId::try_from(discovery.principal_id)
                     .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
                 inference_secret: None,
+                inference_bearer: None,
                 model_config: None,
                 pairing_verifier,
                 pairing_signer,
@@ -202,6 +228,14 @@ impl DaemonConfig {
     #[must_use]
     pub fn with_model_config(mut self, config: OpenAiCompatibleConfig) -> Self {
         self.model_config = Some(config);
+        self
+    }
+
+    /// Attaches the resolved inference credential for authenticated providers.
+    /// Held only for the process lifetime; `Debug` stays redacted.
+    #[must_use]
+    pub fn with_inference_bearer(mut self, bearer: Option<InferenceBearer>) -> Self {
+        self.inference_bearer = bearer;
         self
     }
 
