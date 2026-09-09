@@ -825,6 +825,7 @@ fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
     match &app.settings {
         None => lines.push(Line::from("settings unavailable")),
         Some(summary) => {
+            lines.push(Line::from("e: edit settings"));
             lines.push(Line::from(format!("config: {}", summary.config_path)));
             lines.push(Line::from(format!(
                 "default profile: {}",
