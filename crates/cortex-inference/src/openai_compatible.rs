@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use crate::{InferenceMessage, InferenceProvider, InferenceRequest, InferenceResponse, ToolCall};
 
 const MAX_MODEL_NAME_BYTES: usize = 256;
-const MAX_CONFIGURED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_CONFIGURED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONFIGURED_EMBEDDING_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CONFIGURED_EMBEDDING_DIMENSIONS: usize = 1024 * 1024;
 
@@ -343,7 +343,7 @@ where
     }
 }
 
-fn map_transport_error(error: TransportError) -> ApplicationError {
+pub(crate) fn map_transport_error(error: TransportError) -> ApplicationError {
     match error {
         TransportError::Timeout => ApplicationError::InferenceTimeout,
         TransportError::Unavailable => ApplicationError::InferenceUnavailable,
