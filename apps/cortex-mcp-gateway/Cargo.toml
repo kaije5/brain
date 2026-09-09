@@ -1,0 +1,33 @@
+[package]
+name = "cortex-mcp-gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = "0.8"
+cortex-domain = { path = "../../crates/cortex-domain" }
+cortex-mcp = { path = "../../crates/cortex-mcp" }
+cortexd = { path = "../cortexd" }
+http = "1.4"
+http-body-util = "0.1"
+jsonwebtoken = { version = "11.0", default-features = false, features = ["rust_crypto", "use_pem"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "test-util", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = "0.7"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+url = "2.5"
+uuid = { version = "1.24", features = ["serde", "v7"] }
+webpki-roots = "1.0"
+
+[dev-dependencies]
+tempfile = "3.23"
