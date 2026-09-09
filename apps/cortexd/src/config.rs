@@ -101,6 +101,12 @@ impl DaemonConfig {
         if database_path.as_os_str().is_empty() {
             return Err(crate::DaemonError::InvalidConfiguration);
         }
+        if let Some(parent) = database_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+        }
         let discovery_path = database_path.with_extension("cortexd-discovery.json");
         let pairing_key_path = pairing_key_path(&discovery_path);
         if discovery_path.exists() {

@@ -79,7 +79,8 @@ async fn daemon_stops_cleanly_when_shutdown_is_requested() {
 #[tokio::test]
 async fn file_backed_configuration_discovers_the_same_owner_and_endpoint_after_restart() {
     let directory = TempDir::new().expect("temporary directory should be available");
-    let database_path = directory.path().join("cortex.db");
+    let database_path = directory.path().join("new").join("data").join("cortex.db");
+    assert!(!database_path.parent().expect("parent").exists());
     let first = LocalDaemon::start(
         DaemonConfig::from_database_path(database_path.clone()).expect("config"),
     )
