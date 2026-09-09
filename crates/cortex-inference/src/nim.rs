@@ -10,6 +10,7 @@ use crate::{
 };
 
 const MAX_DISCOVERED_MODELS: usize = 128;
+const PROBE_CONCURRENCY: usize = 8;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = MAX_CONFIGURED_RESPONSE_BYTES;
 const PROBE_MAX_TOKENS: u32 = 1;
 
@@ -275,16 +276,27 @@ impl<T: NimTransport> NimDiscovery<T> {
     }
 
     /// Refreshes the capability catalog: discovery followed by bounded
-    /// probing of every discovered model. Failures surface as typed errors
-    /// so callers keep their previous catalog without fabricating evidence.
+    /// probing of every discovered model. Probes run with bounded concurrency
+    /// so large hosted catalogs do not stretch daemon startup; failures
+    /// surface as typed errors so callers keep their previous catalog
+    /// without fabricating evidence.
     ///
     /// # Errors
     /// Returns typed inference failures; never invents eligibility.
     pub async fn refresh(&self, bearer: Option<&str>) -> Result<ModelCatalog, ApplicationError> {
         let discovered = self.discover(bearer).await?;
         let mut probed = Vec::with_capacity(discovered.len());
-        for model in discovered {
-            probed.push(self.probe_model(model, bearer).await?);
+        for chunk in discovered.chunks(PROBE_CONCURRENCY) {
+            let mut results = futures::future::join_all(
+                chunk
+                    .iter()
+                    .cloned()
+                    .map(|model| self.probe_model(model, bearer)),
+            )
+            .await;
+            for result in results.drain(..) {
+                probed.push(result?);
+            }
         }
         Ok(ModelCatalog::new(probed))
     }

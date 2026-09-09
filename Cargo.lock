@@ -423,6 +423,7 @@ dependencies = [
  "chrono",
  "cortex-application",
  "cortex-domain",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
