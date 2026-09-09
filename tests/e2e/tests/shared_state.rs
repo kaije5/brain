@@ -1,13 +1,13 @@
 mod support;
 
 #[cfg(windows)]
-use support::assert_deployed_daemon_rejects_missing_model_secret;
+use support::assert_deployed_daemon_degrades_on_missing_model_secret;
 use support::{Harness, configure_model_secret_for_platform};
 
 #[cfg(windows)]
 #[tokio::test]
-async fn deployed_model_secret_reference_must_resolve_before_startup() {
-    assert_deployed_daemon_rejects_missing_model_secret().await;
+async fn deployed_model_secret_reference_failure_degrades_explicitly() {
+    assert_deployed_daemon_degrades_on_missing_model_secret().await;
 }
 
 #[cfg(windows)]

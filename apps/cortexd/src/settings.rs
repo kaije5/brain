@@ -253,6 +253,8 @@ pub enum ModelResolution {
         config: OpenAiCompatibleConfig,
         /// The durable routing decision, for diagnostics only.
         route: RoutedModel,
+        /// Every model id discovered on the profile, for client selection.
+        models: Vec<String>,
     },
     /// A configured profile could not produce an eligible model. The daemon
     /// starts and reports the degraded state; it never falls back silently.
@@ -323,10 +325,10 @@ pub async fn resolve_default_model<T: NimTransport>(
             secret: profile_and_secret(&profiles, &profile_id),
         };
     };
-    let Ok(catalog) = NimDiscovery::new(discovery_config, transport)
+    let catalog = NimDiscovery::new(discovery_config, transport)
         .refresh(bearer)
-        .await
-    else {
+        .await;
+    let Ok(catalog) = catalog else {
         return ModelResolution::Degraded {
             reason: "provider_unavailable",
             secret: profile_and_secret(&profiles, &profile_id),
@@ -365,6 +367,11 @@ pub async fn resolve_default_model<T: NimTransport>(
             secret: profile_and_secret(&profiles, &profile_id),
         };
     };
+    let discovered = catalog
+        .models()
+        .iter()
+        .map(|model| model.model_id().as_str().to_owned())
+        .collect();
     match OpenAiCompatibleConfig::new(
         routed_base_url,
         route.model_id.as_str(),
@@ -372,7 +379,11 @@ pub async fn resolve_default_model<T: NimTransport>(
         MODEL_TIMEOUT,
         limits,
     ) {
-        Ok(config) => ModelResolution::Configured { config, route },
+        Ok(config) => ModelResolution::Configured {
+            config,
+            route,
+            models: discovered,
+        },
         Err(_) => ModelResolution::Degraded {
             reason: "invalid_model_config",
             secret: routed_secret,

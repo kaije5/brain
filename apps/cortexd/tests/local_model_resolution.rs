@@ -72,7 +72,7 @@ async fn default_profile_resolves_through_the_runtime_router() {
     let resolution =
         resolve_default_model(Some(&settings), FakeNimTransport::default(), None).await;
     match resolution {
-        ModelResolution::Configured { config, route } => {
+        ModelResolution::Configured { config, route, .. } => {
             assert_eq!(route.profile_id.as_str(), "local");
             assert_eq!(route.model_id.as_str(), "model-a");
             assert_eq!(config.model(), "model-a");

@@ -118,7 +118,8 @@ pub struct LocalDaemon {
     migrations_applied: bool,
     service: Arc<DaemonService>,
     search: Arc<DaemonSearch>,
-    embedding_provider: DaemonEmbeddingProvider,
+    embedding_provider: SharedEmbeddingProvider,
+    discovered_models: Arc<std::sync::RwLock<Vec<String>>>,
     grants: BTreeSet<CapabilityGrant>,
     audit: SqliteAuditPort,
 }
@@ -131,10 +132,11 @@ struct ClientVerifier {
 
 type DaemonService =
     ApplicationService<GrantPolicy, SqliteRepositories, OperationStore, SqliteAuditPort>;
-type DaemonSearch = HybridSearchService<SqliteRepositories, DaemonEmbeddingProvider>;
+type DaemonSearch = HybridSearchService<SqliteRepositories, SharedEmbeddingProvider>;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 enum DaemonEmbeddingProvider {
+    #[default]
     Unavailable,
     Configured(Arc<OpenAiCompatibleProvider<ReqwestOpenAiTransport>>),
 }
@@ -161,6 +163,38 @@ impl cortex_inference::InferenceProvider for DaemonEmbeddingProvider {
                 cortex_inference::InferenceProvider::complete(provider.as_ref(), request).await
             }
         }
+    }
+}
+
+/// Model provider shared between the search service and the agent loop.
+/// The daemon starts with [`DaemonEmbeddingProvider::Unavailable`] and
+/// installs the resolved provider once background model resolution
+/// completes, so IPC availability never waits on catalog probing.
+#[derive(Clone, Default)]
+struct SharedEmbeddingProvider(Arc<std::sync::RwLock<DaemonEmbeddingProvider>>);
+
+impl SharedEmbeddingProvider {
+    fn install(&self, provider: DaemonEmbeddingProvider) {
+        *self.0.write().expect("provider lock") = provider;
+    }
+
+    fn current(&self) -> DaemonEmbeddingProvider {
+        self.0.read().expect("provider lock").clone()
+    }
+}
+
+impl cortex_application::EmbeddingProvider for SharedEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<cortex_application::Embedding, ApplicationError> {
+        cortex_application::EmbeddingProvider::embed(&self.current(), text).await
+    }
+}
+
+impl cortex_inference::InferenceProvider for SharedEmbeddingProvider {
+    async fn complete(
+        &self,
+        request: cortex_inference::InferenceRequest,
+    ) -> Result<cortex_inference::InferenceResponse, ApplicationError> {
+        cortex_inference::InferenceProvider::complete(&self.current(), request).await
     }
 }
 
@@ -354,18 +388,16 @@ impl LocalDaemon {
                 CapabilityGrant::new(config.workspace_id, client.principal_id, capability)
             }));
         }
-        let embedding_provider =
-            config
-                .model_config
-                .map_or(DaemonEmbeddingProvider::Unavailable, |provider| {
-                    let bearer = config
-                        .inference_bearer
-                        .as_ref()
-                        .map(|credential| credential.expose().to_owned());
-                    DaemonEmbeddingProvider::Configured(Arc::new(
-                        OpenAiCompatibleProvider::new(provider).with_bearer(bearer),
-                    ))
-                });
+        let embedding_provider = SharedEmbeddingProvider::default();
+        if let Some(provider) = config.model_config {
+            let bearer = config
+                .inference_bearer
+                .as_ref()
+                .map(|credential| credential.expose().to_owned());
+            embedding_provider.install(DaemonEmbeddingProvider::Configured(Arc::new(
+                OpenAiCompatibleProvider::new(provider).with_bearer(bearer),
+            )));
+        }
         let service = Arc::new(ApplicationService::new(
             GrantPolicy::new(grants.iter().copied()),
             repositories.clone(),
@@ -387,10 +419,39 @@ impl LocalDaemon {
                 repositories,
                 embedding_provider.clone(),
             )),
-            embedding_provider,
+            embedding_provider: embedding_provider.clone(),
+            discovered_models: Arc::new(std::sync::RwLock::new(Vec::new())),
             grants,
             audit,
         })
+    }
+
+    /// Installs the resolved model provider and discovered catalog after
+    /// startup, upgrading inference from its explicit unavailable state
+    /// without blocking IPC availability (SCRUM-76).
+    pub fn install_resolved_model(
+        &self,
+        config: cortex_inference::OpenAiCompatibleConfig,
+        bearer: Option<String>,
+        models: Vec<String>,
+    ) {
+        self.embedding_provider
+            .install(DaemonEmbeddingProvider::Configured(Arc::new(
+                OpenAiCompatibleProvider::new(config).with_bearer(bearer),
+            )));
+        if let Ok(mut catalog) = self.discovered_models.write() {
+            *catalog = models;
+        }
+    }
+
+    /// The discovered model catalog when background resolution completed;
+    /// empty while resolution is pending, disabled, or degraded.
+    #[must_use]
+    pub fn discovered_models(&self) -> Vec<String> {
+        self.discovered_models
+            .read()
+            .map(|models| models.clone())
+            .unwrap_or_default()
     }
 
     /// Reports whether ordered `SQLite` migrations completed before service availability.
@@ -464,6 +525,7 @@ impl LocalDaemon {
             "cortex_daemon_logs" => {
                 Ok(self.diagnostic_response(principal_id, correlation_id, "logs"))
             }
+            "cortex_model_list" => Ok(self.model_list_response(correlation_id)),
             "cortex_remote_enroll" => self.enroll_remote_principal(principal_id, request).await,
             "cortex_knowledge_search" | "cortex_note_search" | "cortex_memory_search" => {
                 self.search_knowledge(principal_id, request).await
@@ -1001,6 +1063,20 @@ impl LocalDaemon {
                 .is_ok()
                 .then_some(client.principal_id)
         })
+    }
+
+    /// The discovered model catalog for client-side model selection.
+    /// Empty while background resolution is pending, disabled, or degraded.
+    fn model_list_response(&self, request_id: Uuid) -> DaemonResponse {
+        DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: WireResult::Success {
+                value: json!({
+                    "models": self.discovered_models(),
+                }),
+            },
+        }
     }
 
     fn diagnostic_response(

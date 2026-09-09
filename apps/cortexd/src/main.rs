@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use cortexd::{
-    DaemonConfig, InferenceBearer, LocalDaemon, LocalSettings, ModelResolution,
-    PlatformSecretStore, data_directory, default_database_path, resolve_default_model,
+    DaemonConfig, LocalDaemon, LocalSettings, ModelResolution, PlatformSecretStore, data_directory,
+    default_database_path, resolve_default_model,
 };
 use tokio::sync::watch;
 
@@ -28,35 +28,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .and_then(LocalSettings::database_override)
         .map_or_else(default_database_path, |name| directory.join(name));
-    let mut config = DaemonConfig::from_local_settings(database_path, settings.as_ref())?;
-    let transport = cortexd::ReqwestNimTransport::default();
-    // Composition root: resolve the default profile's credential once so
-    // discovery and the configured provider authenticate against hosted
-    // endpoints. The value never leaves this process.
-    let credential = match default_profile_secret(settings.as_ref()) {
-        Some(reference) => PlatformSecretStore.resolve_value(&reference).ok(),
-        None => None,
-    }
-    .map(|value| value.as_str().to_owned());
-    let bearer = credential.as_deref();
-    match resolve_default_model(settings.as_ref(), transport, bearer).await {
-        ModelResolution::Disabled => {}
-        ModelResolution::Configured { config: model, .. } => {
-            config = config
-                .with_model_config(model)
-                .with_inference_bearer(bearer.map(str::to_owned).map(InferenceBearer::new));
+    let config = DaemonConfig::from_local_settings(database_path, settings.as_ref())?;
+    let daemon = Arc::new(LocalDaemon::start(config).await?);
+    let (shutdown_sender, shutdown) = watch::channel(false);
+    let server = tokio::spawn(daemon.clone().serve(shutdown));
+
+    // Composition root (SCRUM-76): model resolution runs in the background so
+    // the IPC server accepts requests immediately; deterministic capabilities
+    // work while the provider catalog is still being probed, and inference
+    // upgrades in place once resolution completes. The credential is resolved
+    // once here and never leaves this process.
+    let resolve_settings = settings.clone();
+    let resolve_daemon = daemon.clone();
+    tokio::spawn(async move {
+        let credential = match default_profile_secret(resolve_settings.as_ref()) {
+            Some(reference) => PlatformSecretStore.resolve_value(&reference).ok(),
+            None => None,
         }
-        ModelResolution::Degraded { reason, secret } => {
-            eprintln!("cortexd: model inference degraded: {reason}");
-            if let Some(reference) = secret {
-                config = config.with_inference_secret(reference);
+        .map(|value| value.as_str().to_owned());
+        let bearer = credential.as_deref();
+        match resolve_default_model(
+            resolve_settings.as_ref(),
+            cortexd::ReqwestNimTransport::default(),
+            bearer,
+        )
+        .await
+        {
+            ModelResolution::Disabled => {}
+            ModelResolution::Configured { config, models, .. } => {
+                resolve_daemon.install_resolved_model(config, bearer.map(str::to_owned), models);
+            }
+            ModelResolution::Degraded { reason, .. } => {
+                eprintln!("cortexd: model inference degraded: {reason}");
             }
         }
-    }
-    let daemon =
-        Arc::new(LocalDaemon::start_with_secret_store(config, &PlatformSecretStore).await?);
-    let (shutdown_sender, shutdown) = watch::channel(false);
-    let server = tokio::spawn(daemon.serve(shutdown));
+    });
+
     tokio::signal::ctrl_c().await?;
     shutdown_sender.send(true)?;
     server.await??;
