@@ -637,3 +637,27 @@ async fn task_update_preserves_due_date_null_alongside_title_change() {
     assert_eq!(service.payloads()[0]["title"], "new title");
     assert_eq!(service.payloads()[0]["due_at"], Value::Null);
 }
+
+#[tokio::test]
+async fn provider_failure_fails_the_turn_safely_without_side_effects() {
+    let provider = Arc::new(FakeProvider {
+        responses: Mutex::new(VecDeque::from([Err(
+            ApplicationError::InferenceUnavailable,
+        )])),
+        requests: Mutex::new(Vec::new()),
+        delay: Duration::ZERO,
+    });
+    let service = Arc::new(RecordingService::default());
+    let runner = AgentRunner::new(
+        Arc::clone(&provider),
+        Arc::clone(&service),
+        limits(3, Duration::from_secs(1)),
+    );
+
+    let outcome = runner
+        .run(context(), "remember x", allowed([Capability::NoteCreate]))
+        .await;
+
+    assert_eq!(outcome, Err(ApplicationError::InferenceUnavailable));
+    assert_eq!(service.recorded_calls(), 0, "no tool executes when the provider fails");
+}
