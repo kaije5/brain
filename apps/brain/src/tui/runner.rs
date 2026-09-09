@@ -156,7 +156,25 @@ fn handle_settings_enter(app: &mut App) {
         return;
     };
     if editor.pending_purpose().is_some() || editor.pending_confirm().is_some() {
+        // Confirming an API key or endpoint URL completes a usable profile,
+        // so the draft persists immediately instead of waiting for `w`.
+        let autosave = matches!(
+            editor.pending_purpose(),
+            Some(super::TextPurpose::Secret(_) | super::TextPurpose::BaseUrl(_))
+        );
         let _ = app.confirm_text_with_store(&crate::local_ops::PlatformSecretWriter);
+        if autosave
+            && app
+                .settings_editor()
+                .is_some_and(|editor| editor.error().is_none())
+            && let Err(message) = app.save_settings()
+        {
+            app.set_status_line(format!("settings: {message}"));
+        }
+        return;
+    }
+    if editor.provider_picker().is_some() {
+        app.select_provider();
         return;
     }
     if editor.cursor() == 0 {
@@ -179,6 +197,7 @@ fn handle_settings_char(app: &mut App, character: char) {
     }
     match character {
         'n' => app.begin_text(super::TextPurpose::NewProfileId),
+        'a' => app.open_provider_picker(),
         'i' => {
             if let Some(index) = editor.cursor().checked_sub(1)
                 && let Some(profile) = editor.profiles().get(index)
@@ -381,11 +400,15 @@ fn handle_settings_prompt(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
     // must not escape the prompt or mutate the profile behind it.
     if app.tab == Tab::Settings
         && let Some(editor) = app.settings_editor()
-        && (editor.pending_purpose().is_some() || editor.pending_confirm().is_some())
+        && (editor.pending_purpose().is_some()
+            || editor.pending_confirm().is_some()
+            || editor.provider_picker().is_some())
     {
         match code {
             KeyCode::Esc => app.cancel_pending(),
             KeyCode::Enter => handle_settings_enter(app),
+            KeyCode::Up if editor.provider_picker().is_some() => app.editor_up(),
+            KeyCode::Down if editor.provider_picker().is_some() => app.editor_down(),
             KeyCode::Backspace => app.editor_text_backspace(),
             KeyCode::Char(c) if text_modifiers(modifiers) => app.editor_text_input(c),
             _ => {}
@@ -486,6 +509,102 @@ mod tests {
         assert_eq!(app.settings_editor().unwrap().cursor(), 0);
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.settings_editor().unwrap().pending_purpose().is_none());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn official_provider_picker_flows_straight_to_the_api_key_prompt() {
+        let mut app = App::new();
+        app.select_tab(Tab::Settings);
+        app.set_settings_summary(SettingsSummary {
+            config_path: "unused-keyboard-test-config".to_owned(),
+            default_profile: None,
+            profiles: Vec::new(),
+            model_status: "ready".to_owned(),
+        });
+        app.start_settings_edit();
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(app.settings_editor().unwrap().provider_picker(), Some(0));
+        // Command letters must not escape the open picker.
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(app.settings_editor().unwrap().provider_picker().is_some());
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let editor = app.settings_editor().unwrap();
+        assert!(matches!(
+            editor.pending_purpose(),
+            Some(TextPurpose::Secret(id)) if id == "nim"
+        ));
+    }
+
+    #[test]
+    fn picker_rejects_a_duplicate_preset_profile() {
+        let mut app = editor();
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let editor = app.settings_editor().unwrap();
+        assert!(editor.provider_picker().is_none());
+        assert!(editor.pending_purpose().is_none());
+        assert!(editor.error().is_some());
+        assert_eq!(editor.profiles().len(), 1);
+    }
+
+    #[test]
+    fn confirming_a_url_saves_the_draft_without_pressing_w() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("cortexd.toml");
+        let mut app = App::new();
+        app.select_tab(Tab::Settings);
+        app.set_settings_summary(SettingsSummary {
+            config_path: path.to_string_lossy().into_owned(),
+            default_profile: Some("nim".to_owned()),
+            profiles: vec![("nim".to_owned(), "https://old.example/v1".to_owned(), true)],
+            model_status: "ready".to_owned(),
+        });
+        app.start_settings_edit();
+        // Cursor row 1: Enter opens the endpoint URL prompt for `nim`.
+        app.editor_down();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        for c in "https://integrate.api.nvidia.com/v1".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let contents = std::fs::read_to_string(&path).expect("draft saved automatically");
+        assert!(contents.contains("https://integrate.api.nvidia.com/v1"));
+        assert!(
+            !app.settings_editor().unwrap().dirty,
+            "the autosave clears the dirty flag"
+        );
+    }
+
+    #[test]
+    fn a_rejected_confirm_does_not_autosave() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("cortexd.toml");
+        let mut app = App::new();
+        app.select_tab(Tab::Settings);
+        app.set_settings_summary(SettingsSummary {
+            config_path: path.to_string_lossy().into_owned(),
+            default_profile: Some("nim".to_owned()),
+            profiles: vec![("nim".to_owned(), "https://old.example/v1".to_owned(), true)],
+            model_status: "ready".to_owned(),
+        });
+        app.start_settings_edit();
+        app.editor_down();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        // Confirming an empty endpoint is rejected; nothing may be written.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!path.exists());
+        assert!(app.settings_editor().unwrap().error().is_some());
+    }
+
+    #[test]
+    fn picker_escape_cancels_without_touching_profiles() {
+        let mut app = editor();
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let editor = app.settings_editor().unwrap();
+        assert!(editor.provider_picker().is_none());
+        assert_eq!(editor.profiles().len(), 1);
         assert!(!app.should_quit());
     }
 

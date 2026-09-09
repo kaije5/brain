@@ -246,6 +246,67 @@ fn invalid_profile_values_are_rejected_without_writing() {
     );
 }
 
+#[test]
+fn official_nim_preset_needs_only_an_api_key() {
+    let directory = TempDir::new().expect("temp dir");
+    let path = directory.path().join("cortexd.toml");
+    let mut app = App::new();
+    app.select_tab(brain::tui::Tab::Settings);
+    app.set_settings_summary(SettingsSummary {
+        config_path: path.to_str().expect("utf8 path").to_owned(),
+        default_profile: None,
+        profiles: Vec::new(),
+        model_status: "resolved by the daemon at startup".to_owned(),
+    });
+    app.start_settings_edit();
+
+    app.open_provider_picker();
+    assert_eq!(app.settings_editor().unwrap().provider_picker(), Some(0));
+    let screen = brain::tui::render_to_string(&app, 100, 30);
+    assert!(screen.contains("NVIDIA NIM"));
+    assert!(screen.contains("https://integrate.api.nvidia.com/v1"));
+
+    app.select_provider();
+    let editor = app.settings_editor().unwrap();
+    assert!(matches!(
+        editor.pending_purpose(),
+        Some(TextPurpose::Secret(id)) if id == "nim"
+    ));
+    for character in "nvapi-test-key".chars() {
+        app.editor_text_input(character);
+    }
+    app.confirm_text_with_store(&RecordingStore)
+        .expect("import ok");
+
+    let editor = app.settings_editor().unwrap();
+    let nim = editor
+        .profiles()
+        .iter()
+        .find(|profile| profile.id == "nim")
+        .expect("preset profile");
+    assert_eq!(nim.base_url, "https://integrate.api.nvidia.com/v1");
+    assert!(nim.enabled);
+    assert_eq!(nim.secret_ref.as_deref(), Some("keyring:cortexd/nim"));
+    assert_eq!(editor.default_profile(), Some("nim"));
+
+    app.save_settings().expect("valid draft saves");
+    let contents = std::fs::read_to_string(&path).expect("config written");
+    assert!(contents.contains("[models.profiles.nim]"));
+    assert!(contents.contains("https://integrate.api.nvidia.com/v1"));
+    assert!(!contents.contains("nvapi-test-key"));
+}
+
+#[test]
+fn official_preset_refuses_to_duplicate_an_existing_profile() {
+    let mut app = app_with_settings();
+    app.start_settings_edit();
+    app.open_provider_picker();
+    app.select_provider();
+    let editor = app.settings_editor().unwrap();
+    assert!(editor.error().is_some());
+    assert_eq!(editor.profiles().len(), 2);
+}
+
 mod local_settings_fixture {
     pub fn text() -> String {
         "[models]\ndefault_profile = \"nim\"\n\n[models.profiles.nim]\nbase_url = \"https://nim.example/v1/\"\n".to_owned()

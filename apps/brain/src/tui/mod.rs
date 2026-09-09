@@ -43,6 +43,28 @@ pub struct SettingsSummary {
     pub model_status: String,
 }
 
+/// A built-in provider adapter the settings editor offers as a preset: the
+/// endpoint is fixed and documented, so the only user input is the API key.
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub base_url: &'static str,
+    pub key_hint: &'static str,
+}
+
+/// Official provider presets. NVIDIA NIM's hosted catalog is `OpenAI`
+/// compatible (`GET /v1/models`, `POST /v1/chat/completions`) at
+/// `integrate.api.nvidia.com/v1`, authenticating with a `nvapi-...` bearer
+/// key issued by build.nvidia.com — the contract the `NimDiscovery` adapter
+/// already implements.
+pub const OFFICIAL_PROVIDERS: [ProviderPreset; 1] = [ProviderPreset {
+    id: "nim",
+    label: "NVIDIA NIM",
+    base_url: "https://integrate.api.nvidia.com/v1",
+    key_hint: "API key (nvapi-...) from build.nvidia.com",
+}];
+
 /// What a pending text edit is for inside the settings editor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextPurpose {
@@ -74,6 +96,7 @@ pub struct SettingsEditor {
     cursor: usize,
     input: Option<(TextPurpose, String)>,
     confirm_delete: Option<String>,
+    provider_picker: Option<usize>,
     error: Option<String>,
     status: Option<String>,
     dirty: bool,
@@ -98,6 +121,7 @@ impl SettingsEditor {
             cursor: 0,
             input: None,
             confirm_delete: None,
+            provider_picker: None,
             error: None,
             status: None,
             dirty: false,
@@ -145,16 +169,30 @@ impl SettingsEditor {
         self.input.as_ref().map(|(purpose, _)| purpose)
     }
 
+    /// Index of the highlighted official provider, when the picker is open.
+    #[must_use]
+    pub const fn provider_picker(&self) -> Option<usize> {
+        self.provider_picker
+    }
+
     fn row_count(&self) -> usize {
         self.profiles.len() + 1
     }
 
     pub fn up(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        if let Some(index) = self.provider_picker.as_mut() {
+            *index = (*index).saturating_sub(1).min(OFFICIAL_PROVIDERS.len() - 1);
+        } else {
+            self.cursor = self.cursor.saturating_sub(1);
+        }
     }
 
     pub fn down(&mut self) {
-        if self.cursor + 1 < self.row_count() {
+        if let Some(index) = self.provider_picker.as_mut() {
+            if *index + 1 < OFFICIAL_PROVIDERS.len() {
+                *index += 1;
+            }
+        } else if self.cursor + 1 < self.row_count() {
             self.cursor += 1;
         }
     }
@@ -181,7 +219,50 @@ impl SettingsEditor {
     pub fn cancel_pending(&mut self) {
         self.input = None;
         self.confirm_delete = None;
+        self.provider_picker = None;
         self.confirm_discard = false;
+    }
+
+    /// Opens the official provider picker. Selecting a preset creates the
+    /// profile with its documented endpoint and jumps straight to the API
+    /// key prompt, so the key is the only required input.
+    pub fn open_provider_picker(&mut self) {
+        if self.provider_picker.is_none() {
+            self.error = None;
+            self.status = None;
+            self.provider_picker = Some(0);
+        }
+    }
+
+    /// Confirms the picker: adds the highlighted preset as a new profile,
+    /// makes it the default when no default exists, and starts the keyring
+    /// import prompt for its API key.
+    pub fn select_provider(&mut self) {
+        let Some(index) = self.provider_picker.take() else {
+            return;
+        };
+        let Some(preset) = OFFICIAL_PROVIDERS.get(index) else {
+            return;
+        };
+        self.error = None;
+        self.status = None;
+        if self.profiles.iter().any(|profile| profile.id == preset.id) {
+            self.error = Some(format!("profile `{}` already exists", preset.id));
+            return;
+        }
+        self.profiles.push(ProfileDraft {
+            id: preset.id.to_owned(),
+            base_url: preset.base_url.to_owned(),
+            enabled: true,
+            secret_ref: None,
+            has_credential: false,
+        });
+        if self.default_profile.is_none() {
+            self.default_profile = Some(preset.id.to_owned());
+        }
+        self.dirty = true;
+        self.cursor = self.row_count() - 1;
+        self.input = Some((TextPurpose::Secret(preset.id.to_owned()), String::new()));
     }
 
     pub fn begin_text(&mut self, purpose: TextPurpose) {
@@ -603,6 +684,18 @@ impl App {
     pub fn begin_delete(&mut self) {
         if let Some(editor) = self.editor.as_mut() {
             editor.begin_delete();
+        }
+    }
+
+    pub fn open_provider_picker(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.open_provider_picker();
+        }
+    }
+
+    pub fn select_provider(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.select_provider();
         }
     }
 
