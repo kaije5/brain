@@ -211,7 +211,7 @@ fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
     if let Some(summary) = &app.settings {
         if summary.profiles.is_empty() {
             lines.push(Line::styled("Set up your first model", accent()));
-            lines.push(Line::from("Press Enter, then n to add a profile and endpoint. Select it to import a token with i; choose the default and save with w."));
+            lines.push(Line::from("Press a to add the official NVIDIA NIM adapter — you only supply an API key from build.nvidia.com. Or press Enter, then n for a custom profile and endpoint."));
         }
         lines.extend([
             Line::from(format!(
@@ -305,7 +305,36 @@ fn render_editor(editor: &SettingsEditor, area: Rect, buffer: &mut Buffer) {
     );
 }
 
+fn render_provider_picker(selected: usize, area: Rect, buffer: &mut Buffer) {
+    let mut lines = vec![Line::styled("Add official provider", accent())];
+    for (index, preset) in super::OFFICIAL_PROVIDERS.iter().enumerate() {
+        let marker = if index == selected { "› " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker}{} ", preset.label),
+                if index == selected {
+                    accent()
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw(preset.base_url),
+        ]));
+        lines.push(Line::from(format!("    {}", preset.key_hint)));
+    }
+    lines.push(Line::from(
+        "Enter: add · only the API key is needed · Esc: cancel",
+    ));
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(area, buffer);
+}
+
 fn render_editor_details(editor: &SettingsEditor, area: Rect, buffer: &mut Buffer) {
+    if let Some(selected) = editor.provider_picker() {
+        render_provider_picker(selected, area, buffer);
+        return;
+    }
     if let Some(purpose) = editor.pending_purpose() {
         let label = match purpose {
             TextPurpose::DefaultProfile => "Default profile id (empty clears)",
@@ -358,11 +387,13 @@ fn render_editor_details(editor: &SettingsEditor, area: Rect, buffer: &mut Buffe
         lines.push(Line::from("Enter: confirm · Esc: cancel"));
     } else {
         lines.push(Line::from(if editor.cursor() == 0 {
-            "Enter: choose default · n: new profile"
+            "Enter: choose default · n: new profile · a: official provider"
         } else {
             "Enter: edit URL · i: import token · t: toggle · d: delete"
         }));
-        lines.push(Line::from("Up/Down: select · n: new · w: save · Esc: back"));
+        lines.push(Line::from(
+            "Up/Down: select · n: new · a: add NVIDIA NIM · w: save · Esc: back",
+        ));
         if let Some(error) = editor.error() {
             lines.push(Line::styled(
                 format!("Error: {error}"),
@@ -390,10 +421,12 @@ fn render_footer(app: &App, area: Rect, buffer: &mut Buffer) {
         Tab::Settings => "Enter: edit/confirm · Esc: back/cancel",
     };
     let navigation = if app.tab == Tab::Settings
-        && app
-            .settings_editor()
-            .is_some_and(|e| e.input.is_some() || e.confirm_delete.is_some() || e.confirm_discard)
-    {
+        && app.settings_editor().is_some_and(|e| {
+            e.input.is_some()
+                || e.confirm_delete.is_some()
+                || e.confirm_discard
+                || e.provider_picker().is_some()
+        }) {
         "Enter: confirm · Esc: cancel · Ctrl+C: quit"
     } else {
         "Tab/Shift+Tab: switch · Ctrl+C: quit"

@@ -84,6 +84,10 @@ Settings prompts keep focus until confirmed or cancelled.
   press `Enter`.
 - **Settings** shows the local `cortexd.toml` values and the daemon's model
   status. Press `Enter` or `e` to edit, then `n` to add a profile and endpoint.
+  Press `a` to add an official provider preset instead: NVIDIA NIM is
+  preconfigured with the hosted `https://integrate.api.nvidia.com/v1`
+  endpoint, so the API key from build.nvidia.com is the only input — the
+  profile becomes the default and the key goes straight into the keyring.
   Use Up/Down to select a row: `Enter` edits the default profile or endpoint,
   `i` imports a masked token into the system keyring, `t` toggles a provider,
   and `d` requests deletion. Press `w` to save; restart the daemon to apply.
