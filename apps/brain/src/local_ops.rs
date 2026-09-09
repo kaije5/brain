@@ -71,7 +71,7 @@ pub fn init_config(database_path: &Path) -> Result<PathBuf, LocalOpError> {
 /// form a safe keyring target, [`LocalOpError::MissingSecret`] for empty
 /// secrets, or [`LocalOpError::StoreUnavailable`] when the platform store
 /// rejects the write.
-pub fn import_secret<W: SecretWriter>(
+pub fn import_secret<W: SecretWriter + ?Sized>(
     store: &W,
     profile: &str,
     secret: &[u8],
@@ -82,6 +82,15 @@ pub fn import_secret<W: SecretWriter>(
     }
     store.write(KEYRING_SERVICE, profile, secret)?;
     Ok(format!("keyring:{KEYRING_SERVICE}/{profile}"))
+}
+
+/// Validates a provider profile identifier for use in `cortexd.toml` and as
+/// a keyring username.
+///
+/// # Errors
+/// Returns a human-readable rejection reason.
+pub fn validate_profile_id(profile: &str) -> Result<(), String> {
+    validate_profile(profile).map_err(|error| error.to_string())
 }
 
 fn validate_profile(profile: &str) -> Result<(), LocalOpError> {

@@ -2,7 +2,9 @@ mod runner;
 
 pub use runner::run_interactive;
 
+use crate::local_ops::{LocalOpError, SecretWriter, import_secret, validate_profile_id};
 use ratatui::{
+    Terminal,
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
@@ -47,6 +49,347 @@ pub struct SettingsSummary {
     pub model_status: String,
 }
 
+/// What a pending text edit is for inside the settings editor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextPurpose {
+    DefaultProfile,
+    NewProfileId,
+    BaseUrl(String),
+    Secret(String),
+}
+
+/// One provider profile row in the editor draft. `has_credential` records
+/// that a keyring credential exists or was just imported; the raw key itself
+/// never enters the draft.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileDraft {
+    pub id: String,
+    pub base_url: String,
+    pub enabled: bool,
+    pub secret_ref: Option<String>,
+    pub has_credential: bool,
+}
+
+/// Draft state for editing the non-secret settings. Pure state machine: all
+/// validation and persistence run through its methods so the flows are fully
+/// testable.
+#[derive(Debug)]
+pub struct SettingsEditor {
+    default_profile: Option<String>,
+    profiles: Vec<ProfileDraft>,
+    cursor: usize,
+    input: Option<(TextPurpose, String)>,
+    confirm_delete: Option<String>,
+    error: Option<String>,
+    status: Option<String>,
+}
+
+impl SettingsEditor {
+    fn from_summary(summary: &SettingsSummary) -> Self {
+        Self {
+            default_profile: summary.default_profile.clone(),
+            profiles: summary
+                .profiles
+                .iter()
+                .map(|(id, base_url, enabled)| ProfileDraft {
+                    id: id.clone(),
+                    base_url: base_url.clone(),
+                    enabled: *enabled,
+                    secret_ref: None,
+                    has_credential: false,
+                })
+                .collect(),
+            cursor: 0,
+            input: None,
+            confirm_delete: None,
+            error: None,
+            status: None,
+        }
+    }
+
+    #[must_use]
+    pub fn default_profile(&self) -> Option<&str> {
+        self.default_profile.as_deref()
+    }
+
+    #[must_use]
+    pub fn profiles(&self) -> &[ProfileDraft] {
+        &self.profiles
+    }
+
+    #[must_use]
+    pub const fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    #[must_use]
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    #[must_use]
+    pub fn pending_text(&self) -> Option<&str> {
+        self.input.as_ref().map(|(_, buffer)| buffer.as_str())
+    }
+
+    #[must_use]
+    pub fn pending_confirm(&self) -> Option<&str> {
+        self.confirm_delete.as_deref()
+    }
+
+    #[must_use]
+    pub fn pending_purpose(&self) -> Option<&TextPurpose> {
+        self.input.as_ref().map(|(purpose, _)| purpose)
+    }
+
+    fn row_count(&self) -> usize {
+        self.profiles.len() + 1
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        if self.cursor + 1 < self.row_count() {
+            self.cursor += 1;
+        }
+    }
+
+    fn selected_profile(&mut self) -> Option<&mut ProfileDraft> {
+        self.profiles.get_mut(self.cursor.saturating_sub(1))
+    }
+
+    pub fn toggle_enabled(&mut self) {
+        if let Some(profile) = self.selected_profile() {
+            profile.enabled = !profile.enabled;
+        }
+    }
+
+    pub fn begin_delete(&mut self) {
+        if self.cursor >= 1
+            && let Some(profile) = self.profiles.get(self.cursor - 1)
+        {
+            self.confirm_delete = Some(profile.id.clone());
+        }
+    }
+
+    pub fn cancel_pending(&mut self) {
+        self.input = None;
+        self.confirm_delete = None;
+    }
+
+    pub fn begin_text(&mut self, purpose: TextPurpose) {
+        self.error = None;
+        self.status = None;
+        self.input = Some((purpose, String::new()));
+    }
+
+    pub fn text_input(&mut self, character: char) {
+        if let Some((_, buffer)) = self.input.as_mut() {
+            buffer.push(character);
+        }
+    }
+
+    pub fn text_backspace(&mut self) {
+        if let Some((_, buffer)) = self.input.as_mut() {
+            buffer.pop();
+        }
+    }
+
+    /// Confirms the pending non-secret text edit. Secret imports must go
+    /// through [`Self::confirm_text_with_store`]; this method refuses them so
+    /// no caller can bypass the keyring flow.
+    pub fn confirm_text(&mut self) {
+        self.confirm_inner(None);
+    }
+
+    /// Confirms the pending edit. A `Secret` purpose imports the typed value
+    /// into the keyring and stores only the resulting `SecretRef`.
+    ///
+    /// # Errors
+    /// Returns the store failure when the keyring write is rejected.
+    pub fn confirm_text_with_store<W: SecretWriter>(
+        &mut self,
+        store: &W,
+    ) -> Result<(), LocalOpError> {
+        self.confirm_inner(Some(store));
+        if self.error.is_some() {
+            Err(LocalOpError::StoreUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn confirm_inner(&mut self, store: Option<&dyn SecretWriter>) {
+        self.error = None;
+        if self.input.is_none() {
+            if let Some(id) = self.confirm_delete.take()
+                && let Some(index) = self.profiles.iter().position(|profile| profile.id == id)
+            {
+                self.profiles.remove(index);
+                if self.default_profile.as_deref() == Some(id.as_str()) {
+                    self.default_profile = None;
+                }
+                self.cursor = self.cursor.min(self.row_count().saturating_sub(1));
+            }
+            return;
+        }
+        self.confirm_delete = None;
+        let Some((purpose, buffer)) = self.input.take() else {
+            return;
+        };
+        let value = buffer.trim().to_owned();
+        match purpose {
+            TextPurpose::DefaultProfile => {
+                if value.is_empty() {
+                    self.default_profile = None;
+                } else if self.profiles.iter().any(|profile| profile.id == value) {
+                    self.default_profile = Some(value);
+                } else {
+                    self.error = Some(format!("unknown profile `{value}`"));
+                    self.input = Some((TextPurpose::DefaultProfile, value));
+                }
+            }
+            TextPurpose::NewProfileId => {
+                if let Err(error) = validate_profile_id(&value) {
+                    self.error = Some(error.clone());
+                } else if self.profiles.iter().any(|profile| profile.id == value) {
+                    self.error = Some(format!("profile `{value}` already exists"));
+                } else {
+                    self.profiles.push(ProfileDraft {
+                        id: value.clone(),
+                        base_url: String::new(),
+                        enabled: true,
+                        secret_ref: None,
+                        has_credential: false,
+                    });
+                    self.cursor = self.row_count() - 1;
+                    self.input = Some((TextPurpose::BaseUrl(value), String::new()));
+                }
+            }
+            TextPurpose::BaseUrl(id) => {
+                if let Some(profile) = self.profiles.iter_mut().find(|profile| profile.id == id) {
+                    if value.is_empty() || value.chars().any(char::is_control) {
+                        self.error = Some("base_url must be a non-empty endpoint URL".to_owned());
+                    } else {
+                        profile.base_url = value;
+                    }
+                }
+            }
+            TextPurpose::Secret(id) => {
+                let Some(store) = store else {
+                    self.error = Some("secret import requires the keyring flow".to_owned());
+                    return;
+                };
+                if value.is_empty() {
+                    self.error = Some("empty secret".to_owned());
+                    return;
+                }
+                match import_secret(store, &id, value.as_bytes()) {
+                    Ok(secret_ref) => {
+                        if let Some(profile) =
+                            self.profiles.iter_mut().find(|profile| profile.id == id)
+                        {
+                            profile.secret_ref = Some(secret_ref);
+                            profile.has_credential = true;
+                        }
+                        self.status = Some(format!("credential imported for `{id}`"));
+                    }
+                    Err(_) => self.error = Some("platform secret store unavailable".to_owned()),
+                }
+            }
+        }
+    }
+
+    /// Serializes the draft and, after validating that the generated file
+    /// parses back into routing profiles, atomically replaces `path`.
+    ///
+    /// # Errors
+    /// Returns a message for validation failures; the target file is never
+    /// touched unless the serialized draft validates.
+    pub fn save(&mut self, path: &std::path::Path) -> Result<(), String> {
+        self.error = None;
+        if let Some(default_profile) = &self.default_profile
+            && !self
+                .profiles
+                .iter()
+                .any(|profile| &profile.id == default_profile)
+        {
+            let message = format!("default profile `{default_profile}` does not exist");
+            self.error = Some(message.clone());
+            return Err(message);
+        }
+        for profile in &self.profiles {
+            if let Err(error) = validate_profile_id(&profile.id) {
+                let message = format!("profile `{}`: {error}", profile.id);
+                self.error = Some(message.clone());
+                return Err(message);
+            }
+            if profile.base_url.is_empty() || profile.base_url.chars().any(char::is_control) {
+                let message = format!("profile `{}`: base_url must be set", profile.id);
+                self.error = Some(message.clone());
+                return Err(message);
+            }
+        }
+        let mut contents = String::from("[models]\n");
+        if let Some(default_profile) = &self.default_profile {
+            contents.push_str("default_profile = \"");
+            contents.push_str(default_profile);
+            contents.push_str("\"\n");
+        }
+        contents.push('\n');
+        for profile in &self.profiles {
+            contents.push_str("[models.profiles.");
+            contents.push_str(&profile.id);
+            contents.push_str("]\nbase_url = \"");
+            contents.push_str(&profile.base_url);
+            contents.push_str("\"\nenabled = ");
+            contents.push_str(if profile.enabled { "true" } else { "false" });
+            contents.push('\n');
+            if let Some(secret_ref) = &profile.secret_ref {
+                contents.push_str("secret_ref = \"");
+                contents.push_str(secret_ref);
+                contents.push_str("\"\n");
+            }
+            contents.push('\n');
+        }
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(std::path::PathBuf::new, std::path::Path::to_path_buf);
+        let staging = directory.join(format!(
+            ".cortexd.toml.new-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        if std::fs::write(&staging, &contents).is_err() {
+            return Err("config could not be written".to_owned());
+        }
+        let valid = cortexd::LocalSettings::load(&staging)
+            .ok()
+            .flatten()
+            .and_then(|settings| settings.provider_profiles().ok())
+            .is_some();
+        if !valid {
+            let _ = std::fs::remove_file(&staging);
+            let message = "serialized settings failed validation; file unchanged".to_owned();
+            self.error = Some(message.clone());
+            return Err(message);
+        }
+        if std::fs::rename(&staging, path).is_err() {
+            let _ = std::fs::remove_file(&staging);
+            return Err("config could not be replaced".to_owned());
+        }
+        self.status = Some("settings saved; the daemon applies them on next start".to_owned());
+        Ok(())
+    }
+}
+
 /// UI state machine. Async daemon calls live in the runner; the state only
 /// absorbs their results, which keeps the whole TUI testable without a
 /// terminal or a daemon.
@@ -61,6 +404,7 @@ pub struct App {
     notes_query: String,
     note_results: Vec<String>,
     settings: Option<SettingsSummary>,
+    editor: Option<SettingsEditor>,
     status_line: String,
 }
 
@@ -76,6 +420,7 @@ impl Default for App {
             notes_query: String::new(),
             note_results: Vec::new(),
             settings: None,
+            editor: None,
             status_line: String::new(),
         }
     }
@@ -217,6 +562,107 @@ impl App {
         self.settings.as_ref()
     }
 
+    pub fn editor_up(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.up();
+        }
+    }
+
+    pub fn editor_down(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.down();
+        }
+    }
+
+    pub fn begin_text(&mut self, purpose: TextPurpose) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.begin_text(purpose);
+        }
+    }
+
+    pub fn cancel_pending(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.cancel_pending();
+        }
+    }
+
+    pub fn begin_delete(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.begin_delete();
+        }
+    }
+
+    pub fn toggle_enabled(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.toggle_enabled();
+        }
+    }
+
+    pub fn editor_text_input(&mut self, character: char) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.text_input(character);
+        }
+    }
+
+    pub fn editor_text_backspace(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.text_backspace();
+        }
+    }
+
+    pub fn confirm_text(&mut self) {
+        if let Some(editor) = self.editor.as_mut() {
+            editor.confirm_text();
+        }
+    }
+
+    /// # Errors
+    /// Propagates the keyring import failure when a secret edit is rejected.
+    pub fn confirm_text_with_store<W: SecretWriter>(
+        &mut self,
+        store: &W,
+    ) -> Result<(), LocalOpError> {
+        match self.editor.as_mut() {
+            Some(editor) => editor.confirm_text_with_store(store),
+            None => Ok(()),
+        }
+    }
+
+    /// Enters settings edit mode, drafting the current summary. Does nothing
+    /// when no settings have been loaded.
+    pub fn start_settings_edit(&mut self) {
+        if let Some(summary) = &self.settings {
+            self.editor = Some(SettingsEditor::from_summary(summary));
+        }
+    }
+
+    pub fn cancel_settings_edit(&mut self) {
+        self.editor = None;
+    }
+
+    #[must_use]
+    pub const fn settings_editor(&self) -> Option<&SettingsEditor> {
+        self.editor.as_ref()
+    }
+
+    /// Saves the editor draft to the config path from the loaded summary.
+    ///
+    /// # Errors
+    /// Returns the validation failure message when the draft is rejected.
+    pub fn save_settings(&mut self) -> Result<(), String> {
+        let Some(path) = self
+            .settings
+            .as_ref()
+            .map(|summary| summary.config_path.clone())
+        else {
+            return Err("no settings loaded".to_owned());
+        };
+        match self.editor.as_mut() {
+            Some(editor) => editor.save(std::path::Path::new(&path)),
+            None => Err("not editing".to_owned()),
+        }
+    }
+
     pub fn set_status_line(&mut self, text: String) {
         self.status_line = text;
     }
@@ -225,6 +671,28 @@ impl App {
     pub fn status_line(&self) -> &str {
         &self.status_line
     }
+}
+
+/// Convenience wrapper used by tests: renders one frame into a string.
+///
+/// # Panics
+/// Panics when the test terminal cannot be created or a frame cannot be drawn.
+#[must_use]
+pub fn render_to_string(app: &App, width: u16, height: u16) -> String {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render(app, frame.area(), frame.buffer_mut()))
+        .expect("draw succeeds");
+    let buffer = terminal.backend().buffer();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    text
 }
 
 /// Renders one frame. Kept as a free function over `&App` so tests can drive
@@ -349,6 +817,10 @@ fn render_notes(app: &App, area: Rect, buffer: &mut Buffer) {
 }
 
 fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
+    if let Some(editor) = app.settings_editor() {
+        render_settings_editor(editor, area, buffer);
+        return;
+    }
     let mut lines: Vec<Line> = Vec::new();
     match &app.settings {
         None => lines.push(Line::from("settings unavailable")),
@@ -382,6 +854,93 @@ fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
             Block::default()
                 .borders(Borders::ALL)
                 .title("Settings (cortexd.toml)"),
+        )
+        .render(area, buffer);
+}
+
+fn render_settings_editor(editor: &SettingsEditor, area: Rect, buffer: &mut Buffer) {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from("default profile: <none>"));
+    for (offset, profile) in std::iter::once(("(default profile)", None)).chain(
+        editor
+            .profiles()
+            .iter()
+            .map(|profile| (profile.id.as_str(), Some(profile))),
+    ) {
+        let _ = offset;
+        let _ = profile;
+    }
+    // Rows: index 0 selects the default profile; indices 1.. select profiles.
+    let mut rows: Vec<String> = vec![format!(
+        "{} [default profile: {}]",
+        if editor.cursor() == 0 { ">" } else { " " },
+        editor.default_profile().unwrap_or("(none)")
+    )];
+    for (index, profile) in editor.profiles().iter().enumerate() {
+        let marker = if editor.cursor() == index + 1 {
+            ">"
+        } else {
+            " "
+        };
+        let credential = if profile.secret_ref.is_some() || profile.has_credential {
+            " keyring-ref"
+        } else {
+            ""
+        };
+        rows.push(format!(
+            "{marker} {} @ {} [{}]{}",
+            profile.id,
+            profile.base_url,
+            if profile.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            credential
+        ));
+    }
+    lines.extend(rows.into_iter().map(Line::from));
+    if let Some(purpose) = editor.pending_purpose() {
+        let prompt = match purpose {
+            TextPurpose::DefaultProfile => "default profile id".to_owned(),
+            TextPurpose::NewProfileId => "new profile id".to_owned(),
+            TextPurpose::BaseUrl(id) => format!("base_url for `{id}`"),
+            TextPurpose::Secret(id) => format!("secret for `{id}` (hidden)"),
+        };
+        let shown = match purpose {
+            TextPurpose::Secret(_) => "*".repeat(editor.pending_text().unwrap_or("").len()),
+            _ => editor.pending_text().unwrap_or("").to_owned(),
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prompt}: {shown} (Enter to confirm, Esc to cancel)"),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+    }
+    if editor.pending_purpose().is_none() {
+        lines.push(Line::from(
+            "Enter: edit · n: new profile · i: import secret · t: enable/disable · d: delete · w: save · Esc: done",
+        ));
+    }
+    if let Some(id) = &editor.confirm_delete {
+        lines.push(Line::from(Span::styled(
+            format!("delete profile `{id}`? Enter to confirm"),
+            Style::default().fg(ratatui::style::Color::Red),
+        )));
+    }
+    if let Some(error) = editor.error() {
+        lines.push(Line::from(Span::styled(
+            format!("error: {error}"),
+            Style::default().fg(ratatui::style::Color::Red),
+        )));
+    }
+    if let Some(status) = editor.status() {
+        lines.push(Line::from(status));
+    }
+    Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Settings editor (cortexd.toml)"),
         )
         .render(area, buffer);
 }
