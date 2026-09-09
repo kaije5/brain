@@ -191,7 +191,7 @@ impl Harness {
         #[cfg(windows)]
         let model_secret_reference = Some(model_secret.reference());
         #[cfg(not(windows))]
-        let model_secret_reference = None;
+        let model_secret_reference: Option<String> = None;
         let mut settings = format!(
             "[models]
 default_profile = \"e2e\"
