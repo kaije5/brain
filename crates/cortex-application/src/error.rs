@@ -13,6 +13,10 @@ pub enum ApplicationError {
     Storage(String),
     InferenceUnavailable,
     InferenceTimeout,
+    /// Degraded routing state: no enabled provider exposes a model with fresh
+    /// evidence for the role's required capabilities. Never silently falls
+    /// back to a substitute model or provider.
+    NoSuitableModel,
     MalformedModelOutput { reason: &'static str },
     Internal,
 }
