@@ -220,19 +220,21 @@ pub fn default_database_path_for(override_value: Option<&std::ffi::OsStr>) -> st
 fn default_data_directory() -> std::path::PathBuf {
     #[cfg(windows)]
     {
-        std::env::var_os("LOCALAPPDATA")
-            .map_or_else(std::env::temp_dir, std::path::PathBuf::from)
-            .join("cortex")
+        match std::env::var_os("LOCALAPPDATA") {
+            Some(value) => std::path::PathBuf::from(value),
+            None => std::env::temp_dir(),
+        }
+        .join("cortex")
     }
     #[cfg(not(windows))]
     {
-        std::env::var_os("XDG_DATA_HOME")
-            .map_or_else(
-                || std::env::home_dir().map(|home| home.join(".local").join("share")),
-                Some,
-            )
-            .unwrap_or_else(std::env::temp_dir)
-            .join("cortex")
+        let base = match std::env::var_os("XDG_DATA_HOME") {
+            Some(value) => std::path::PathBuf::from(value),
+            None => std::env::home_dir()
+                .map(|home| home.join(".local").join("share"))
+                .unwrap_or_else(std::env::temp_dir),
+        };
+        base.join("cortex")
     }
 }
 
