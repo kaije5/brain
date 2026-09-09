@@ -115,6 +115,7 @@ fn settings_tab_renders_non_secret_config_and_profile() {
     app.set_settings_summary(brain::tui::SettingsSummary {
         config_path: "C:\\data\\cortexd.toml".to_owned(),
         default_profile: Some("nim".to_owned()),
+        pinned_model: None,
         profiles: vec![
             ("nim".to_owned(), "https://nim.example/v1/".to_owned(), true),
             (

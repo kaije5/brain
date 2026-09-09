@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use chrono::Utc;
 use cortex_application::{ApplicationError, SecretRef};
 use cortex_inference::{
-    ModelRouter, NimConfig, NimDiscovery, NimTransport, OpenAiCompatibleConfig, ProviderLimits,
-    ProviderProfile, ProviderProfileId, RoleRoutingPolicy, RoutedModel,
+    ModelCatalog, ModelRouter, NimConfig, NimDiscovery, NimTransport, OpenAiCompatibleConfig,
+    ProviderLimits, ProviderProfile, ProviderProfileId, RoleRoutingPolicy, RoutedModel,
 };
 use serde::Deserialize;
 
@@ -46,6 +46,7 @@ struct DaemonSection {
 #[serde(deny_unknown_fields)]
 struct ModelsSection {
     default_profile: Option<String>,
+    model: Option<String>,
     profiles: Option<BTreeMap<String, ModelProfileEntry>>,
 }
 
@@ -95,6 +96,7 @@ impl LocalSettings {
             }),
             models: file.models.unwrap_or(ModelsSection {
                 default_profile: None,
+                model: None,
                 profiles: None,
             }),
         }))
@@ -146,6 +148,13 @@ impl LocalSettings {
     #[must_use]
     pub fn default_profile_id(&self) -> Option<&str> {
         self.models.default_profile.as_deref()
+    }
+
+    /// Pinned model id from `[models] model`, overriding router selection
+    /// when the pinned model appears in the discovered catalog.
+    #[must_use]
+    pub fn pinned_model(&self) -> Option<&str> {
+        self.models.model.as_deref()
     }
 
     /// Builds the durable routing profiles declared in the file. Secret
@@ -235,6 +244,21 @@ fn default_data_directory() -> std::path::PathBuf {
                 .unwrap_or_else(std::env::temp_dir),
         };
         base.join("cortex")
+    }
+}
+
+/// Narrows the catalog to the pinned model when one is configured.
+/// `Err(())` means the pin names a model the profile never discovered.
+fn apply_pinned_model(catalog: ModelCatalog, pinned: Option<&str>) -> Result<ModelCatalog, ()> {
+    match pinned {
+        Some(pinned) => catalog
+            .models()
+            .iter()
+            .find(|model| model.model_id().as_str() == pinned)
+            .cloned()
+            .map(|model| ModelCatalog::new(vec![model]))
+            .ok_or(()),
+        None => Ok(catalog),
     }
 }
 
@@ -334,6 +358,17 @@ pub async fn resolve_default_model<T: NimTransport>(
             secret: profile_and_secret(&profiles, &profile_id),
         };
     };
+    let all_models: Vec<String> = catalog
+        .models()
+        .iter()
+        .map(|model| model.model_id().as_str().to_owned())
+        .collect();
+    let Ok(catalog) = apply_pinned_model(catalog, settings.pinned_model()) else {
+        return ModelResolution::Degraded {
+            reason: "pinned_model_unavailable",
+            secret: profile_and_secret(&profiles, &profile_id),
+        };
+    };
     let Ok(policy) = RoleRoutingPolicy::agent_default(MAX_EVIDENCE_AGE) else {
         return ModelResolution::Degraded {
             reason: "invalid_routing_policy",
@@ -357,6 +392,23 @@ pub async fn resolve_default_model<T: NimTransport>(
         .find(|profile| profile.id() == &route.profile_id)
         .and_then(|profile| profile.secret_reference())
         .cloned();
+    build_routed_provider(
+        routed_base_url,
+        route.model_id.as_str().to_owned(),
+        routed_secret,
+        all_models,
+        route,
+    )
+}
+
+/// Builds the validated provider configuration for one routed model.
+fn build_routed_provider(
+    base_url: &str,
+    model_id: String,
+    secret: Option<SecretRef>,
+    discovered: Vec<String>,
+    route: cortex_inference::RoutedModel,
+) -> ModelResolution {
     let Ok(limits) = ProviderLimits::new(
         MODEL_RESPONSE_BYTES,
         MODEL_EMBEDDING_INPUT_BYTES,
@@ -364,21 +416,10 @@ pub async fn resolve_default_model<T: NimTransport>(
     ) else {
         return ModelResolution::Degraded {
             reason: "invalid_provider_limits",
-            secret: profile_and_secret(&profiles, &profile_id),
+            secret,
         };
     };
-    let discovered = catalog
-        .models()
-        .iter()
-        .map(|model| model.model_id().as_str().to_owned())
-        .collect();
-    match OpenAiCompatibleConfig::new(
-        routed_base_url,
-        route.model_id.as_str(),
-        routed_secret.clone(),
-        MODEL_TIMEOUT,
-        limits,
-    ) {
+    match OpenAiCompatibleConfig::new(base_url, model_id, secret.clone(), MODEL_TIMEOUT, limits) {
         Ok(config) => ModelResolution::Configured {
             config,
             route,
@@ -386,7 +427,7 @@ pub async fn resolve_default_model<T: NimTransport>(
         },
         Err(_) => ModelResolution::Degraded {
             reason: "invalid_model_config",
-            secret: routed_secret,
+            secret,
         },
     }
 }

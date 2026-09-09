@@ -10,6 +10,7 @@ use cortexd::{LocalSettings, data_directory};
 
 /// Async daemon effects applied back onto the state machine by the loop.
 enum Effect {
+    Models(Result<Vec<String>, String>),
     Tasks(Result<Vec<(String, String)>, String>),
     Notes(Result<Vec<String>, String>),
     Agent(Result<String, String>),
@@ -60,6 +61,9 @@ fn handle_key(
 ) {
     if code == KeyCode::Char('c') && modifiers == KeyModifiers::CONTROL {
         app.quit();
+        return;
+    }
+    if handle_model_browser(app, code, modifiers) {
         return;
     }
     if handle_settings_prompt(app, code, modifiers) {
@@ -143,11 +147,54 @@ fn handle_key(
         KeyCode::Char(character) => match app.tab {
             Tab::Chat => app.push_chat_input(character),
             Tab::Notes => app.push_note_query(character),
-            Tab::Settings => handle_settings_char(app, character),
+            Tab::Settings => {
+                if character == 'm' {
+                    app.set_status_line("Loading discovered models...".to_owned());
+                    request_model_list(client, sender);
+                } else {
+                    handle_settings_char(app, character);
+                }
+            }
             Tab::Tasks => {}
         },
         _ => {}
     }
+}
+
+/// The model browser owns the keyboard while open: typing filters, Up/Down
+/// select, Enter pins the highlighted model, Esc closes.
+fn handle_model_browser(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    if app.tab != Tab::Settings || app.model_browser().is_none() {
+        return false;
+    }
+    match code {
+        KeyCode::Esc => app.close_model_browser(),
+        KeyCode::Up => {
+            if let Some(browser) = app.model_browser_mut() {
+                browser.up();
+            }
+        }
+        KeyCode::Down => {
+            if let Some(browser) = app.model_browser_mut() {
+                browser.down();
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(browser) = app.model_browser_mut() {
+                browser.backspace_query();
+            }
+        }
+        KeyCode::Enter => {
+            app.confirm_model_selection();
+        }
+        KeyCode::Char(c) if text_modifiers(modifiers) => {
+            if let Some(browser) = app.model_browser_mut() {
+                browser.push_query(c);
+            }
+        }
+        _ => {}
+    }
+    true
 }
 
 fn handle_settings_enter(app: &mut App) {
@@ -217,6 +264,18 @@ fn handle_settings_char(app: &mut App, character: char) {
 
 fn apply_effect(app: &mut App, effect: Effect, client: &DaemonClient) {
     match effect {
+        Effect::Models(Ok(models)) => {
+            if models.is_empty() {
+                app.set_status_line(
+                    "no models discovered yet; the daemon is still resolving the catalog"
+                        .to_owned(),
+                );
+            } else {
+                app.set_status_line(format!("{} models discovered", models.len()));
+                app.open_model_browser(models);
+            }
+        }
+        Effect::Models(Err(code)) => app.set_status_line(format!("models unavailable: {code}")),
         Effect::Tasks(Ok(rows)) => {
             app.set_status_line(format!("{} tasks loaded", rows.len()));
             app.set_tasks(rows);
@@ -305,6 +364,31 @@ fn request_agent_reply(client: &DaemonClient, sender: mpsc::Sender<Effect>, app:
     });
 }
 
+fn request_model_list(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        let result = send_capability(&client, "cortex_model_list", serde_json::json!({})).await;
+        let models = result.and_then(|mut values| {
+            values
+                .pop()
+                .and_then(|value| {
+                    value
+                        .get("models")
+                        .and_then(serde_json::Value::as_array)
+                        .cloned()
+                })
+                .map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|model| model.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .ok_or_else(|| "malformed_model_list".to_owned())
+        });
+        let _ = sender.send(Effect::Models(models));
+    });
+}
+
 fn request_settings(app: &mut App) {
     let directory = data_directory();
     let path = directory.join("cortexd.toml");
@@ -315,6 +399,10 @@ fn request_settings(app: &mut App) {
         .unwrap_or_default();
     let summary = SettingsSummary {
         config_path: path.display().to_string(),
+        pinned_model: settings
+            .as_ref()
+            .and_then(LocalSettings::pinned_model)
+            .map(str::to_owned),
         default_profile: settings
             .as_ref()
             .and_then(LocalSettings::default_profile_id)
@@ -440,6 +528,7 @@ mod tests {
         app.set_settings_summary(SettingsSummary {
             config_path: "unused-keyboard-test-config".to_owned(),
             default_profile: Some("nim".to_owned()),
+            pinned_model: None,
             profiles: vec![("nim".to_owned(), "https://example.com/v1".to_owned(), true)],
             model_status: "ready".to_owned(),
         });
@@ -519,6 +608,7 @@ mod tests {
         app.set_settings_summary(SettingsSummary {
             config_path: "unused-keyboard-test-config".to_owned(),
             default_profile: None,
+            pinned_model: None,
             profiles: Vec::new(),
             model_status: "ready".to_owned(),
         });
@@ -557,6 +647,7 @@ mod tests {
         app.set_settings_summary(SettingsSummary {
             config_path: path.to_string_lossy().into_owned(),
             default_profile: Some("nim".to_owned()),
+            pinned_model: None,
             profiles: vec![("nim".to_owned(), "https://old.example/v1".to_owned(), true)],
             model_status: "ready".to_owned(),
         });
@@ -585,6 +676,7 @@ mod tests {
         app.set_settings_summary(SettingsSummary {
             config_path: path.to_string_lossy().into_owned(),
             default_profile: Some("nim".to_owned()),
+            pinned_model: None,
             profiles: vec![("nim".to_owned(), "https://old.example/v1".to_owned(), true)],
             model_status: "ready".to_owned(),
         });

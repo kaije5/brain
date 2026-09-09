@@ -39,6 +39,7 @@ pub enum ChatStatus {
 pub struct SettingsSummary {
     pub config_path: String,
     pub default_profile: Option<String>,
+    pub pinned_model: Option<String>,
     pub profiles: Vec<(String, String, bool)>,
     pub model_status: String,
 }
@@ -92,6 +93,7 @@ pub struct ProfileDraft {
 #[derive(Debug)]
 pub struct SettingsEditor {
     default_profile: Option<String>,
+    pinned_model: Option<String>,
     profiles: Vec<ProfileDraft>,
     cursor: usize,
     input: Option<(TextPurpose, String)>,
@@ -107,6 +109,7 @@ impl SettingsEditor {
     fn from_summary(summary: &SettingsSummary) -> Self {
         Self {
             default_profile: summary.default_profile.clone(),
+            pinned_model: summary.pinned_model.clone(),
             profiles: summary
                 .profiles
                 .iter()
@@ -137,6 +140,18 @@ impl SettingsEditor {
     #[must_use]
     pub fn profiles(&self) -> &[ProfileDraft] {
         &self.profiles
+    }
+
+    /// The pinned model id that overrides router selection, if any.
+    #[must_use]
+    pub fn pinned_model(&self) -> Option<&str> {
+        self.pinned_model.as_deref()
+    }
+
+    /// Pins or clears the chat model override.
+    pub fn set_pinned_model(&mut self, model: Option<String>) {
+        self.pinned_model = model;
+        self.dirty = true;
     }
 
     #[must_use]
@@ -430,6 +445,11 @@ impl SettingsEditor {
             contents.push_str(default_profile);
             contents.push_str("\"\n");
         }
+        if let Some(pinned) = &self.pinned_model {
+            contents.push_str("model = \"");
+            contents.push_str(pinned);
+            contents.push_str("\"\n");
+        }
         contents.push('\n');
         for profile in &self.profiles {
             contents.push_str("[models.profiles.");
@@ -493,7 +513,75 @@ pub struct App {
     note_results: Vec<String>,
     settings: Option<SettingsSummary>,
     editor: Option<SettingsEditor>,
+    model_browser: Option<ModelBrowser>,
     status_line: String,
+}
+
+/// Searchable browser over the models discovered by the daemon (SCRUM-77).
+#[derive(Debug, Default)]
+pub struct ModelBrowser {
+    models: Vec<String>,
+    query: String,
+    cursor: usize,
+}
+
+impl ModelBrowser {
+    #[must_use]
+    pub fn new(models: Vec<String>) -> Self {
+        Self {
+            models,
+            query: String::new(),
+            cursor: 0,
+        }
+    }
+
+    pub fn push_query(&mut self, character: char) {
+        self.query.push(character);
+        self.cursor = 0;
+    }
+
+    pub fn backspace_query(&mut self) {
+        self.query.pop();
+        self.cursor = 0;
+    }
+
+    /// Models matching the current query, case-insensitively.
+    #[must_use]
+    pub fn matches(&self) -> Vec<&str> {
+        let query = self.query.to_lowercase();
+        self.models
+            .iter()
+            .map(String::as_str)
+            .filter(|model| model.to_lowercase().contains(&query))
+            .collect()
+    }
+
+    #[must_use]
+    pub const fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn up(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn down(&mut self) {
+        let count = self.matches().len();
+        if count > 0 && self.cursor + 1 < count {
+            self.cursor += 1;
+        }
+    }
+
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// The highlighted model, if the filtered list has a selection.
+    #[must_use]
+    pub fn selected(&self) -> Option<&str> {
+        self.matches().get(self.cursor).copied()
+    }
 }
 
 impl Default for App {
@@ -509,6 +597,7 @@ impl Default for App {
             note_results: Vec::new(),
             settings: None,
             editor: None,
+            model_browser: None,
             status_line: String::new(),
         }
     }
@@ -737,6 +826,49 @@ impl App {
 
     /// Enters settings edit mode, drafting the current summary. Does nothing
     /// when no settings have been loaded.
+    /// Opens the model browser over `models`, or updates an open one.
+    pub fn open_model_browser(&mut self, models: Vec<String>) {
+        match self.model_browser.as_mut() {
+            Some(browser) => browser.models = models,
+            None => self.model_browser = Some(ModelBrowser::new(models)),
+        }
+    }
+
+    pub fn close_model_browser(&mut self) {
+        self.model_browser = None;
+    }
+
+    #[must_use]
+    pub const fn model_browser(&self) -> Option<&ModelBrowser> {
+        self.model_browser.as_ref()
+    }
+
+    pub fn model_browser_mut(&mut self) -> Option<&mut ModelBrowser> {
+        self.model_browser.as_mut()
+    }
+
+    /// Pins the browser's highlighted model into the editor draft, opening
+    /// the editor first when it was closed.
+    pub fn confirm_model_selection(&mut self) -> bool {
+        let selected = self
+            .model_browser
+            .as_ref()
+            .and_then(ModelBrowser::selected)
+            .map(str::to_owned);
+        let Some(selected) = selected else {
+            return false;
+        };
+        if self.editor.is_none() {
+            self.start_settings_edit();
+        }
+        let pinned = self.editor.as_mut().map(|editor| {
+            editor.set_pinned_model(Some(selected.clone()));
+            selected
+        });
+        self.model_browser = None;
+        pinned.is_some()
+    }
+
     pub fn start_settings_edit(&mut self) {
         if let Some(summary) = &self.settings {
             self.editor = Some(SettingsEditor::from_summary(summary));
@@ -771,6 +903,7 @@ impl App {
         editor.save(std::path::Path::new(&path))?;
         if let Some(summary) = self.settings.as_mut() {
             summary.default_profile.clone_from(&editor.default_profile);
+            summary.pinned_model.clone_from(&editor.pinned_model);
             summary.profiles = editor
                 .profiles
                 .iter()

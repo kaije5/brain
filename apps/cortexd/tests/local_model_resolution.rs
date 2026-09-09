@@ -170,3 +170,47 @@ fn daemon_defaults_apply_without_a_settings_file() {
             .expect("valid daemon config");
     assert!(config.endpoint_name().starts_with("cortexd-"));
 }
+
+#[tokio::test]
+async fn pinned_model_overrides_router_selection() {
+    let settings = settings_from(
+        r#"
+[models]
+default_profile = "local"
+model = "model-b"
+
+[models.profiles.local]
+base_url = "http://127.0.0.1:8000/v1/"
+"#,
+    );
+    let resolution =
+        resolve_default_model(Some(&settings), FakeNimTransport::default(), None).await;
+    match resolution {
+        ModelResolution::Configured { config, models, .. } => {
+            assert_eq!(config.model(), "model-b");
+            // The catalog exposed to clients stays complete.
+            assert_eq!(models.len(), 2);
+        }
+        other => panic!("expected a configured route, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pinning_an_unknown_model_is_an_explicit_degraded_state() {
+    let settings = settings_from(
+        r#"
+[models]
+default_profile = "local"
+model = "no-such-model"
+
+[models.profiles.local]
+base_url = "http://127.0.0.1:8000/v1/"
+"#,
+    );
+    let resolution =
+        resolve_default_model(Some(&settings), FakeNimTransport::default(), None).await;
+    assert!(
+        matches!(resolution, ModelResolution::Degraded { .. }),
+        "an unavailable pinned model must degrade explicitly, got {resolution:?}"
+    );
+}

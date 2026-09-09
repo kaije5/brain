@@ -128,6 +128,7 @@ async fn tui_settings_editor_writes_a_valid_config() {
     app.set_settings_summary(brain::tui::SettingsSummary {
         config_path: config_path.display().to_string(),
         default_profile: settings.default_profile_id().map(str::to_owned),
+        pinned_model: settings.pinned_model().map(str::to_owned),
         profiles: settings
             .provider_profiles()
             .expect("valid profiles")

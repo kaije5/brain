@@ -200,12 +200,16 @@ fn render_notes(app: &App, area: Rect, buffer: &mut Buffer) {
 }
 
 fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
+    if let Some(browser) = app.model_browser() {
+        render_model_browser(browser, area, buffer);
+        return;
+    }
     if let Some(editor) = app.settings_editor() {
         render_editor(editor, area, buffer);
         return;
     }
     let mut lines = vec![Line::styled(
-        "e: edit settings · Enter: edit settings",
+        "e: edit settings · m: choose model · Enter: edit settings",
         accent(),
     )];
     if let Some(summary) = &app.settings {
@@ -215,11 +219,15 @@ fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
         }
         lines.extend([
             Line::from(format!(
-                "default profile: {}",
+                "default profile: {} · pinned model: {}",
                 summary
                     .default_profile
                     .as_deref()
-                    .unwrap_or("(none configured)")
+                    .unwrap_or("(none configured)"),
+                summary
+                    .pinned_model
+                    .as_deref()
+                    .unwrap_or("(router chooses)"),
             )),
             Line::from(format!("model status: {}", summary.model_status)),
             Line::default(),
@@ -328,6 +336,46 @@ fn render_provider_picker(selected: usize, area: Rect, buffer: &mut Buffer) {
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .render(area, buffer);
+}
+
+fn render_model_browser(browser: &super::ModelBrowser, area: Rect, buffer: &mut Buffer) {
+    let block = panel(" Choose model ");
+    let inner = block.inner(area);
+    block.render(area, buffer);
+    let [query_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+    Paragraph::new(Line::from(vec![
+        Span::styled("search: ", accent()),
+        Span::raw(input_tail(
+            browser.query(),
+            query_area.width.saturating_sub(8),
+        )),
+    ]))
+    .render(query_area, buffer);
+
+    let matches = browser.matches();
+    let mut lines = Vec::new();
+    if matches.is_empty() {
+        lines.push(Line::styled(
+            "no models match",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    for (index, model) in matches.iter().enumerate() {
+        let marker = if index == browser.cursor() {
+            "› "
+        } else {
+            "  "
+        };
+        lines.push(Line::from(format!("{marker}{model}")));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(
+        "type to filter · Up/Down: select · Enter: pin · Esc: back",
+    ));
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(list_area, buffer);
 }
 
 fn render_editor_details(editor: &SettingsEditor, area: Rect, buffer: &mut Buffer) {

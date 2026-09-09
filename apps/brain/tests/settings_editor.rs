@@ -25,6 +25,7 @@ fn app_with_config_path(config_path: &str) -> App {
     app.set_settings_summary(SettingsSummary {
         config_path: config_path.to_owned(),
         default_profile: Some("nim".to_owned()),
+        pinned_model: None,
         profiles: vec![
             ("nim".to_owned(), "https://nim.example/v1/".to_owned(), true),
             (
@@ -255,6 +256,7 @@ fn official_nim_preset_needs_only_an_api_key() {
     app.set_settings_summary(SettingsSummary {
         config_path: path.to_str().expect("utf8 path").to_owned(),
         default_profile: None,
+        pinned_model: None,
         profiles: Vec::new(),
         model_status: "resolved by the daemon at startup".to_owned(),
     });
@@ -311,4 +313,64 @@ mod local_settings_fixture {
     pub fn text() -> String {
         "[models]\ndefault_profile = \"nim\"\n\n[models.profiles.nim]\nbase_url = \"https://nim.example/v1/\"\n".to_owned()
     }
+}
+
+#[test]
+fn model_browser_searches_and_pins_into_the_draft() {
+    let mut app = app_with_settings();
+    app.open_model_browser(vec![
+        "meta/llama-3.1-70b-instruct".to_owned(),
+        "meta/llama-3.1-8b-instruct".to_owned(),
+        "nvidia/nemotron-mini".to_owned(),
+    ]);
+    let screen = brain::tui::render_to_string(&app, 100, 30);
+    assert!(screen.contains("Choose model"));
+    assert!(screen.contains("nemotron-mini"));
+
+    // Typing narrows the list.
+    for character in "nemotron".chars() {
+        if let Some(browser) = app.model_browser_mut() {
+            browser.push_query(character);
+        }
+    }
+    let matches = app.model_browser().unwrap().matches();
+    assert_eq!(matches, vec!["nvidia/nemotron-mini"]);
+
+    // Enter pins the selection into an editor draft (opening it if needed).
+    assert!(app.confirm_model_selection());
+    assert!(app.model_browser().is_none());
+    let editor = app.settings_editor().expect("editor opened");
+    assert_eq!(editor.pinned_model(), Some("nvidia/nemotron-mini"));
+}
+
+#[test]
+fn pinned_model_serializes_and_parses_back() {
+    let directory = TempDir::new().expect("temp dir");
+    let path = directory.path().join("cortexd.toml");
+    let mut app = App::new();
+    app.select_tab(brain::tui::Tab::Settings);
+    app.set_settings_summary(SettingsSummary {
+        config_path: path.to_str().expect("utf8 path").to_owned(),
+        default_profile: Some("nim".to_owned()),
+        pinned_model: None,
+        profiles: vec![(
+            "nim".to_owned(),
+            "https://integrate.api.nvidia.com/v1".to_owned(),
+            true,
+        )],
+        model_status: "ready".to_owned(),
+    });
+    app.start_settings_edit();
+    app.open_model_browser(vec!["meta/llama-3.1-8b-instruct".to_owned()]);
+    assert!(app.confirm_model_selection());
+    app.save_settings().expect("valid draft saves");
+
+    let contents = std::fs::read_to_string(&path).expect("config written");
+    assert!(contents.contains("model = \"meta/llama-3.1-8b-instruct\""));
+    assert!(!contents.contains("nvapi"));
+
+    let settings = cortexd::LocalSettings::load(&path)
+        .expect("parses")
+        .expect("present");
+    assert_eq!(settings.pinned_model(), Some("meta/llama-3.1-8b-instruct"));
 }
