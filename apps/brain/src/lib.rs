@@ -14,5 +14,6 @@ pub use client::{ClientError, DaemonClient};
 pub use local_ops::{
     LocalOpError, PlatformSecretWriter, SecretWriter, data_directory, data_directory_for,
     default_database_path, default_database_path_for, import_secret, init_config,
+    validate_profile_id,
 };
 pub use render::{CliEnvelope, render_json, render_text};

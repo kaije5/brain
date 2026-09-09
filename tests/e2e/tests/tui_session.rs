@@ -108,3 +108,62 @@ async fn tui_renders_real_daemon_state_and_degrades_without_a_model() {
         "chat tab must show the explicit degraded state, got:\n{screen}"
     );
 }
+
+/// The settings editor round-trips a profile edit into `cortexd.toml` and the
+/// written file validates against the daemon's own settings loader.
+#[tokio::test]
+async fn tui_settings_editor_writes_a_valid_config() {
+    let harness = Harness::start().await;
+    let config_path = harness
+        .database_path()
+        .parent()
+        .expect("parent")
+        .join("cortexd.toml");
+    let settings = cortexd::LocalSettings::load(&config_path)
+        .expect("harness settings parse")
+        .expect("harness settings exist");
+
+    let mut app = App::new();
+    app.select_tab(Tab::Settings);
+    app.set_settings_summary(brain::tui::SettingsSummary {
+        config_path: config_path.display().to_string(),
+        default_profile: settings.default_profile_id().map(str::to_owned),
+        profiles: settings
+            .provider_profiles()
+            .expect("valid profiles")
+            .iter()
+            .filter_map(|profile| {
+                Some((
+                    profile.id().as_str().to_owned(),
+                    settings.endpoint_for(profile.id().as_str())?.to_owned(),
+                    profile.enabled(),
+                ))
+            })
+            .collect(),
+        model_status: "resolved by the daemon at startup".to_owned(),
+    });
+
+    app.start_settings_edit();
+    app.begin_text(brain::tui::TextPurpose::NewProfileId);
+    for character in "secondary".chars() {
+        app.editor_text_input(character);
+    }
+    app.confirm_text();
+    app.begin_text(brain::tui::TextPurpose::BaseUrl("secondary".to_owned()));
+    for character in "http://127.0.0.1:9000/v1/".chars() {
+        app.editor_text_input(character);
+    }
+    app.confirm_text();
+    app.save_settings().expect("valid draft saves");
+
+    let settings = cortexd::LocalSettings::load(&config_path)
+        .expect("edited settings parse")
+        .expect("edited settings exist");
+    let ids: Vec<_> = settings
+        .provider_profiles()
+        .expect("valid profiles")
+        .iter()
+        .map(|profile| profile.id().as_str().to_owned())
+        .collect();
+    assert!(ids.contains(&"secondary".to_owned()));
+}

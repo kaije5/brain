@@ -62,19 +62,39 @@ fn handle_key(
     match code {
         KeyCode::Char('q') if modifiers.is_empty() => app.quit(),
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => app.quit(),
-        KeyCode::Esc => app.quit(),
+        KeyCode::Esc => {
+            if let Some(editor) = app.settings_editor() {
+                if editor.pending_purpose().is_some() || editor.pending_confirm().is_some() {
+                    app.cancel_pending();
+                } else {
+                    app.cancel_settings_edit();
+                }
+            } else {
+                app.quit();
+            }
+        }
         KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => app.previous_tab(),
         KeyCode::Tab => app.next_tab(),
         KeyCode::Char('1') => app.select_tab(Tab::Chat),
         KeyCode::Char('2') => app.select_tab(Tab::Tasks),
         KeyCode::Char('3') => app.select_tab(Tab::Notes),
         KeyCode::Char('4') => app.select_tab(Tab::Settings),
+        KeyCode::Up => app.editor_up(),
+        KeyCode::Down => app.editor_down(),
         KeyCode::Backspace => match app.tab {
             Tab::Chat => app.backspace_chat_input(),
             Tab::Notes => app.backspace_note_query(),
-            _ => {}
+            Tab::Settings => {
+                if let Some(editor) = app.settings_editor()
+                    && editor.pending_purpose().is_some()
+                {
+                    app.editor_text_backspace();
+                }
+            }
+            Tab::Tasks => {}
         },
         KeyCode::Enter => match app.tab {
+            Tab::Settings => handle_settings_enter(app),
             Tab::Chat => {
                 app.submit_prompt();
                 request_agent_reply(client, sender, app);
@@ -84,12 +104,56 @@ fn handle_key(
                     request_notes(client, sender, query);
                 }
             }
-            _ => {}
+            Tab::Tasks => {}
         },
         KeyCode::Char(character) => match app.tab {
             Tab::Chat => app.push_chat_input(character),
             Tab::Notes => app.push_note_query(character),
-            _ => {}
+            Tab::Settings => handle_settings_char(app, character),
+            Tab::Tasks => {}
+        },
+        _ => {}
+    }
+}
+
+fn handle_settings_enter(app: &mut App) {
+    let Some(editor) = app.settings_editor() else {
+        return;
+    };
+    if editor.pending_purpose().is_some() || editor.pending_confirm().is_some() {
+        let _ = app.confirm_text_with_store(&crate::local_ops::PlatformSecretWriter);
+        return;
+    }
+    if editor.cursor() == 0 {
+        app.begin_text(super::TextPurpose::DefaultProfile);
+    } else if let Some(profile) = editor.profiles().get(editor.cursor() - 1) {
+        app.begin_text(super::TextPurpose::BaseUrl(profile.id.clone()));
+    }
+}
+
+fn handle_settings_char(app: &mut App, character: char) {
+    let Some(editor) = app.settings_editor() else {
+        if character == 'e' {
+            app.start_settings_edit();
+        }
+        return;
+    };
+    if editor.pending_purpose().is_some() {
+        app.editor_text_input(character);
+        return;
+    }
+    match character {
+        'n' => app.begin_text(super::TextPurpose::NewProfileId),
+        'i' => {
+            if let Some(profile) = editor.profiles().get(editor.cursor().saturating_sub(1)) {
+                app.begin_text(super::TextPurpose::Secret(profile.id.clone()));
+            }
+        }
+        't' => app.toggle_enabled(),
+        'd' => app.begin_delete(),
+        'w' => match app.save_settings() {
+            Ok(()) => {}
+            Err(message) => app.set_status_line(format!("settings: {message}")),
         },
         _ => {}
     }
