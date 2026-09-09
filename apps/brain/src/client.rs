@@ -43,6 +43,7 @@ impl ClientError {
     }
 }
 
+#[derive(Clone)]
 pub struct DaemonClient {
     endpoint_name: String,
     principal_id: Uuid,
@@ -57,8 +58,7 @@ impl DaemonClient {
     /// Returns a redacted category when discovery or protected enrollment cannot be read.
     pub fn from_environment() -> Result<Self, ClientError> {
         let database = std::env::var_os("CORTEX_DATABASE")
-            .map(PathBuf::from)
-            .ok_or(ClientError::DiscoveryUnavailable)?;
+            .map_or_else(cortexd::default_database_path, PathBuf::from);
         let discovery_path = database.with_extension("cortexd-discovery.json");
         let pairing_path = discovery_path.with_extension("cortexd-pairing");
         let discovery: Discovery = serde_json::from_slice(

@@ -1,8 +1,13 @@
 #![forbid(unsafe_code)]
 
-use brain::{Cli, CliEnvelope, DaemonClient, command_request, render_json, render_text};
+use brain::{
+    Cli, CliEnvelope, Command, ConfigCommand, DaemonClient, LocalOpError, PlatformSecretWriter,
+    SecretCommand, command_request, default_database_path, import_secret, init_config, render_json,
+    render_text,
+};
 use clap::Parser;
 use cortexd::WireResult;
+use serde_json::{Value, json};
 
 #[tokio::main]
 async fn main() {
@@ -14,7 +19,9 @@ async fn main() {
     };
     let text = match cli.output {
         brain::Output::Json => render_json(&envelope).unwrap_or_else(|_| {
-            "{\"ok\":false,\"data\":null,\"error\":{\"code\":\"render_failed\"}}\n".to_owned()
+            "{\"ok\":false,\"data\":null,\"error\":{\"code\":\"render_failed\"}}
+"
+            .to_owned()
         }),
         brain::Output::Text => render_text(&envelope),
     };
@@ -24,11 +31,66 @@ async fn main() {
     }
 }
 
-async fn run(cli: &Cli) -> Result<serde_json::Value, brain::ClientError> {
-    let command = command_request(cli).map_err(|_| brain::ClientError::InvalidInput)?;
-    let response = DaemonClient::from_environment()?.request(command).await?;
-    match response.result {
-        WireResult::Success { value } => Ok(value),
-        WireResult::Error { code } => Err(brain::ClientError::Daemon(code)),
+enum RunError {
+    Client(brain::ClientError),
+    Local(LocalOpError),
+    MissingSecret,
+    TuiUnavailable,
+}
+
+impl RunError {
+    fn code(&self) -> &str {
+        match self {
+            Self::Client(error) => error.code(),
+            Self::Local(LocalOpError::ConfigAlreadyExists) => "config_already_exists",
+            Self::Local(LocalOpError::InvalidProfile) => "invalid_profile",
+            Self::Local(LocalOpError::MissingSecret) | Self::MissingSecret => "missing_secret",
+            Self::Local(_) => "secret_store_unavailable",
+            Self::TuiUnavailable => "interactive_terminal_unavailable",
+        }
+    }
+}
+
+async fn run(cli: &Cli) -> Result<Value, RunError> {
+    if cli.command.is_none() {
+        brain::tui::run_interactive()
+            .await
+            .map_err(|_| RunError::TuiUnavailable)?;
+        return Ok(json!({"interactive": true}));
+    }
+    match cli.command.as_ref() {
+        Some(Command::Config(ConfigCommand::Init)) => {
+            let path = init_config(&default_database_path()).map_err(RunError::Local)?;
+            Ok(json!({"config_path": path.to_string_lossy()}))
+        }
+        Some(Command::Secret(SecretCommand::Import { profile })) => {
+            let mut secret = String::new();
+            std::io::stdin()
+                .read_line(&mut secret)
+                .map_err(|_| RunError::MissingSecret)?;
+            let secret = secret.trim().to_owned();
+            if secret.is_empty() {
+                return Err(RunError::MissingSecret);
+            }
+            let secret_ref = import_secret(&PlatformSecretWriter, profile, secret.as_bytes())
+                .map_err(RunError::Local)?;
+            drop(secret);
+            Ok(json!({"secret_ref": secret_ref, "profile": profile}))
+        }
+        _ => {
+            let command = command_request(cli)
+                .map_err(|_| RunError::Client(brain::ClientError::InvalidInput))?;
+            let response = DaemonClient::from_environment()
+                .map_err(RunError::Client)?
+                .request(command)
+                .await
+                .map_err(RunError::Client)?;
+            match response.result {
+                WireResult::Success { value } => Ok(value),
+                WireResult::Error { code } => {
+                    Err(RunError::Client(brain::ClientError::Daemon(code)))
+                }
+            }
+        }
     }
 }

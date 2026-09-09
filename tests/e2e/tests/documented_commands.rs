@@ -33,14 +33,29 @@ fn documented_brain_commands_parse_and_map_to_the_real_daemon_contract() {
     );
     for command in commands {
         let cli = Cli::try_parse_from(command).expect("documented brain command must parse");
-        command_request(&cli).expect("documented brain command must map to daemon IPC");
+        if is_daemon_command(&cli) {
+            command_request(&cli).expect("documented brain command must map to daemon IPC");
+        }
     }
+}
+
+/// `brain config` and `brain secret` are local client operations with no
+/// daemon IPC contract; they are covered by brain's own unit tests.
+fn is_daemon_command(cli: &Cli) -> bool {
+    !matches!(
+        cli.command,
+        Some(brain::Command::Config(_) | brain::Command::Secret(_))
+    )
 }
 
 #[tokio::test]
 async fn every_documented_brain_command_executes_against_the_real_daemon_boundary() {
     let harness = support::Harness::start().await;
     for command in all_documented_brain_commands() {
+        let cli = Cli::try_parse_from(&command).expect("documented brain command must parse");
+        if !is_daemon_command(&cli) {
+            continue;
+        }
         let output = Command::new(env!("CARGO_BIN_EXE_brain-e2e"))
             .args(&command[1..])
             .env("CORTEX_DATABASE", harness.database_path())

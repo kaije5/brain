@@ -7,9 +7,15 @@ workspace: `cortexd` and the `brain` client. It does not install a model server,
 create an Internet-facing service, or enroll a remote MCP identity. Use the
 pinned Rust toolchain selected by the workspace.
 
-Choose a private directory owned by the current OS user. The following examples
-use Windows PowerShell and a deliberately ordinary path; replace it with an
-absolute path that is private to the same user:
+Cortex keeps all local state in one **data directory**: `cortex.db`, its
+discovery/pairing artifacts, and the non-secret `cortexd.toml` settings file.
+By default it is `%LOCALAPPDATA%\cortex` on Windows and
+`$XDG_DATA_HOME/cortex` (or `~/.local/share/cortex`) elsewhere, so normal
+usage needs no environment variable at all. The single documented override is
+`CORTEX_DATABASE`, which points at the database file and thereby selects the
+data directory. The following examples use Windows PowerShell and a
+deliberately ordinary path; replace it with a directory private to the same
+user:
 
 ```powershell
 New-Item -ItemType Directory -Force -Path 'C:\CortexData' | Out-Null
@@ -57,21 +63,91 @@ Commands return a redacted category and a nonzero exit status when the daemon,
 enrollment, input, or request is unavailable. They do not print database paths,
 pairing keys, or raw daemon/storage errors.
 
-## Optional local model configuration
+## Interactive terminal session
 
-The deterministic CLI and lexical search work without a configured model. To
-enable the supported local OpenAI-compatible provider, configure all of the
-following in the daemon process environment before starting `cortexd`:
+Running `brain` with no subcommand opens one interactive full-screen session:
 
-- `CORTEX_MODEL_BASE_URL` — local provider base URL.
-- `CORTEX_MODEL_NAME` — provider model name.
-- `CORTEX_MODEL_SECRET_REF` — optional opaque platform-secret-store reference;
-  this is a locator, never a credential value.
+```powershell
+cargo run -p brain
+```
 
-`CORTEX_MODEL_BASE_URL` and `CORTEX_MODEL_NAME` are an all-or-nothing pair.
-Never put an API key in `CORTEX_MODEL_SECRET_REF`, a command line, this file,
-or an exported configuration. If the provider is unreachable, retrieval remains
-available through its lexical leg and reports the semantic leg as degraded.
+The default tab is agent chat; prompts reuse the daemon's bounded,
+policy-checked agent loop (`cortex_agent_run`). Switch tabs with `Tab`
+(also `1`-`4`), send with `Enter`, quit with `q` or `Esc`:
+
+- **Tasks** lists canonical tasks through the same authorized IPC path as the
+  CLI.
+- **Notes** searches notes and memories.
+- **Settings** shows the local `cortexd.toml` values and the daemon's model
+  status; provider keys are never displayed or edited as raw values here -
+  import or rotate them through the keyring-backed `SecretRef` flow above.
+
+When no eligible model is configured or the provider is unavailable, the chat
+tab shows an explicit degraded state while tasks, notes, and settings keep
+working; there is no silent provider fallback. The TUI is only a view over
+the daemon's typed capabilities and holds no direct database access. All
+one-shot CLI subcommands continue to work unchanged for scripting.
+
+## Local settings: `cortexd.toml`
+
+Non-secret settings live in `cortexd.toml` in the data directory. When the
+file is absent, `cortexd` starts with documented defaults. Write the
+commented template (it documents every supported key and never contains
+credentials) with:
+
+```powershell
+cargo run -p brain -- config init
+```
+
+The template supports a `[daemon]` section (`database` file name and `endpoint`
+override), a `[models] default_profile` selector, and one
+`[models.profiles.<id>]` table per provider with `base_url`, `enabled`, and a
+non-secret `secret_ref` locator. Unknown keys — including anything that looks
+like a raw credential such as `api_key` — are rejected at startup, so secrets
+can never enter the config file, environment variables, or tracked files.
+Environment variables are not a configuration channel.
+
+## Provider credentials: keyring-backed `SecretRef`s
+
+Provider API keys are imported into the OS secret store (Windows Credential
+Manager) and referenced by non-secret `keyring:` locators:
+
+```powershell
+cargo run -p brain -- secret import --profile nim
+# paste the provider API key on stdin, then press Enter
+```
+
+This stores the credential under `cortexd/nim` and prints the `SecretRef`
+`keyring:cortexd/nim` to reference from a model profile:
+
+```toml
+[models]
+default_profile = "nim"
+
+[models.profiles.nim]
+base_url = "http://127.0.0.1:8000/v1/"
+enabled = true
+secret_ref = "keyring:cortexd/nim"
+```
+
+Rotate by re-running `brain secret import --profile nim` for the same profile. Raw secrets
+are never accepted on the command line, in the config file, in logs, or in
+diagnostics; `cortexd` resolves `SecretRef`s through the platform secret store
+at startup only.
+
+## Model routing
+
+On startup, `cortexd` resolves `[models] default_profile` through the
+capability-aware runtime router: it discovers the profile endpoint's models,
+probes their capabilities, and selects an eligible model for the agent role.
+Endpoints for the chat provider must be loopback OpenAI-compatible deployments
+(such as a self-hosted NIM container on `127.0.0.1`). If no profile is
+configured or no eligible model is available, the daemon starts in an explicit
+degraded state: deterministic capabilities (notes, tasks, memories, lexical
+search) keep working and the provider failure is reported — there is no silent
+provider fallback.
+
+## Recoverable deletion and restore
 
 ## Recoverable deletion and restore
 

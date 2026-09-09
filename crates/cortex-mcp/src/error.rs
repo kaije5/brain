@@ -55,9 +55,9 @@ pub fn map_application_error(error: &ApplicationError) -> McpError {
         ApplicationError::PermissionDenied | ApplicationError::PolicyDenied(_) => {
             McpError::permission_denied()
         }
-        ApplicationError::InferenceUnavailable | ApplicationError::InferenceTimeout => {
-            McpError::unavailable()
-        }
+        ApplicationError::InferenceUnavailable
+        | ApplicationError::InferenceTimeout
+        | ApplicationError::NoSuitableModel => McpError::unavailable(),
         ApplicationError::Storage(_) | ApplicationError::Internal => McpError {
             code: "cortex_internal_error".to_owned(),
             message: "Cortex could not complete that operation.".to_owned(),

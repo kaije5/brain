@@ -7,7 +7,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
 
-use crate::{OperationStore, SqliteAuditPort, SqliteRepositories};
+use crate::{OperationStore, SqliteAuditPort, SqliteModelRoutingStore, SqliteRepositories};
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
@@ -55,6 +55,11 @@ impl SqliteDatabase {
     #[must_use]
     pub fn operation_store(&self) -> OperationStore {
         OperationStore::new(self.pool.clone())
+    }
+
+    #[must_use]
+    pub fn model_routing_store(&self) -> SqliteModelRoutingStore {
+        SqliteModelRoutingStore::new(self.pool.clone())
     }
 
     #[cfg(test)]

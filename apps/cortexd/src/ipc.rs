@@ -1487,6 +1487,7 @@ impl From<ApplicationError> for DaemonError {
             ApplicationError::Storage(_)
             | ApplicationError::InferenceUnavailable
             | ApplicationError::InferenceTimeout
+            | ApplicationError::NoSuitableModel
             | ApplicationError::MalformedModelOutput { .. }
             | ApplicationError::Internal => Self::StartupFailed,
         }

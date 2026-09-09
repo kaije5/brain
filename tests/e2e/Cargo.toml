@@ -29,6 +29,7 @@ bench = false
 
 [dev-dependencies]
 axum = "0.8"
+ratatui = "0.29"
 cortex-application = { path = "../../crates/cortex-application" }
 cortex-domain = { path = "../../crates/cortex-domain" }
 cortex-inference = { path = "../../crates/cortex-inference" }

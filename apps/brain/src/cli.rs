@@ -9,8 +9,9 @@ use cortexd::PROTOCOL_VERSION;
 pub struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = Output::Text)]
     pub output: Output,
+    /// Absent subcommand opens the interactive full-screen session.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -33,6 +34,10 @@ pub enum Command {
     Memory(MemoryCommand),
     #[command(subcommand)]
     Remote(RemoteCommand),
+    #[command(subcommand)]
+    Config(ConfigCommand),
+    #[command(subcommand)]
+    Secret(SecretCommand),
     Ask {
         prompt: String,
     },
@@ -61,6 +66,21 @@ pub enum TaskCommand {
 #[derive(Clone, Debug, Subcommand)]
 pub enum MemoryCommand {
     Search(SearchArgs),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Writes the documented `cortexd.toml` template beside the database.
+    Init,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Imports a provider credential from stdin into the OS keyring.
+    Import {
+        #[arg(long)]
+        profile: String,
+    },
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -124,7 +144,10 @@ pub enum CliCommandError {
 ///
 /// Returns an error when a user-supplied limit or due date is invalid.
 pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
-    let (capability, payload, _mutation) = match &cli.command {
+    let Some(command) = &cli.command else {
+        return Err(CliCommandError::InvalidInput);
+    };
+    let (capability, payload, _mutation) = match command {
         Command::Status => ("cortex_daemon_status", json!({}), false),
         Command::Doctor => ("cortex_daemon_doctor", json!({}), false),
         Command::Logs => ("cortex_daemon_logs", json!({}), false),
@@ -157,6 +180,11 @@ pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
             true,
         ),
         Command::Ask { prompt } => ("cortex_agent_run", json!({"prompt":prompt}), false),
+        // `config` and `secret` are local client operations handled by the
+        // binary before any daemon request is built.
+        Command::Config(_) | Command::Secret(_) => {
+            return Err(CliCommandError::InvalidInput);
+        }
     };
     let operation_id = Uuid::now_v7();
     Ok(CommandRequest {

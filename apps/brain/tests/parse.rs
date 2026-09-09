@@ -15,13 +15,13 @@ fn task_add_parses_due_and_json_output() {
     ])
     .expect("CLI parses");
     assert!(matches!(
-        cli.command,
-        Command::Task(TaskCommand::Add { .. })
+        cli.command.as_ref(),
+        Some(Command::Task(TaskCommand::Add { .. }))
     ));
 }
 
 #[test]
 fn every_top_level_command_accepts_json_output() {
     let cli = Cli::try_parse_from(["brain", "--output", "json", "status"]).expect("parses");
-    assert!(matches!(cli.command, Command::Status));
+    assert!(matches!(cli.command.as_ref(), Some(Command::Status)));
 }

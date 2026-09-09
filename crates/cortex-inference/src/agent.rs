@@ -112,6 +112,37 @@ impl AuthorizedCapabilities {
         self.capabilities.contains(&capability)
     }
 
+    /// Resolves the exact capability subset authorized for one agent turn by
+    /// evaluating Cortex policy for every candidate (SCRUM-43). Exposure is
+    /// derived only from policy and typed capability definitions; provider
+    /// content can never expand the result.
+    ///
+    /// # Errors
+    /// Returns a validation error when a duplicate candidate appears in the
+    /// caller-supplied candidate list.
+    pub fn resolve(
+        context: &CommandContext,
+        policy: &dyn cortex_application::PolicyPort,
+        candidates: impl IntoIterator<Item = Capability>,
+    ) -> Result<Self, ApplicationError> {
+        let mut capabilities = BTreeSet::new();
+        for capability in candidates {
+            if matches!(
+                policy.evaluate(context, capability),
+                cortex_domain::PolicyDecision::Allow
+            ) {
+                capabilities.insert(capability);
+            }
+        }
+        Ok(Self { capabilities })
+    }
+
+    /// The provider-neutral tool definitions exposed to the model for this turn.
+    #[must_use]
+    pub fn inference_tools(&self) -> Vec<InferenceTool> {
+        self.iter().map(inference_tool).collect()
+    }
+
     fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
         self.capabilities.iter().copied()
     }

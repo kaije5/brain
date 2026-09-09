@@ -12,7 +12,9 @@ workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
 cortexd = { path = "../cortexd" }
+crossterm = "0.28"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+ratatui = "0.29"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -20,4 +22,9 @@ tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-th
 uuid = { version = "1.24", features = ["serde", "v7"] }
 
 [dev-dependencies]
+ratatui = "0.29"
 tempfile = "3.23"
+[target.'cfg(windows)'.dependencies]
+keyring-core = "1.0"
+windows-native-keyring-store = "1.1"
+zeroize = "1.8"
