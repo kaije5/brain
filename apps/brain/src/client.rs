@@ -254,15 +254,29 @@ impl DaemonClient {
         let request = command.into_daemon_request(self.principal_id);
         let expected = request.request_id;
         write_frame(&mut stream, &request).await?;
-        let response: cortexd::DaemonResponse =
-            serde_json::from_slice(&read_frame(&mut stream).await?)
-                .map_err(|_| ClientError::TransportUnavailable)?;
-        if response.protocol_version != cortexd::PROTOCOL_VERSION || response.request_id != expected
-        {
-            return Err(ClientError::TransportUnavailable);
+        // Agent runs stream partial frames by default; a non-streaming
+        // caller skips them and returns only the terminal frame.
+        loop {
+            let response: cortexd::DaemonResponse =
+                serde_json::from_slice(&read_frame(&mut stream).await?)
+                    .map_err(|_| ClientError::TransportUnavailable)?;
+            if response.protocol_version != cortexd::PROTOCOL_VERSION
+                || response.request_id != expected
+            {
+                return Err(ClientError::TransportUnavailable);
+            }
+            if is_partial(&response.result) {
+                continue;
+            }
+            return Ok(response);
         }
-        Ok(response)
     }
+}
+
+/// True for intermediate streaming frames that non-streaming callers skip.
+fn is_partial(result: &cortexd::WireResult) -> bool {
+    matches!(result, cortexd::WireResult::Success { value }
+        if value.get("partial").is_some())
 }
 
 #[derive(Deserialize)]

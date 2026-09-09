@@ -46,7 +46,7 @@ async fn agent_run_streams_frames_and_the_tui_renders_them_incrementally() {
                 request_id: Uuid::now_v7(),
                 operation_id: Uuid::now_v7(),
                 capability: "cortex_agent_run".to_owned(),
-                payload: json!({"prompt": "hello", "stream": true}),
+                payload: json!({"prompt": "hello"}),
             },
             &on_partial,
         )

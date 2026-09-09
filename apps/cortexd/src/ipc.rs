@@ -1342,9 +1342,9 @@ where
     write_response(stream, &response).await
 }
 
-/// True when the frame asks for the opt-in streaming `cortex_agent_run`
-/// variant. Peeking keeps every other capability on the unchanged
-/// single-response path, so v1 consumers see no protocol difference.
+/// True unless the frame explicitly opts out of streaming with
+/// `"stream": false`. Only `cortex_agent_run` streams; every other
+/// capability stays on the unchanged single-response path.
 fn requests_streaming_agent_output(bytes: &[u8]) -> bool {
     #[derive(Deserialize)]
     struct Peek {
@@ -1353,7 +1353,7 @@ fn requests_streaming_agent_output(bytes: &[u8]) -> bool {
     }
     serde_json::from_slice::<Peek>(bytes).is_ok_and(|peek| {
         peek.capability == "cortex_agent_run"
-            && peek.payload.get("stream").and_then(Value::as_bool) == Some(true)
+            && peek.payload.get("stream").and_then(Value::as_bool) != Some(false)
     })
 }
 

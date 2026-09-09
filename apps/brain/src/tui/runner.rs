@@ -289,7 +289,7 @@ fn request_agent_reply(client: &DaemonClient, sender: mpsc::Sender<Effect>, app:
             request_id: uuid::Uuid::now_v7(),
             operation_id: uuid::Uuid::now_v7(),
             capability: "cortex_agent_run".to_owned(),
-            payload: serde_json::json!({"prompt": prompt, "stream": true}),
+            payload: serde_json::json!({"prompt": prompt}),
         };
         let chunk_sender = sender.clone();
         let on_partial = move |chunk: &str| {
