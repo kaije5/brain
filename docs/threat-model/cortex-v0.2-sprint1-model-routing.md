@@ -1,0 +1,29 @@
+# Cortex Sprint 1 model routing threat model (v0.2 extension)
+
+## Scope
+
+Extends the [v0.1 threat model](cortex-v0.1.md) to the Sprint 1 model-routing slice: the runtime router, the NIM discovery/probing adapter, dynamic capability resolution, and the bounded agent loop over NVIDIA NIM ([ADR-020](../adr/ADR-020-provider-neutral-inference-contract.md) - [ADR-024](../adr/ADR-024-no-silent-model-fallback.md)). `cortexd` remains the final local policy authority; the NIM endpoint is an external, untrusted service that receives exactly one bounded kind of traffic: an authorized agent turn.
+
+## Data boundary
+
+A turn may carry: the user prompt, the authorized capability subset (tool names, descriptions, input schemas), conversation messages including bounded tool results, and provider-neutral structured-output constraints. It may never carry: secret material, database contents outside returned tool results, audit payloads, local paths, or configuration. Discovery and probe traffic carries no personal data beyond the probe prompts themselves.
+
+## Threats and Sprint 1 mitigations
+
+- **Provider/model content exposure (personal data leaves the host):** only explicitly routed turns reach the provider; the [router](../adr/ADR-021-runtime-model-router.md) selects only configured providers, and [no-silent-fallback](../adr/ADR-024-no-silent-model-fallback.md) guarantees data is never sent to an unselected endpoint. Tool results are bounded before re-entering the conversation, and the request envelope is size-limited as in v0.1. Residual: the content of an authorized turn is visible to the provider; this is inherent to choosing NIM and is documented, not hidden.
+- **Credentials and SecretRefs:** the NIM credential exists only in the platform secret store behind an opaque `SecretRef` ([ADR-022](../adr/ADR-022-nvidia-nim-first-provider.md)), resolved by the adapter at call time. Credential values never enter SQLite, profile files, logs, tracing, audit payloads, model context, or error messages; adapter error mapping reports safe categories and status, never response bodies or headers. No credential material is stored in Jira, Confluence, or Git (SCRUM-65 provisioning).
+- **Capability widening:** the capability subset is resolved from Cortex policy and typed capability definitions before the request; unauthorized capabilities are absent from the request, not merely rejected afterwards (SCRUM-43). Tool schemas are generated from provider-neutral contracts. Provider output cannot define, register, or expand tools: the [agent loop](../adr/ADR-023-agent-turn-model-eligibility.md) rejects unknown or unauthorized tool names and validates arguments against typed schemas before any execution, and `cortexd` re-applies policy per tool call.
+- **Malformed structured output:** every tool call and structured response is validated against provider-neutral schemas before use; malformed, oversized, or non-conforming output becomes a typed `MalformedModelOutput` error. Malformed output is never persisted as domain data, never widens access, and never becomes memory content; provenance requirements are unchanged.
+- **Prompt injection:** external content is data, never privileged instruction (v0.1 invariant 9). This now explicitly includes `/v1/models` discovery payloads and model metadata: identifiers are validated and bounded before influencing routing, and metadata is never executed or treated as configuration. Injected instructions inside notes, memories, or tool results cannot grant capabilities, alter policy, or escalate the capability set; every proposed action still passes deterministic `cortexd` policy. Tests cover allowed, denied, mixed, and injection cases.
+- **Stale or poisoned capability catalog:** eligibility derives only from recorded probe evidence with timestamps ([ADR-023](../adr/ADR-023-agent-turn-model-eligibility.md)); stale evidence is not eligibility, and refresh failure never fabricates entries. A model whose behavior drifts after probing is bounded by the same schema validation, policy checks, and loop limits as any other turn.
+- **Probe and discovery abuse (cost/DoS):** probes are deterministic, small, capped per model and per refresh; refresh is an explicit operator or configured action, not a per-turn cost.
+- **Endpoint spoofing and transport attack:** non-loopback provider endpoints require TLS; the endpoint identity comes from validated profile configuration, never from provider responses or model metadata.
+- **Degraded-state information leakage:** `NoSuitableModel` and other routing failures surface safe public categories and remediation hints, never endpoints, credential state details, raw provider errors, or internal identities.
+
+## Residual risks
+
+NVIDIA endpoint availability and trust are outside local control; within an authorized turn, prompt and tool-result content transits NVIDIA infrastructure. Model behavior can change between probes; schema validation, policy enforcement, and loop bounds contain - but cannot eliminate - the effect. A compromised endpoint could return adversarial content, which the external-content-as-data rule and deterministic policy bound to failed or denied actions. A compromised local owner account remains within the host trust boundary, as in v0.1: it can change profiles and grants, so routing security assumes an uncompromised host.
+
+## Verification expectations
+
+Sprint 1 tests (SCRUM-41/42/43/62) must cover: discovery and probing fakes including malformed, oversized, and non-conforming responses; router determinism and eligibility filtering; authentication-required versus keyless endpoints; `NoSuitableModel` degraded behavior without fallback; capability-resolution cases including prompt injection; and structural isolation proving no NVIDIA types compile into `cortex-domain` or `cortex-application`. No core test requires a live NIM service.
