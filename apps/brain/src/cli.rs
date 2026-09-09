@@ -9,8 +9,9 @@ use cortexd::PROTOCOL_VERSION;
 pub struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = Output::Text)]
     pub output: Output,
+    /// Absent subcommand opens the interactive full-screen session.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -143,7 +144,10 @@ pub enum CliCommandError {
 ///
 /// Returns an error when a user-supplied limit or due date is invalid.
 pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
-    let (capability, payload, _mutation) = match &cli.command {
+    let Some(command) = &cli.command else {
+        return Err(CliCommandError::InvalidInput);
+    };
+    let (capability, payload, _mutation) = match command {
         Command::Status => ("cortex_daemon_status", json!({}), false),
         Command::Doctor => ("cortex_daemon_doctor", json!({}), false),
         Command::Logs => ("cortex_daemon_logs", json!({}), false),

@@ -63,6 +63,31 @@ Commands return a redacted category and a nonzero exit status when the daemon,
 enrollment, input, or request is unavailable. They do not print database paths,
 pairing keys, or raw daemon/storage errors.
 
+## Interactive terminal session
+
+Running `brain` with no subcommand opens one interactive full-screen session:
+
+```powershell
+cargo run -p brain
+```
+
+The default tab is agent chat; prompts reuse the daemon's bounded,
+policy-checked agent loop (`cortex_agent_run`). Switch tabs with `Tab`
+(also `1`-`4`), send with `Enter`, quit with `q` or `Esc`:
+
+- **Tasks** lists canonical tasks through the same authorized IPC path as the
+  CLI.
+- **Notes** searches notes and memories.
+- **Settings** shows the local `cortexd.toml` values and the daemon's model
+  status; provider keys are never displayed or edited as raw values here -
+  import or rotate them through the keyring-backed `SecretRef` flow above.
+
+When no eligible model is configured or the provider is unavailable, the chat
+tab shows an explicit degraded state while tasks, notes, and settings keep
+working; there is no silent provider fallback. The TUI is only a view over
+the daemon's typed capabilities and holds no direct database access. All
+one-shot CLI subcommands continue to work unchanged for scripting.
+
 ## Local settings: `cortexd.toml`
 
 Non-secret settings live in `cortexd.toml` in the data directory. When the

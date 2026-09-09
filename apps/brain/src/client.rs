@@ -43,6 +43,7 @@ impl ClientError {
     }
 }
 
+#[derive(Clone)]
 pub struct DaemonClient {
     endpoint_name: String,
     principal_id: Uuid,
