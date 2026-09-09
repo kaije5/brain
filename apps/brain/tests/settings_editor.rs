@@ -56,6 +56,30 @@ fn entering_edit_mode_drafts_the_current_settings() {
 }
 
 #[test]
+fn saving_refreshes_the_settings_summary_and_reopened_editor() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("cortexd.toml");
+    let mut app = app_with_config_path(path.to_str().unwrap());
+    app.start_settings_edit();
+    app.begin_text(TextPurpose::DefaultProfile);
+    for c in "local".chars() {
+        app.editor_text_input(c);
+    }
+    app.confirm_text();
+    app.save_settings().unwrap();
+    app.cancel_settings_edit();
+    assert_eq!(
+        app.settings_summary().unwrap().default_profile.as_deref(),
+        Some("local")
+    );
+    app.start_settings_edit();
+    assert_eq!(
+        app.settings_editor().unwrap().default_profile(),
+        Some("local")
+    );
+}
+
+#[test]
 fn cursor_moves_through_rows() {
     let mut app = app_with_settings();
     app.start_settings_edit();

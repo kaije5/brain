@@ -51,6 +51,15 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
+    #[cfg(test)]
+    pub(crate) fn for_keyboard_tests() -> Self {
+        Self {
+            endpoint_name: "unused-keyboard-test-endpoint".to_owned(),
+            principal_id: Uuid::nil(),
+            signer: SigningKey::from_bytes(&[0; 32]),
+        }
+    }
+
     /// Discovers the local daemon and reads only its per-user enrollment artifact.
     ///
     /// # Errors

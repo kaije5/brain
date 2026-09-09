@@ -130,3 +130,88 @@ fn settings_tab_renders_non_secret_config_and_profile() {
     assert!(screen.contains("nim"));
     assert!(screen.contains("degraded"));
 }
+
+#[test]
+fn tiny_and_offset_viewports_do_not_panic() {
+    for tab in [Tab::Chat, Tab::Tasks, Tab::Notes, Tab::Settings] {
+        let mut app = App::new();
+        app.select_tab(tab);
+        for width in [0, 1, 12, 40, 80] {
+            for height in [0, 1, 2, 3, 6, 24] {
+                let area = ratatui::layout::Rect::new(2, 3, width, height);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                brain::tui::render(&app, area, &mut buffer);
+            }
+        }
+    }
+}
+
+#[test]
+fn empty_screens_explain_the_next_step_and_quit_shortcut() {
+    for (tab, message) in [
+        (Tab::Chat, "Start a conversation"),
+        (Tab::Tasks, "No tasks"),
+        (Tab::Notes, "Type at least 2 characters"),
+    ] {
+        let mut app = App::new();
+        app.select_tab(tab);
+        let screen = render_app(&app);
+        assert!(screen.contains(message), "{screen}");
+        assert!(screen.contains("Ctrl+C"));
+    }
+}
+
+#[test]
+fn long_input_keeps_the_typing_position_visible() {
+    let mut app = App::new();
+    for c in format!("{}END", "x".repeat(200)).chars() {
+        app.push_chat_input(c);
+    }
+    assert!(render_app(&app).contains("END"));
+}
+
+#[test]
+fn newest_chat_reply_stays_visible_after_transcript_fills_screen() {
+    let mut app = App::new();
+    for _ in 0..30 {
+        app.push_chat_input('x');
+        app.submit_prompt();
+        app.receive_agent_reply("An earlier response".to_owned());
+    }
+    app.receive_agent_reply("The latest reply".to_owned());
+    assert!(render_app(&app).contains("The latest reply"));
+}
+
+#[test]
+fn submitting_while_waiting_preserves_the_next_draft() {
+    let mut app = App::new();
+    app.push_chat_input('a');
+    app.submit_prompt();
+    app.push_chat_input('b');
+    app.submit_prompt();
+    assert_eq!(app.transcript().len(), 1);
+    assert_eq!(app.chat_input(), "b");
+}
+
+#[test]
+fn wrapped_history_keeps_latest_reply_and_failure_visible() {
+    let mut app = App::new();
+    for _ in 0..20 {
+        app.receive_agent_reply("x".repeat(99));
+    }
+    app.receive_agent_reply("Latest wrapped reply".to_owned());
+    assert!(render_app(&app).contains("Latest wrapped reply"));
+    app.receive_agent_error("provider_unavailable".to_owned());
+    let screen = render_app(&app);
+    assert!(screen.contains("DEGRADED"));
+    assert!(screen.contains("provider_unavailable"));
+}
+
+#[test]
+fn loaded_status_does_not_replace_contextual_shortcuts() {
+    let mut app = App::new();
+    app.select_tab(Tab::Tasks);
+    app.set_tasks(vec![("A task".to_owned(), "open".to_owned())]);
+    app.set_status_line("1 tasks loaded".to_owned());
+    assert!(render_app(&app).contains("r: refresh"));
+}
