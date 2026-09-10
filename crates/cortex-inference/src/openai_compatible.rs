@@ -4,7 +4,13 @@ use cortex_application::{ApplicationError, Embedding, EmbeddingProvider, SecretR
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{InferenceMessage, InferenceProvider, InferenceRequest, InferenceResponse, ToolCall};
+use crate::{
+    InferenceMessage, InferenceProvider, InferenceRequest, InferenceResponse, ToolCall,
+    error::{
+        ProviderError, classify_http_response, classify_network_error, map_provider_error,
+        read_bounded_body,
+    },
+};
 
 const MAX_MODEL_NAME_BYTES: usize = 256;
 pub(crate) const MAX_CONFIGURED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -173,14 +179,6 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-/// Safe transport failure categories used by the provider adapter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransportError {
-    Timeout,
-    Unavailable,
-    ResponseTooLarge,
-}
-
 /// Injectable JSON transport boundary for deterministic adapter tests.
 #[allow(async_fn_in_trait)]
 pub trait OpenAiTransport: Send + Sync {
@@ -191,7 +189,7 @@ pub trait OpenAiTransport: Send + Sync {
         body: Value,
         timeout: Duration,
         max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError>;
+    ) -> Result<Vec<u8>, ProviderError>;
 }
 
 /// Reusable Reqwest transport for a configured local model server.
@@ -221,49 +219,35 @@ impl OpenAiTransport for ReqwestOpenAiTransport {
         body: Value,
         timeout: Duration,
         max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         let mut request = self.client.post(endpoint).timeout(timeout).json(&body);
         if let Some(value) = bearer.and_then(|token| {
             reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).ok()
         }) {
             request = request.header(reqwest::header::AUTHORIZATION, value);
         }
-        let mut response = request
+        let response = request
             .send()
             .await
-            .map_err(|error| classify_reqwest_error(&error))?
-            .error_for_status()
-            .map_err(|error| classify_reqwest_error(&error))?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > max_response_bytes as u64)
-        {
-            return Err(TransportError::ResponseTooLarge);
+            .map_err(|error| classify_network_error(&error))?;
+        let status = response.status();
+        // Only 4xx/5xx are provider failures; 3xx bodies still parse (redirects
+        // are never followed, but their responses are not classified as errors).
+        if status.is_client_error() || status.is_server_error() {
+            // Provider error payloads are classified into typed categories;
+            // headers other than `Retry-After` and the raw body are dropped.
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .cloned();
+            let error_body = read_bounded_body(response, max_response_bytes).await?;
+            return Err(classify_http_response(
+                status.as_u16(),
+                retry_after.as_ref(),
+                &error_body,
+            ));
         }
-        let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| classify_reqwest_error(&error))?
-        {
-            let next_len = body
-                .len()
-                .checked_add(chunk.len())
-                .ok_or(TransportError::ResponseTooLarge)?;
-            if next_len > max_response_bytes {
-                return Err(TransportError::ResponseTooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
-    }
-}
-
-fn classify_reqwest_error(error: &reqwest::Error) -> TransportError {
-    if error.is_timeout() {
-        TransportError::Timeout
-    } else {
-        TransportError::Unavailable
+        read_bounded_body(response, max_response_bytes).await
     }
 }
 
@@ -334,7 +318,7 @@ where
                 self.config.limits.response_bytes,
             )
             .await
-            .map_err(map_transport_error)?;
+            .map_err(|error| map_provider_error(&error))?;
         decode_response(&response)
     }
 }
@@ -362,22 +346,12 @@ where
                 self.config.limits.response_bytes,
             )
             .await
-            .map_err(map_transport_error)?;
+            .map_err(|error| map_provider_error(&error))?;
         decode_embedding(
             &self.config.model,
             &response,
             self.config.limits.embedding_dimensions,
         )
-    }
-}
-
-pub(crate) fn map_transport_error(error: TransportError) -> ApplicationError {
-    match error {
-        TransportError::Timeout => ApplicationError::InferenceTimeout,
-        TransportError::Unavailable => ApplicationError::InferenceUnavailable,
-        TransportError::ResponseTooLarge => ApplicationError::MalformedModelOutput {
-            reason: "provider response exceeded configured byte limit",
-        },
     }
 }
 

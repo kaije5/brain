@@ -6,13 +6,14 @@ use std::{
 use cortex_application::{ApplicationError, EmbeddingProvider, SecretRef};
 use cortex_inference::{
     InferenceMessage, InferenceProvider, InferenceRequest, InferenceTool, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, OpenAiTransport, ProviderLimits, ToolCall, TransportError,
+    OpenAiCompatibleProvider, OpenAiTransport, ProviderError, ProviderFailureCategory,
+    ProviderLimits, ToolCall,
 };
 use serde_json::{Value, json};
 
 #[derive(Clone)]
 struct FakeTransport {
-    response: Result<Vec<u8>, TransportError>,
+    response: Result<Vec<u8>, ProviderError>,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
 }
 
@@ -26,10 +27,11 @@ struct RecordedRequest {
 }
 
 impl FakeTransport {
-    fn returning(response: Result<Value, TransportError>) -> Self {
+    fn returning(response: Result<Value, ProviderError>) -> Self {
         Self {
             response: response.and_then(|value| {
-                serde_json::to_vec(&value).map_err(|_| TransportError::Unavailable)
+                serde_json::to_vec(&value)
+                    .map_err(|_| ProviderError::from_category(ProviderFailureCategory::Unavailable))
             }),
             requests: Arc::new(Mutex::new(Vec::new())),
         }
@@ -79,10 +81,10 @@ impl OpenAiTransport for FakeTransport {
         body: Value,
         timeout: Duration,
         max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         self.requests
             .lock()
-            .map_err(|_| TransportError::Unavailable)?
+            .map_err(|_| ProviderError::from_category(ProviderFailureCategory::Unavailable))?
             .push(RecordedRequest {
                 endpoint: endpoint.to_owned(),
                 bearer: bearer.map(str::to_owned),
@@ -91,9 +93,9 @@ impl OpenAiTransport for FakeTransport {
                 _max_response_bytes: max_response_bytes,
             });
         match &self.response {
-            Ok(response) if response.len() > max_response_bytes => {
-                Err(TransportError::ResponseTooLarge)
-            }
+            Ok(response) if response.len() > max_response_bytes => Err(
+                ProviderError::from_category(ProviderFailureCategory::MalformedResponse),
+            ),
             response => response.clone(),
         }
     }
@@ -177,9 +179,12 @@ async fn adapter_maps_openai_tool_calls_into_provider_neutral_output() {
 #[tokio::test]
 async fn adapter_maps_transport_failures_to_safe_application_errors() {
     for (transport_error, expected) in [
-        (TransportError::Timeout, ApplicationError::InferenceTimeout),
         (
-            TransportError::Unavailable,
+            ProviderError::from_category(ProviderFailureCategory::Timeout),
+            ApplicationError::InferenceTimeout,
+        ),
+        (
+            ProviderError::from_category(ProviderFailureCategory::Unavailable),
             ApplicationError::InferenceUnavailable,
         ),
     ] {

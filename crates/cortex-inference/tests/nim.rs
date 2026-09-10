@@ -3,8 +3,12 @@ use std::{sync::Mutex, time::Duration};
 use cortex_application::{ApplicationError, SecretRef};
 use cortex_inference::{
     DiscoveredModel, ModelCapability, ModelId, NimConfig, NimDiscovery, NimTransport,
-    TransportError,
+    ProviderError, ProviderFailureCategory,
 };
+
+fn provider_error(category: ProviderFailureCategory) -> ProviderError {
+    ProviderError::from_category(category)
+}
 use serde_json::{Value, json};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -16,8 +20,8 @@ struct FakeNimTransport {
 
 #[derive(Default)]
 struct FakeInner {
-    get_responses: Vec<Result<Vec<u8>, TransportError>>,
-    post_responses: Vec<Result<Vec<u8>, TransportError>>,
+    get_responses: Vec<Result<Vec<u8>, ProviderError>>,
+    post_responses: Vec<Result<Vec<u8>, ProviderError>>,
     get_requests: Vec<(String, Option<String>)>,
     post_requests: Vec<(String, Option<String>, Value)>,
 }
@@ -35,7 +39,7 @@ impl NimTransport for FakeNimTransport {
         bearer: Option<&str>,
         timeout: Duration,
         max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         let _ = (timeout, max_response_bytes);
         let mut inner = self.lock();
         inner
@@ -44,7 +48,7 @@ impl NimTransport for FakeNimTransport {
         inner
             .get_responses
             .pop()
-            .unwrap_or(Err(TransportError::Unavailable))
+            .unwrap_or(Err(provider_error(ProviderFailureCategory::Unavailable)))
     }
 
     async fn post_json(
@@ -54,7 +58,7 @@ impl NimTransport for FakeNimTransport {
         body: Value,
         timeout: Duration,
         max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         let _ = (timeout, max_response_bytes);
         let mut inner = self.lock();
         inner
@@ -63,7 +67,7 @@ impl NimTransport for FakeNimTransport {
         inner
             .post_responses
             .pop()
-            .unwrap_or(Err(TransportError::Unavailable))
+            .unwrap_or(Err(provider_error(ProviderFailureCategory::Unavailable)))
     }
 }
 
@@ -77,8 +81,8 @@ fn config() -> NimConfig {
 }
 
 fn transport(
-    get_responses: Vec<Result<Vec<u8>, TransportError>>,
-    post_responses: Vec<Result<Vec<u8>, TransportError>>,
+    get_responses: Vec<Result<Vec<u8>, ProviderError>>,
+    post_responses: Vec<Result<Vec<u8>, ProviderError>>,
 ) -> FakeNimTransport {
     FakeNimTransport {
         inner: std::sync::Arc::new(Mutex::new(FakeInner {
@@ -179,7 +183,10 @@ async fn keyless_discovery_omits_the_authorization_header() {
 
 #[tokio::test]
 async fn discovery_maps_transport_failure_to_a_safe_typed_error() {
-    let fake = transport(vec![Err(TransportError::Unavailable)], Vec::new());
+    let fake = transport(
+        vec![Err(provider_error(ProviderFailureCategory::Unavailable))],
+        Vec::new(),
+    );
     let discovery = NimDiscovery::new(config(), fake.clone());
 
     let result = discovery.discover(Some("token")).await;
@@ -209,7 +216,10 @@ async fn probing_records_only_capabilities_the_model_demonstrates() {
     // Tool probe succeeds; the structured-output probe is refused by the endpoint.
     let fake = transport(
         Vec::new(),
-        vec![Err(TransportError::Unavailable), Ok(chat_response("ok"))],
+        vec![
+            Err(provider_error(ProviderFailureCategory::Unavailable)),
+            Ok(chat_response("ok")),
+        ],
     );
     let discovery = NimDiscovery::new(config(), fake.clone());
     let model = DiscoveredModel::new(ModelId::new("meta/llama-3.1-70b-instruct").expect("id"));
@@ -274,7 +284,10 @@ async fn refresh_discovers_then_probes_every_model_with_fresh_evidence() {
 
 #[tokio::test]
 async fn refresh_failure_reports_a_degraded_state_without_fabricating_evidence() {
-    let fake = transport(vec![Err(TransportError::Timeout)], Vec::new());
+    let fake = transport(
+        vec![Err(provider_error(ProviderFailureCategory::Timeout))],
+        Vec::new(),
+    );
     let discovery = NimDiscovery::new(config(), fake.clone());
 
     let result = discovery.refresh(Some("token")).await;
