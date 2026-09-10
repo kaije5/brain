@@ -12,7 +12,7 @@ use cortex_domain::{
 };
 use cortex_inference::{
     AgentLimits, AgentRunner, AuthorizedCapabilities, OpenAiCompatibleProvider,
-    ReqwestOpenAiTransport,
+    ReqwestOpenAiTransport, SystemPrompt,
 };
 use cortex_search::{HybridSearchService, SearchRequest};
 use cortex_storage::{
@@ -921,13 +921,26 @@ impl LocalDaemon {
         let context = self.command_context(principal_id, request)?;
         let limits = AgentLimits::new(4, Duration::from_secs(30), 1, 32 * 1024, 128 * 1024)
             .map_err(DaemonError::from)?;
+        // SCRUM-79: the stable tier is the prompt-cache boundary and must stay
+        // byte-identical across sessions; per-session/turn tiers attach here
+        // once the daemon tracks that state.
+        let system_prompt = SystemPrompt::new(
+            "You are Cortex, a local-first personal knowledge agent. \
+             You can read and change the user's notes, tasks, and memories \
+             through the provided tools. Prefer a tool over guessing, never \
+             fabricate entity identifiers, and keep answers concise.",
+        )
+        .map_err(DaemonError::from)?;
         let agent = AgentRunner::new(
             Arc::new(self.embedding_provider.clone()),
             Arc::new(DaemonAgentExecutor {
                 daemon: self.clone(),
             }),
             limits,
-        );
+        )
+        .with_system_prompt(system_prompt)
+        .with_compaction_threshold(limits.max_request_bytes / 2)
+        .map_err(DaemonError::from)?;
         let output = match partials {
             Some(sender) => {
                 let request_id = request.request_id;

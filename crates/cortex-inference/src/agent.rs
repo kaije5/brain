@@ -14,7 +14,7 @@ use uuid::{Uuid, Version};
 
 use crate::{
     InferenceMessage, InferenceProvider, InferenceRequest, InferenceResponse, InferenceTool,
-    ToolCall,
+    SystemPrompt, ToolCall,
 };
 
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
@@ -24,6 +24,9 @@ const MAX_TOOL_CALL_ID_BYTES: usize = 256;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_CONFIGURED_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_CONFIGURED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+const COMPACTION_INSTRUCTION: &str = "Summarize the following conversation excerpt for an assistant that must continue the task without the original messages. Preserve every fact, decision, entity identifier, and instruction needed to continue. Reply with only the summary.";
+const COMPACTION_SUMMARY_HEADER: &str = "[Earlier conversation, summarized]";
 
 /// Hard limits applied to one local agent run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -157,6 +160,8 @@ where
     provider: Arc<P>,
     service: Arc<S>,
     limits: AgentLimits,
+    system_prompt: Option<SystemPrompt>,
+    compaction_threshold_bytes: usize,
 }
 
 impl<P, S> AgentRunner<P, S>
@@ -170,7 +175,38 @@ where
             provider,
             service,
             limits,
+            system_prompt: None,
+            compaction_threshold_bytes: 0,
         }
+    }
+
+    /// Attaches the three-tier system prompt prepended to every request of
+    /// every run. The stable tier stays byte-identical across requests so the
+    /// upstream prompt cache remains warm (SCRUM-79).
+    #[must_use]
+    pub fn with_system_prompt(mut self, system_prompt: SystemPrompt) -> Self {
+        self.system_prompt = Some(system_prompt);
+        self
+    }
+
+    /// Enables context compaction (SCRUM-79): once the serialized request
+    /// exceeds `threshold_bytes`, older turns are summarized by the model and
+    /// replaced instead of failing the request byte limit.
+    ///
+    /// # Errors
+    /// Returns a validation error when the threshold is zero or does not
+    /// leave room below the configured request byte limit.
+    pub fn with_compaction_threshold(
+        mut self,
+        threshold_bytes: usize,
+    ) -> Result<Self, ApplicationError> {
+        if threshold_bytes == 0 || threshold_bytes >= self.limits.max_request_bytes {
+            return Err(ApplicationError::Validation {
+                field: "compaction_threshold_bytes",
+            });
+        }
+        self.compaction_threshold_bytes = threshold_bytes;
+        Ok(self)
     }
 
     /// Runs one bounded agent conversation for an authenticated principal.
@@ -232,14 +268,25 @@ where
         on_chunk: Option<&(dyn Fn(&str) + Send + Sync)>,
     ) -> Result<String, ApplicationError> {
         let tools: Vec<InferenceTool> = allowed_capabilities.iter().map(inference_tool).collect();
-        let mut messages = vec![InferenceMessage::User {
-            content: prompt.to_owned(),
-        }];
+        let mut messages: Vec<InferenceMessage> = self
+            .system_prompt
+            .as_ref()
+            .map(|prompt| InferenceMessage::System {
+                content: prompt.render(),
+            })
+            .into_iter()
+            .chain(std::iter::once(InferenceMessage::User {
+                content: prompt.to_owned(),
+            }))
+            .collect();
         let mut call_states = BTreeMap::<String, CallState>::new();
 
         for _ in 0..self.limits.max_iterations {
             if tokio::time::Instant::now() >= deadline {
                 return Err(ApplicationError::InferenceTimeout);
+            }
+            if self.compaction_threshold_bytes > 0 {
+                self.compact_if_needed(&mut messages, deadline).await?;
             }
             let request = InferenceRequest {
                 messages: messages.clone(),
@@ -318,6 +365,110 @@ where
         }
         malformed("agent iteration limit exceeded")
     }
+
+    /// Replaces older turns with a model-generated summary once the serialized
+    /// conversation approaches the configured request limit. The stable head
+    /// (system prompt and original user prompt) and the most recent turns are
+    /// always preserved so the prompt-cache prefix stays byte-stable.
+    ///
+    /// # Errors
+    /// Returns typed inference errors from the summarization call, or a
+    /// malformed-output error when the model returns no usable summary.
+    async fn compact_if_needed(
+        &self,
+        messages: &mut Vec<InferenceMessage>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), ApplicationError> {
+        let serialized_bytes = serde_json::to_vec(&InferenceRequest {
+            messages: messages.clone(),
+            tools: Vec::new(),
+        })
+        .map_err(|_| ApplicationError::Internal)?;
+        if serialized_bytes.len() <= self.compaction_threshold_bytes {
+            return Ok(());
+        }
+        // Head: system prompt plus the original user prompt.
+        let head = usize::from(matches!(
+            messages.first(),
+            Some(InferenceMessage::System { .. })
+        )) + 1;
+        if let Some(range) = Self::summarizable_range(messages, head)
+            && let Some(summary) = self.summarize(messages, range.clone(), deadline).await?
+        {
+            let mut compacted = messages[..head].to_vec();
+            compacted.push(InferenceMessage::User {
+                content: format!("{COMPACTION_SUMMARY_HEADER}\n{summary}"),
+            });
+            compacted.extend_from_slice(&messages[range.end..]);
+            *messages = compacted;
+        }
+        Ok(())
+    }
+
+    /// The compactable span `[start, end)`, or `None` when the conversation
+    /// has nothing safely compactable: the span must keep at least two recent
+    /// messages and never orphan a tool result from its assistant call.
+    fn summarizable_range(
+        messages: &[InferenceMessage],
+        head: usize,
+    ) -> Option<std::ops::Range<usize>> {
+        let end = messages.len().checked_sub(2)?;
+        if end <= head + 1 {
+            return None;
+        }
+        let mut start = head;
+        while start < end && matches!(messages[start], InferenceMessage::Tool { .. }) {
+            start += 1;
+        }
+        if start >= end {
+            return None;
+        }
+        Some(start..end)
+    }
+
+    async fn summarize(
+        &self,
+        messages: &[InferenceMessage],
+        range: std::ops::Range<usize>,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<String>, ApplicationError> {
+        let transcript =
+            serde_json::to_string(&messages[range]).map_err(|_| ApplicationError::Internal)?;
+        let instruction = format!("{COMPACTION_INSTRUCTION}\n\n{transcript}");
+        if instruction.len() > self.limits.max_message_bytes {
+            // The excerpt itself cannot fit a summarization request; leave the
+            // conversation alone and let the request byte limit fail as before.
+            return Ok(None);
+        }
+        let summary_request = InferenceRequest {
+            messages: messages[..head_len(messages)]
+                .iter()
+                .chain(std::iter::once(&InferenceMessage::User {
+                    content: instruction,
+                }))
+                .cloned()
+                .collect(),
+            tools: Vec::new(),
+        };
+        let response = tokio::time::timeout_at(deadline, self.provider.complete(summary_request))
+            .await
+            .map_err(|_| ApplicationError::InferenceTimeout)??;
+        let summary = response
+            .content
+            .filter(|content| !content.trim().is_empty() && content.len() <= MAX_TEXT_BYTES)
+            .filter(|_| response.tool_calls.is_empty())
+            .ok_or(ApplicationError::MalformedModelOutput {
+                reason: "context compaction produced no usable summary",
+            })?;
+        Ok(Some(summary))
+    }
+}
+
+fn head_len(messages: &[InferenceMessage]) -> usize {
+    usize::from(matches!(
+        messages.first(),
+        Some(InferenceMessage::System { .. })
+    ))
 }
 
 #[derive(Clone, Copy)]

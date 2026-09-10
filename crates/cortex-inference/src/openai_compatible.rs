@@ -481,6 +481,10 @@ fn encode_request(model: &str, request: InferenceRequest) -> Result<Value, Appli
 
 fn encode_message(message: InferenceMessage) -> Result<Value, ApplicationError> {
     match message {
+        InferenceMessage::System { content } => Ok(json!({
+            "role": "system",
+            "content": content
+        })),
         InferenceMessage::User { content } => Ok(json!({
             "role": "user",
             "content": content
