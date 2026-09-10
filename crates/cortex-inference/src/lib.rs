@@ -5,6 +5,7 @@ mod nim;
 mod openai_compatible;
 mod provider;
 mod routing;
+mod system_prompt;
 
 pub use agent::{AgentLimits, AgentRunner, AuthorizedCapabilities};
 pub use nim::{NimConfig, NimDiscovery, NimTransport, ReqwestNimTransport};
@@ -20,3 +21,4 @@ pub use routing::{
     DiscoveredModel, ModelCapability, ModelCatalog, ModelId, ModelRouter, ProviderProfile,
     ProviderProfileId, RoleRoutingPolicy, RoutedModel,
 };
+pub use system_prompt::SystemPrompt;
