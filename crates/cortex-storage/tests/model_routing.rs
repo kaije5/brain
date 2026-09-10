@@ -154,3 +154,48 @@ async fn blank_profile_ids_are_rejected_at_the_store_boundary() -> Result<(), St
     assert!(matches!(&result, Err(ApplicationError::Validation { .. })));
     Ok(())
 }
+
+#[tokio::test]
+async fn route_decision_round_trips_and_replaces_the_previous_selection() -> Result<(), String> {
+    let (_temp, database) = database().await;
+    let store = database.model_routing_store();
+    ensure_profile(&database, "alpha").await;
+    ensure_profile(&database, "beta").await;
+
+    assert!(store.load_route().await.is_ok_and(|route| route.is_none()));
+
+    store
+        .record_route("beta", "model-a", "2026-09-10T12:00:00Z")
+        .await
+        .map_err(|error| debug_error(&error))?;
+    let decision = store
+        .load_route()
+        .await
+        .map_err(|error| debug_error(&error))?
+        .expect("decision recorded");
+    assert_eq!(decision.profile_id, "beta");
+    assert_eq!(decision.model_id, "model-a");
+    assert_eq!(decision.routed_at, "2026-09-10T12:00:00Z");
+
+    // The latest resolution replaces the previous decision, identifiers only.
+    store
+        .record_route("alpha", "model-b", "2026-09-10T13:00:00Z")
+        .await
+        .map_err(|error| debug_error(&error))?;
+    let decision = store
+        .load_route()
+        .await
+        .map_err(|error| debug_error(&error))?
+        .expect("decision replaced");
+    assert_eq!(decision.profile_id, "alpha");
+    assert_eq!(decision.model_id, "model-b");
+
+    // Invalid identifiers are rejected before any write.
+    assert!(
+        store
+            .record_route("", "model-a", "2026-09-10T14:00:00Z")
+            .await
+            .is_err()
+    );
+    Ok(())
+}

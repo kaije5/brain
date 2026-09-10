@@ -10,6 +10,7 @@ use crate::{
         ProviderError, classify_http_response, classify_network_error, map_provider_error,
         read_bounded_body,
     },
+    routing::ProviderQuirks,
 };
 
 const MAX_MODEL_NAME_BYTES: usize = 256;
@@ -72,6 +73,7 @@ pub struct OpenAiCompatibleConfig {
     secret_reference: Option<SecretRef>,
     timeout: Duration,
     limits: ProviderLimits,
+    quirks: ProviderQuirks,
 }
 
 impl OpenAiCompatibleConfig {
@@ -133,7 +135,20 @@ impl OpenAiCompatibleConfig {
             secret_reference,
             timeout,
             limits,
+            quirks: ProviderQuirks::default(),
         })
+    }
+
+    /// Attaches typed OpenAI-compatibility quirks from the provider profile.
+    #[must_use]
+    pub const fn with_quirks(mut self, quirks: ProviderQuirks) -> Self {
+        self.quirks = quirks;
+        self
+    }
+
+    #[must_use]
+    pub const fn quirks(&self) -> ProviderQuirks {
+        self.quirks
     }
 
     #[must_use]
@@ -307,7 +322,7 @@ where
         &self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, ApplicationError> {
-        let body = encode_request(&self.config.model, request)?;
+        let body = encode_request(&self.config.model, request, self.config.quirks)?;
         let response = self
             .transport
             .post_json(
@@ -425,7 +440,11 @@ mod tests {
     }
 }
 
-fn encode_request(model: &str, request: InferenceRequest) -> Result<Value, ApplicationError> {
+fn encode_request(
+    model: &str,
+    request: InferenceRequest,
+    quirks: ProviderQuirks,
+) -> Result<Value, ApplicationError> {
     let messages = request
         .messages
         .into_iter()
@@ -445,12 +464,21 @@ fn encode_request(model: &str, request: InferenceRequest) -> Result<Value, Appli
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({
+    let mut body = json!({
         "model": model,
         "messages": messages,
         "tools": tools,
         "tool_choice": "auto"
-    }))
+    });
+    // The `omit_tool_choice` quirk (SCRUM-82): some OpenAI-compatible servers
+    // reject `tool_choice` alongside `tools`; omitting the field leaves the
+    // default (auto) selection in force.
+    if quirks.omit_tool_choice() {
+        body.as_object_mut()
+            .expect("statically built object")
+            .remove("tool_choice");
+    }
+    Ok(body)
 }
 
 fn encode_message(message: InferenceMessage) -> Result<Value, ApplicationError> {

@@ -3,8 +3,9 @@ use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use chrono::Utc;
 use cortex_application::{ApplicationError, SecretRef};
 use cortex_inference::{
-    ModelRouter, NimConfig, NimDiscovery, NimTransport, OpenAiCompatibleConfig, ProviderLimits,
-    ProviderProfile, ProviderProfileId, RoleRoutingPolicy, RoutedModel,
+    ApiMode, AuthStrategy, DiscoveredModel, ModelCatalog, ModelId, ModelRouter, NimConfig,
+    NimDiscovery, NimTransport, OpenAiCompatibleConfig, ProfileTimeouts, ProviderLimits,
+    ProviderProfile, ProviderProfileId, ProviderQuirks, RoleRoutingPolicy, RoutedModel,
 };
 use serde::Deserialize;
 
@@ -21,10 +22,12 @@ pub enum SettingsError {
 }
 
 impl From<ApplicationError> for SettingsError {
-    fn from(_: ApplicationError) -> Self {
-        Self::Invalid {
-            field: "secret_ref",
-        }
+    fn from(error: ApplicationError) -> Self {
+        let field = match error {
+            ApplicationError::Validation { field } => field,
+            _ => "secret_ref",
+        };
+        Self::Invalid { field }
     }
 }
 
@@ -49,6 +52,35 @@ struct ModelsSection {
     profiles: Option<BTreeMap<String, ModelProfileEntry>>,
 }
 
+/// Wire protocol spoken by a profile. Only the OpenAI-compatible completions
+/// mode exists (SCRUM-82); unknown names are rejected at parse time.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum ConfigApiMode {
+    #[default]
+    #[serde(rename = "openai_completions")]
+    OpenAiCompletions,
+}
+
+/// Typed auth strategy. `secret_ref` requires the profile's `secret_ref`
+/// locator; a raw credential key is structurally impossible because unknown
+/// fields are rejected.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum ConfigAuthType {
+    #[default]
+    None,
+    SecretRef,
+}
+
+/// Typed, narrow OpenAI-compatibility quirks; no free-form escape hatch.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct ConfigQuirks {
+    #[serde(default)]
+    omit_tool_choice: bool,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelProfileEntry {
@@ -56,10 +88,44 @@ struct ModelProfileEntry {
     #[serde(default = "enabled_by_default")]
     enabled: bool,
     secret_ref: Option<String>,
+    #[serde(default)]
+    api_mode: ConfigApiMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_type: Option<ConfigAuthType>,
+    #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+    #[serde(default)]
+    request_timeout_ms: Option<u64>,
+    #[serde(default)]
+    stale_stream_timeout_ms: Option<u64>,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    quirks: ConfigQuirks,
 }
 
 fn enabled_by_default() -> bool {
     true
+}
+
+/// Per-profile timeouts; unset fields keep the historical 5 s default so
+/// existing single-profile configurations behave exactly as before.
+///
+/// # Errors
+/// Returns [`SettingsError::Invalid`] when any declared timeout is zero.
+fn profile_timeouts(entry: &ModelProfileEntry) -> Result<ProfileTimeouts, SettingsError> {
+    let defaults = ProfileTimeouts::default();
+    let connect = entry
+        .connect_timeout_ms
+        .map_or(defaults.connect(), Duration::from_millis);
+    let request = entry
+        .request_timeout_ms
+        .map_or(defaults.request(), Duration::from_millis);
+    let stale_stream = entry
+        .stale_stream_timeout_ms
+        .map_or(defaults.stale_stream(), Duration::from_millis);
+    ProfileTimeouts::new(connect, request, stale_stream)
+        .map_err(|_| SettingsError::Invalid { field: "timeouts" })
 }
 
 /// Non-secret local settings loaded from `cortexd.toml` beside the database.
@@ -121,11 +187,18 @@ impl LocalSettings {
 # the daemon explicitly degraded (no silent fallback).
 #default_profile = "nim"
 
-# One table per provider profile, keyed by profile id.
+# One table per provider profile, keyed by profile id. Optional typed keys:
+# api_mode ("openai_completions"), auth_type ("none" | "secret_ref"), per-phase
+# timeouts in milliseconds (connect_timeout_ms, request_timeout_ms,
+# stale_stream_timeout_ms), a declared model allowlist ("models"), and typed
+# "quirks" (omit_tool_choice). Unknown keys — including any raw credential
+# field — are rejected at startup.
 #[models.profiles.nim]
 #base_url = "https://integrate.api.nvidia.com/v1"
 #enabled = true
 #secret_ref = "keyring:cortexd/nim"
+#auth_type = "secret_ref"
+#request_timeout_ms = 5000
 "#
     }
 
@@ -152,8 +225,10 @@ impl LocalSettings {
     /// material never appears here, only opaque `SecretRef` locators.
     ///
     /// # Errors
-    /// Returns [`SettingsError::Invalid`] when a profile id or secret
-    /// reference fails validation.
+    /// Returns [`SettingsError::Invalid`] when a profile id, secret
+    /// reference, auth strategy, timeout, or declared model fails validation
+    /// — including an `auth_type = "secret_ref"` profile without a
+    /// `secret_ref`, and a keyless profile that declares one anyway.
     pub fn provider_profiles(&self) -> Result<Vec<ProviderProfile>, SettingsError> {
         let mut profiles = Vec::new();
         for (id, entry) in self.models.profiles.iter().flatten() {
@@ -163,9 +238,42 @@ impl LocalSettings {
                 .as_deref()
                 .map(SecretRef::new)
                 .transpose()?;
+            // The declared auth strategy and the presence of a secret locator
+            // must agree. An unset `auth_type` keeps legacy configurations
+            // working: a `secret_ref` implies `secret_ref` auth, no locator
+            // implies keyless. A pasted credential has no representable field.
+            let wants_secret = match entry.auth_type {
+                // Unset keeps legacy configs working: infer from the locator.
+                None => entry.secret_ref.is_some(),
+                Some(ConfigAuthType::SecretRef) => true,
+                Some(ConfigAuthType::None) => false,
+            };
+            let auth = match (wants_secret, entry.secret_ref.is_some()) {
+                (true, true) => AuthStrategy::SecretRef,
+                (false, false) => AuthStrategy::None,
+                // Explicit strategy contradicting the locator presence.
+                (true, false) | (false, true) => {
+                    return Err(SettingsError::Invalid { field: "auth_type" });
+                }
+            };
+            let timeouts = profile_timeouts(entry)?;
+            let declared_models = entry
+                .models
+                .iter()
+                .map(|model| ModelId::new(model).map_err(SettingsError::from))
+                .collect::<Result<Vec<_>, _>>()?;
+            let quirks =
+                ProviderQuirks::default().with_omit_tool_choice(entry.quirks.omit_tool_choice);
             profiles.push(
                 ProviderProfile::new(profile_id, entry.enabled)?
-                    .with_secret_reference(secret_reference),
+                    .with_secret_reference(secret_reference)
+                    .with_api_mode(match entry.api_mode {
+                        ConfigApiMode::OpenAiCompletions => ApiMode::OpenAiCompletions,
+                    })
+                    .with_auth_strategy(auth)
+                    .with_timeouts(timeouts)
+                    .with_quirks(quirks)
+                    .with_declared_models(declared_models),
             );
         }
         Ok(profiles)
@@ -267,7 +375,6 @@ pub enum ModelResolution {
     },
 }
 
-const MODEL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EVIDENCE_AGE: Duration = Duration::from_hours(24);
 
 const MODEL_RESPONSE_BYTES: usize = 64 * 1024;
@@ -283,14 +390,18 @@ fn profile_and_secret(profiles: &[ProviderProfile], profile_id: &str) -> Option<
 }
 
 /// Resolves the settings' default model profile through the SCRUM-41 runtime
-/// router: fresh NIM discovery builds the capability catalog, then the
-/// deterministic agent-role policy selects the model. The bearer credential
-/// is resolved once by the daemon composition root (from the profile's
-/// `SecretRef`) and crosses only the transport boundary.
+/// router: fresh NIM discovery on every enabled profile builds the capability
+/// catalog (each with its own declared endpoint, auth strategy, and timeouts),
+/// then the deterministic agent-role policy selects the
+/// `{profile_id, model_id}` route. The bearer credential is resolved once by
+/// the daemon composition root (from the profile's `SecretRef`) and crosses
+/// only the transport boundary — and only to profiles whose auth strategy is
+/// `secret_ref`.
 ///
-/// Discovery and probes talk to the configured endpoint; failures surface as
+/// Discovery and probes talk to the configured endpoints; failures surface as
 /// [`ModelResolution::Degraded`] rather than blocking deterministic operation.
-pub async fn resolve_default_model<T: NimTransport>(
+/// There is no fallback: the routed selection is the typed decision.
+pub async fn resolve_default_model<T: NimTransport + Clone>(
     settings: Option<&LocalSettings>,
     transport: T,
     bearer: Option<&str>,
@@ -307,7 +418,7 @@ pub async fn resolve_default_model<T: NimTransport>(
             secret: None,
         };
     };
-    let Some(profile) = profiles
+    let Some(default_profile) = profiles
         .iter()
         .find(|profile| profile.id().as_str() == profile_id && profile.enabled())
     else {
@@ -316,47 +427,51 @@ pub async fn resolve_default_model<T: NimTransport>(
             secret: profile_and_secret(&profiles, &profile_id),
         };
     };
-    let base_url = settings.endpoint_for(&profile_id).unwrap_or_default();
-    let Ok(discovery_config) =
-        NimConfig::new(base_url, profile.secret_reference().cloned(), MODEL_TIMEOUT)
-    else {
-        return ModelResolution::Degraded {
-            reason: "invalid_endpoint",
-            secret: profile_and_secret(&profiles, &profile_id),
-        };
-    };
-    let catalog = NimDiscovery::new(discovery_config, transport)
-        .refresh(bearer)
-        .await;
-    let Ok(catalog) = catalog else {
+
+    let discovery = discover_enabled_profiles(
+        settings,
+        &profiles,
+        default_profile.id(),
+        &transport,
+        bearer,
+    )
+    .await;
+    let Some(discovered) = discovery else {
         return ModelResolution::Degraded {
             reason: "provider_unavailable",
             secret: profile_and_secret(&profiles, &profile_id),
         };
     };
+
     let Ok(policy) = RoleRoutingPolicy::agent_default(MAX_EVIDENCE_AGE) else {
         return ModelResolution::Degraded {
             reason: "invalid_routing_policy",
             secret: profile_and_secret(&profiles, &profile_id),
         };
     };
+    let catalog = ModelCatalog::new(discovered);
     let Ok(route) = ModelRouter::select(&policy, &profiles, &catalog, Utc::now()) else {
         return ModelResolution::Degraded {
             reason: "no_eligible_model",
             secret: profile_and_secret(&profiles, &profile_id),
         };
     };
-    let Some(routed_base_url) = settings.endpoint_for(route.profile_id.as_str()) else {
+    let Some(routed_profile) = profiles
+        .iter()
+        .find(|profile| profile.id() == &route.profile_id)
+    else {
         return ModelResolution::Degraded {
             reason: "routed_profile_missing",
             secret: profile_and_secret(&profiles, &profile_id),
         };
     };
-    let routed_secret = profiles
-        .iter()
-        .find(|profile| profile.id() == &route.profile_id)
-        .and_then(|profile| profile.secret_reference())
-        .cloned();
+    let Some(routed_base_url) = settings.endpoint_for(route.profile_id.as_str()) else {
+        return ModelResolution::Degraded {
+            reason: "routed_profile_missing",
+            secret: routed_profile.secret_reference().cloned(),
+        };
+    };
+    let routed_secret = routed_profile.secret_reference().cloned();
     let Ok(limits) = ProviderLimits::new(
         MODEL_RESPONSE_BYTES,
         MODEL_EMBEDDING_INPUT_BYTES,
@@ -367,26 +482,81 @@ pub async fn resolve_default_model<T: NimTransport>(
             secret: profile_and_secret(&profiles, &profile_id),
         };
     };
-    let discovered = catalog
-        .models()
-        .iter()
-        .map(|model| model.model_id().as_str().to_owned())
-        .collect();
+    let models = catalog_model_ids(catalog.models());
     match OpenAiCompatibleConfig::new(
         routed_base_url,
         route.model_id.as_str(),
         routed_secret.clone(),
-        MODEL_TIMEOUT,
+        routed_profile.timeouts().request(),
         limits,
-    ) {
+    )
+    .map(|config| config.with_quirks(routed_profile.quirks()))
+    {
         Ok(config) => ModelResolution::Configured {
             config,
             route,
-            models: discovered,
+            models,
         },
         Err(_) => ModelResolution::Degraded {
             reason: "invalid_model_config",
             secret: routed_secret,
         },
     }
+}
+
+/// Bounded discovery across every enabled profile, each with its own
+/// endpoint, auth strategy, and request timeout. Discoveries are attributed
+/// to their profile so the router can never pair a model with another
+/// profile's evidence. Returns `None` when the default profile's discovery
+/// fails; other profiles degrade best-effort so one unreachable endpoint
+/// cannot hide an eligible alternative.
+async fn discover_enabled_profiles<T: NimTransport + Clone>(
+    settings: &LocalSettings,
+    profiles: &[ProviderProfile],
+    default_profile_id: &ProviderProfileId,
+    transport: &T,
+    bearer: Option<&str>,
+) -> Option<Vec<DiscoveredModel>> {
+    let mut discovered = Vec::new();
+    for profile in profiles.iter().filter(|profile| profile.enabled()) {
+        let base_url = settings.endpoint_for(profile.id().as_str())?;
+        let Ok(discovery_config) = NimConfig::new(
+            base_url,
+            profile.secret_reference().cloned(),
+            profile.timeouts().request(),
+        ) else {
+            if profile.id() == default_profile_id {
+                return None;
+            }
+            continue;
+        };
+        // Credentials cross the transport boundary only for profiles whose
+        // typed auth strategy references secret material.
+        let profile_bearer = match profile.auth_strategy() {
+            AuthStrategy::SecretRef => bearer,
+            AuthStrategy::None => None,
+        };
+        match NimDiscovery::new(discovery_config, transport.clone())
+            .refresh(profile_bearer)
+            .await
+        {
+            Ok(catalog) => discovered.extend(
+                catalog
+                    .models()
+                    .iter()
+                    .cloned()
+                    .map(|model| model.with_profile(profile.id().clone())),
+            ),
+            Err(_) if profile.id() == default_profile_id => return None,
+            Err(_) => {}
+        }
+    }
+    Some(discovered)
+}
+
+fn catalog_model_ids(models: &[DiscoveredModel]) -> Vec<String> {
+    models
+        .iter()
+        .map(|model| model.model_id().as_str().to_owned())
+        .collect()
 }

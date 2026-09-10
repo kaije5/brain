@@ -462,6 +462,24 @@ impl LocalDaemon {
         }
     }
 
+    /// Persists the durable routing decision `{profile_id, model_id}` so
+    /// diagnostics can report which profile served which model. Only
+    /// identifiers and a timestamp are stored; secrets never reach storage
+    /// (SCRUM-82).
+    ///
+    /// # Errors
+    /// Returns the storage failure when the decision cannot be recorded.
+    pub async fn record_route(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+    ) -> Result<(), cortex_application::ApplicationError> {
+        self.database
+            .model_routing_store()
+            .record_route(profile_id, model_id, &chrono::Utc::now().to_rfc3339())
+            .await
+    }
+
     /// The discovered model catalog when background resolution completed;
     /// empty while resolution is pending, disabled, or degraded.
     #[must_use]

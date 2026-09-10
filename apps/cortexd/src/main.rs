@@ -24,6 +24,17 @@ fn default_profile_secret(settings: Option<&LocalSettings>) -> Option<cortexd::S
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = data_directory();
     let settings = LocalSettings::load(&directory.join("cortexd.toml"))?;
+    // SCRUM-82: fail fast on structurally invalid provider profile
+    // configuration. A runtime-unreachable provider degrades explicitly
+    // later; a profile that fails validation is a startup error.
+    if let Some(Err(cortexd::SettingsError::Invalid { field })) =
+        settings.as_ref().map(LocalSettings::provider_profiles)
+    {
+        return Err(format!(
+            "invalid provider profile configuration in cortexd.toml (field: {field})"
+        )
+        .into());
+    }
     let database_path = settings
         .as_ref()
         .and_then(LocalSettings::database_override)
@@ -55,8 +66,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         {
             ModelResolution::Disabled => {}
-            ModelResolution::Configured { config, models, .. } => {
+            ModelResolution::Configured {
+                config,
+                models,
+                route,
+            } => {
                 resolve_daemon.install_resolved_model(config, bearer.map(str::to_owned), models);
+                // SCRUM-82: persist the typed {profile_id, model_id} decision
+                // for diagnostics; identifiers only, never secrets.
+                if let Err(error) = resolve_daemon
+                    .record_route(route.profile_id.as_str(), route.model_id.as_str())
+                    .await
+                {
+                    eprintln!("cortexd: routing decision not persisted: {error:?}");
+                }
             }
             ModelResolution::Degraded { reason, .. } => {
                 eprintln!("cortexd: model inference degraded: {reason}");

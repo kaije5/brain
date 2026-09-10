@@ -118,11 +118,21 @@ cargo run -p brain -- config init
 
 The template supports a `[daemon]` section (`database` file name and `endpoint`
 override), a `[models] default_profile` selector, and one
-`[models.profiles.<id>]` table per provider with `base_url`, `enabled`, and a
-non-secret `secret_ref` locator. Unknown keys — including anything that looks
-like a raw credential such as `api_key` — are rejected at startup, so secrets
-can never enter the config file, environment variables, or tracked files.
-Environment variables are not a configuration channel.
+`[models.profiles.<id>]` table per provider. Each profile accepts `base_url`,
+`enabled`, a non-secret `secret_ref` locator, and typed SCRUM-82 keys:
+`api_mode` (`openai_completions`), `auth_type` (`none` or `secret_ref`; when
+omitted it is inferred from the presence of `secret_ref`), per-phase timeouts
+(`connect_timeout_ms`, `request_timeout_ms`, `stale_stream_timeout_ms`), a
+declared model allowlist (`models`), and typed provider `quirks`
+(`omit_tool_choice`). Unknown keys — including anything that looks like a raw
+credential such as `api_key` — are rejected at startup, so secrets can never
+enter the config file, environment variables, or tracked files. A profile
+whose auth strategy contradicts its `secret_ref` (or a zero timeout) fails
+startup with a clear configuration error. Routing decisions are persisted as
+typed `{profile_id, model_id}` selections; profiles with fresh capability
+evidence are discovered across every enabled profile, and the router selects
+deterministically with no silent fallback. Environment variables are not a
+configuration channel.
 
 ## Provider credentials: keyring-backed `SecretRef`s
 

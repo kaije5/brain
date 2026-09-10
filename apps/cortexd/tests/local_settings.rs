@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use cortex_inference::{ApiMode, AuthStrategy};
 use cortexd::{LocalSettings, SettingsError};
 use tempfile::TempDir;
 
@@ -119,4 +120,159 @@ fn committed_template_documents_every_supported_key_and_parses() {
         settings.provider_profiles().is_ok(),
         "template profiles must build"
     );
+}
+
+#[test]
+fn fully_populated_profile_parses_all_typed_fields() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_settings(
+        directory.path(),
+        r#"
+[models]
+default_profile = "nim"
+
+[models.profiles.nim]
+base_url = "https://integrate.api.nvidia.com/v1"
+secret_ref = "keyring:cortexd/nim"
+api_mode = "openai_completions"
+auth_type = "secret_ref"
+connect_timeout_ms = 2000
+request_timeout_ms = 9000
+stale_stream_timeout_ms = 15000
+models = ["meta/llama-3.1-70b-instruct"]
+
+[models.profiles.nim.quirks]
+omit_tool_choice = true
+"#,
+    );
+    let settings = LocalSettings::load(&path)
+        .expect("valid settings")
+        .expect("file present");
+    let profiles = settings.provider_profiles().expect("valid profiles");
+    let nim = profiles
+        .iter()
+        .find(|profile| profile.id().as_str() == "nim")
+        .expect("nim profile");
+    assert_eq!(nim.api_mode(), ApiMode::OpenAiCompletions);
+    assert_eq!(nim.auth_strategy(), AuthStrategy::SecretRef);
+    assert_eq!(nim.timeouts().connect().as_millis(), 2_000);
+    assert_eq!(nim.timeouts().request().as_millis(), 9_000);
+    assert_eq!(nim.timeouts().stale_stream().as_millis(), 15_000);
+    assert_eq!(nim.declared_models().len(), 1);
+    assert!(nim.quirks().omit_tool_choice());
+}
+
+#[test]
+fn unsupported_api_mode_is_rejected_at_parse_time() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_settings(
+        directory.path(),
+        r#"
+[models.profiles.nim]
+base_url = "https://integrate.api.nvidia.com/v1"
+api_mode = "anthropic_messages"
+"#,
+    );
+    assert!(matches!(
+        LocalSettings::load(&path),
+        Err(SettingsError::Invalid { .. })
+    ));
+}
+
+#[test]
+fn auth_type_must_agree_with_the_secret_locator() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let secret_ref_without_auth = write_settings(
+        directory.path(),
+        r#"
+[models.profiles.a]
+base_url = "https://integrate.api.nvidia.com/v1"
+auth_type = "secret_ref"
+"#,
+    );
+    assert!(
+        matches!(
+            LocalSettings::load(&secret_ref_without_auth)
+                .expect("parses")
+                .expect("present")
+                .provider_profiles(),
+            Err(SettingsError::Invalid { field: "auth_type" })
+        ),
+        "secret_ref auth without a locator must fail validation"
+    );
+
+    let keyless_with_locator = write_settings(
+        directory.path(),
+        r#"
+[models.profiles.a]
+base_url = "http://127.0.0.1:8000/v1"
+secret_ref = "keyring:cortexd/local"
+auth_type = "none"
+"#,
+    );
+    assert!(
+        matches!(
+            LocalSettings::load(&keyless_with_locator)
+                .expect("parses")
+                .expect("present")
+                .provider_profiles(),
+            Err(SettingsError::Invalid { field: "auth_type" })
+        ),
+        "keyless auth with a locator must fail validation"
+    );
+}
+
+#[test]
+fn zero_timeouts_are_rejected_at_startup() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_settings(
+        directory.path(),
+        r#"
+[models.profiles.a]
+base_url = "http://127.0.0.1:8000/v1"
+request_timeout_ms = 0
+"#,
+    );
+    assert!(matches!(
+        LocalSettings::load(&path)
+            .expect("parses")
+            .expect("present")
+            .provider_profiles(),
+        Err(SettingsError::Invalid { field: "timeouts" })
+    ));
+}
+
+#[test]
+fn legacy_profiles_keep_working_without_explicit_auth_type() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_settings(
+        directory.path(),
+        r#"
+[models]
+default_profile = "nim"
+
+[models.profiles.nim]
+base_url = "https://integrate.api.nvidia.com/v1"
+secret_ref = "keyring:cortexd/nim"
+
+[models.profiles.keyless]
+base_url = "http://127.0.0.1:8000/v1"
+"#,
+    );
+    let settings = LocalSettings::load(&path)
+        .expect("valid settings")
+        .expect("file present");
+    let profiles = settings.provider_profiles().expect("valid profiles");
+    let nim = profiles
+        .iter()
+        .find(|profile| profile.id().as_str() == "nim")
+        .expect("nim profile");
+    let keyless = profiles
+        .iter()
+        .find(|profile| profile.id().as_str() == "keyless")
+        .expect("keyless profile");
+    assert_eq!(nim.auth_strategy(), AuthStrategy::SecretRef);
+    assert_eq!(keyless.auth_strategy(), AuthStrategy::None);
+    // Historical default timeout is preserved for legacy configurations.
+    assert_eq!(nim.timeouts().request().as_secs(), 5);
 }

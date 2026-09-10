@@ -218,3 +218,36 @@ fn catalog_refresh_replaces_prior_discovery_results() {
             .expect("refreshed model is eligible");
     assert_eq!(selection.model_id.as_str(), "meta/llama-3.1-70b-instruct");
 }
+
+#[test]
+fn discovered_models_route_only_to_their_own_profile() {
+    // SCRUM-82: catalog provenance. Two profiles discovering the same model id
+    // must not let one profile inherit the other's evidence.
+    let eligible_profile = profile("zeta", true);
+    let ineligible_profile = profile("alpha", true);
+    let now = Utc::now();
+    let attributed = DiscoveredModel::new(ModelId::new("model-a").expect("id"))
+        .with_evidence(ModelCapability::ToolCalling, now)
+        .with_evidence(ModelCapability::StructuredOutput, now)
+        .with_profile(eligible_profile.id().clone());
+    let policy = RoleRoutingPolicy::agent_default(Duration::from_hours(1)).expect("policy");
+    let catalog = ModelCatalog::new(vec![attributed]);
+
+    let route = ModelRouter::select(
+        &policy,
+        &[eligible_profile.clone(), ineligible_profile],
+        &catalog,
+        now,
+    )
+    .expect("route");
+    assert_eq!(route.profile_id, *eligible_profile.id());
+
+    // Declared model sets constrain eligibility further: a profile that does
+    // not list the discovered model never routes to it.
+    let restrictive =
+        profile("beta", true).with_declared_models(vec![ModelId::new("other").expect("id")]);
+    assert!(
+        ModelRouter::select(&policy, &[restrictive], &catalog, now).is_err(),
+        "a declared-model allowlist must exclude unlisted models"
+    );
+}
