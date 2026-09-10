@@ -133,7 +133,12 @@ secret_ref = \"{missing_reference}\"
         .expect("agent run reaches the running daemon");
     match response.result {
         cortexd::WireResult::Error { code } => {
-            assert_eq!(code, "unavailable", "inference must fail explicitly");
+            // SCRUM-84: transport-level inference failures carry the typed
+            // transport code rather than the coarse startup-failure code.
+            assert_eq!(
+                code, "transport_unavailable",
+                "inference must fail explicitly"
+            );
         }
         cortexd::WireResult::Success { .. } => {
             panic!("agent run succeeded without a resolvable model secret");

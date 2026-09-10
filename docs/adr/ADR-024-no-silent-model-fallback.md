@@ -23,3 +23,13 @@ Predictable, auditable behavior is worth more than uptime for a personal, policy
 ## Consequences and alternatives considered
 
 Silent cross-provider or cross-model fallback was rejected for the security and determinism reasons above. Automatic retry loops were rejected beyond transport-level retries: they multiply provider calls without new evidence. The cost is that a stale catalog or an outage stops agent turns until the operator acts, which the explicit refresh command and doctor diagnostics make a small, visible burden.
+
+## Clarification: error classification and same-selection retries (SCRUM-84)
+
+This record is clarified to state explicitly what the typed provider error taxonomy (`ProviderFailureCategory`, `RecoveryHint`) permits:
+
+- **Prohibited:** silently substituting another model or provider when the selected one fails. A failure never changes which endpoint receives user data.
+- **Allowed:** classifying provider/inference failures into typed categories (`Timeout`, `Unavailable`, `RateLimit`, `Overloaded`, `ServerError`, `Auth`, `QuotaOrBilling`, `ContextOverflow`, `InvalidRequest`, `MalformedResponse`) and retrying the **same resolved selection** when the category's recovery hint permits it (see SCRUM-85 for bounded retry scheduling). Classification and retry never weaken the no-silent-fallback rule.
+- Any future cross-model or cross-provider fallback must be an explicit, user-visible configuration change; it may never fire automatically inside error recovery.
+
+Consumers decide recovery from the typed category/recovery hint, never by parsing provider error text, so retry policy stays deterministic and auditable.

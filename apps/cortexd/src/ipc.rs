@@ -87,6 +87,11 @@ pub enum DaemonError {
     InvalidConfiguration,
     StartupFailed,
     TransportUnavailable,
+    RateLimited,
+    AuthenticationFailed,
+    QuotaExceeded,
+    ContextOverflow,
+    InvalidInferenceRequest,
 }
 
 impl std::fmt::Display for DaemonError {
@@ -99,6 +104,11 @@ impl std::fmt::Display for DaemonError {
             Self::InvalidConfiguration => "invalid daemon configuration",
             Self::StartupFailed => "daemon startup failed",
             Self::TransportUnavailable => "local transport unavailable",
+            Self::RateLimited => "provider rate limited the request",
+            Self::AuthenticationFailed => "provider rejected the credential",
+            Self::QuotaExceeded => "provider quota or billing limit reached",
+            Self::ContextOverflow => "request exceeded the model context window",
+            Self::InvalidInferenceRequest => "provider rejected the request",
         })
     }
 }
@@ -235,7 +245,15 @@ impl cortex_application::AgentCapabilityExecutor for DaemonAgentExecutor {
 fn application_error_from_daemon(error: &DaemonError) -> ApplicationError {
     match error {
         DaemonError::PermissionDenied => ApplicationError::PermissionDenied,
-        DaemonError::InvalidRequest => ApplicationError::Validation { field: "payload" },
+        DaemonError::InvalidRequest | DaemonError::InvalidInferenceRequest => {
+            ApplicationError::Validation { field: "payload" }
+        }
+        DaemonError::RateLimited => ApplicationError::RateLimited {
+            retry_after_secs: None,
+        },
+        DaemonError::AuthenticationFailed => ApplicationError::AuthenticationFailed,
+        DaemonError::QuotaExceeded => ApplicationError::QuotaExceeded,
+        DaemonError::ContextOverflow => ApplicationError::ContextOverflow,
         DaemonError::Unauthenticated
         | DaemonError::UnsupportedCapability
         | DaemonError::InvalidConfiguration
@@ -1661,10 +1679,16 @@ impl From<ApplicationError> for DaemonError {
             }
             ApplicationError::Validation { .. }
             | ApplicationError::NotFound { .. }
-            | ApplicationError::Conflict { .. } => Self::InvalidRequest,
+            | ApplicationError::Conflict { .. }
+            | ApplicationError::InvalidInferenceRequest => Self::InvalidRequest,
+            ApplicationError::InferenceUnavailable | ApplicationError::InferenceTimeout => {
+                Self::TransportUnavailable
+            }
+            ApplicationError::RateLimited { .. } => Self::RateLimited,
+            ApplicationError::AuthenticationFailed => Self::AuthenticationFailed,
+            ApplicationError::QuotaExceeded => Self::QuotaExceeded,
+            ApplicationError::ContextOverflow => Self::ContextOverflow,
             ApplicationError::Storage(_)
-            | ApplicationError::InferenceUnavailable
-            | ApplicationError::InferenceTimeout
             | ApplicationError::NoSuitableModel
             | ApplicationError::MalformedModelOutput { .. }
             | ApplicationError::Internal => Self::StartupFailed,
@@ -1681,6 +1705,11 @@ impl DaemonError {
             Self::PermissionDenied => "permission_denied",
             Self::InvalidConfiguration | Self::StartupFailed => "unavailable",
             Self::TransportUnavailable => "transport_unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::AuthenticationFailed => "auth_failed",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::ContextOverflow => "context_overflow",
+            Self::InvalidInferenceRequest => "invalid_inference_request",
         }
     }
 }
@@ -1883,10 +1912,12 @@ mod tests {
             },
         )
         .await;
+        // SCRUM-84: transport-level inference failures carry the typed
+        // transport code rather than the coarse startup-failure code.
         assert_eq!(
             agent.result,
             WireResult::Error {
-                code: "unavailable".to_owned()
+                code: "transport_unavailable".to_owned()
             }
         );
         assert_eq!(

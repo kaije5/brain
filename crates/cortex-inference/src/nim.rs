@@ -5,8 +5,12 @@ use cortex_application::{ApplicationError, SecretRef};
 use serde_json::{Value, json};
 
 use crate::{
-    DiscoveredModel, ModelCapability, ModelCatalog, ModelId, TransportError,
-    openai_compatible::{MAX_CONFIGURED_RESPONSE_BYTES, map_transport_error},
+    DiscoveredModel, ModelCapability, ModelCatalog, ModelId,
+    error::{
+        ProviderError, ProviderFailureCategory, classify_http_response, classify_network_error,
+        map_provider_error, read_bounded_body,
+    },
+    openai_compatible::MAX_CONFIGURED_RESPONSE_BYTES,
 };
 
 const MAX_DISCOVERED_MODELS: usize = 128;
@@ -110,7 +114,7 @@ pub trait NimTransport: Send + Sync {
         bearer: Option<&str>,
         timeout: Duration,
         max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError>;
+    ) -> Result<Vec<u8>, ProviderError>;
 
     async fn post_json(
         &self,
@@ -119,7 +123,7 @@ pub trait NimTransport: Send + Sync {
         body: Value,
         timeout: Duration,
         max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError>;
+    ) -> Result<Vec<u8>, ProviderError>;
 }
 
 /// NVIDIA NIM adapter: automatic model discovery through `GET /v1/models`
@@ -156,7 +160,7 @@ impl<T: NimTransport> NimDiscovery<T> {
                 MAX_DISCOVERY_RESPONSE_BYTES,
             )
             .await
-            .map_err(map_transport_error)?;
+            .map_err(|error| map_provider_error(&error))?;
         let parsed: Value = serde_json::from_slice(&response).map_err(|_| {
             ApplicationError::MalformedModelOutput {
                 reason: "invalid NIM model list response",
@@ -246,11 +250,22 @@ impl<T: NimTransport> NimDiscovery<T> {
             .await
         {
             Ok(_) => Ok(true),
-            // A 4xx-style rejection or an over-budget probe means this model
-            // did not demonstrate the capability; one slow model must not
-            // degrade the whole catalog refresh.
-            Err(TransportError::Unavailable | TransportError::Timeout) => Ok(false),
-            Err(error) => Err(map_transport_error(error)),
+            // A rejected or over-budget probe means this model did not
+            // demonstrate the capability; one slow model must not degrade
+            // the whole catalog refresh. Credential and billing failures are
+            // configuration defects and still abort the refresh.
+            Err(error)
+                if error.category().retryable()
+                    || matches!(
+                        error.category(),
+                        ProviderFailureCategory::InvalidRequest
+                            | ProviderFailureCategory::ContextOverflow
+                            | ProviderFailureCategory::MalformedResponse
+                    ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(map_provider_error(&error)),
         }
     }
 
@@ -331,41 +346,23 @@ impl ReqwestNimTransport {
     }
 }
 
-async fn read_bounded(
+/// Reads the body of a failed response and classifies it into the typed
+/// provider error taxonomy.
+async fn classify_failed_response(
     response: reqwest::Response,
     max_response_bytes: usize,
-) -> Result<Vec<u8>, TransportError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_response_bytes as u64)
-    {
-        return Err(TransportError::ResponseTooLarge);
-    }
-    let mut body = Vec::new();
-    let mut response = response;
-    while let Some(chunk) = response
-        .chunk()
+) -> ProviderError {
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .cloned();
+    // Over-budget error bodies classify as malformed responses rather than
+    // masking the HTTP status.
+    let body = read_bounded_body(response, max_response_bytes)
         .await
-        .map_err(|error| classify_reqwest_error(&error))?
-    {
-        let next_len = body
-            .len()
-            .checked_add(chunk.len())
-            .ok_or(TransportError::ResponseTooLarge)?;
-        if next_len > max_response_bytes {
-            return Err(TransportError::ResponseTooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-fn classify_reqwest_error(error: &reqwest::Error) -> TransportError {
-    if error.is_timeout() {
-        TransportError::Timeout
-    } else {
-        TransportError::Unavailable
-    }
+        .unwrap_or_default();
+    classify_http_response(status, retry_after.as_ref(), &body)
 }
 
 impl NimTransport for ReqwestNimTransport {
@@ -375,7 +372,7 @@ impl NimTransport for ReqwestNimTransport {
         bearer: Option<&str>,
         timeout: Duration,
         max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         let response = self
             .client()
             .get(endpoint)
@@ -383,10 +380,12 @@ impl NimTransport for ReqwestNimTransport {
             .headers(Self::auth_header(bearer))
             .send()
             .await
-            .map_err(|error| classify_reqwest_error(&error))?
-            .error_for_status()
-            .map_err(|error| classify_reqwest_error(&error))?;
-        read_bounded(response, max_response_bytes).await
+            .map_err(|error| classify_network_error(&error))?;
+        let status = response.status();
+        if status.is_client_error() || status.is_server_error() {
+            return Err(classify_failed_response(response, max_response_bytes).await);
+        }
+        read_bounded_body(response, max_response_bytes).await
     }
 
     async fn post_json(
@@ -396,7 +395,7 @@ impl NimTransport for ReqwestNimTransport {
         body: Value,
         timeout: Duration,
         max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         let response = self
             .client()
             .post(endpoint)
@@ -405,9 +404,11 @@ impl NimTransport for ReqwestNimTransport {
             .json(&body)
             .send()
             .await
-            .map_err(|error| classify_reqwest_error(&error))?
-            .error_for_status()
-            .map_err(|error| classify_reqwest_error(&error))?;
-        read_bounded(response, max_response_bytes).await
+            .map_err(|error| classify_network_error(&error))?;
+        let status = response.status();
+        if status.is_client_error() || status.is_server_error() {
+            return Err(classify_failed_response(response, max_response_bytes).await);
+        }
+        read_bounded_body(response, max_response_bytes).await
     }
 }
