@@ -68,7 +68,9 @@ pub fn configure_model_secret_for_platform(
 }
 
 #[cfg(windows)]
-pub async fn assert_deployed_daemon_rejects_missing_model_secret() {
+pub async fn assert_deployed_daemon_degrades_on_missing_model_secret() {
+    use cortexd::{AuthenticatedIpcClient, DaemonRequest, PROTOCOL_VERSION};
+
     let directory = TempDir::new().expect("temporary Cortex directory");
     let database_path = directory.path().join("cortex.db");
     let missing_reference = format!("keyring:cortex/e2e-missing-{}", Uuid::now_v7());
@@ -86,23 +88,59 @@ secret_ref = \"{missing_reference}\"
     )
     .expect("settings fixture");
     let mut process = Command::new(env!("CARGO_BIN_EXE_cortexd-e2e"))
-        .env("CORTEX_DATABASE", database_path)
+        .env("CORTEX_DATABASE", database_path.clone())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .expect("deployed cortexd process");
-    // Startup includes bounded provider discovery (5 s timeout) before the
-    // composition root rejects the unresolvable secret reference.
-    match tokio::time::timeout(Duration::from_secs(15), process.wait()).await {
-        Ok(Ok(status)) => assert!(!status.success(), "missing model secret was accepted"),
-        Ok(Err(error)) => panic!("failed to observe deployed cortexd exit: {error}"),
-        Err(_) => {
-            let _ = process.kill().await;
-            let _ = process.wait().await;
-            panic!("deployed cortexd ignored the missing model secret reference");
+
+    // SCRUM-76: the daemon starts and serves IPC even though the model
+    // secret can never resolve; inference must fail with an explicit
+    // degraded error instead of taking the daemon down.
+    let client = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(client) = AuthenticatedIpcClient::from_database_path(&database_path) {
+                let request = DaemonRequest {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: Uuid::now_v7(),
+                    principal_id: Uuid::now_v7(),
+                    operation_id: Uuid::now_v7(),
+                    capability: "cortex_daemon_status".to_owned(),
+                    payload: serde_json::json!({}),
+                };
+                if client.request(&request).await.is_ok() {
+                    return client;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("daemon became ready despite the missing model secret");
+
+    let request = DaemonRequest {
+        protocol_version: PROTOCOL_VERSION,
+        request_id: Uuid::now_v7(),
+        principal_id: Uuid::now_v7(),
+        operation_id: Uuid::now_v7(),
+        capability: "cortex_agent_run".to_owned(),
+        payload: serde_json::json!({"prompt": "hello"}),
+    };
+    let response = client
+        .request(&request)
+        .await
+        .expect("agent run reaches the running daemon");
+    match response.result {
+        cortexd::WireResult::Error { code } => {
+            assert_eq!(code, "unavailable", "inference must fail explicitly");
+        }
+        cortexd::WireResult::Success { .. } => {
+            panic!("agent run succeeded without a resolvable model secret");
         }
     }
+    let _ = process.kill().await;
+    let _ = process.wait().await;
 }
 
 pub struct Harness {
@@ -469,7 +507,26 @@ async fn wait_until_ready(client: &AuthenticatedIpcClient) {
             payload: json!({}),
         };
         if client.request(&request).await.is_ok() {
-            return;
+            // SCRUM-76: IPC is available before background model resolution
+            // finishes; chat-capable tests must also wait for the catalog.
+            let models_request = DaemonRequest {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: Uuid::now_v7(),
+                principal_id: Uuid::now_v7(),
+                operation_id: Uuid::now_v7(),
+                capability: "cortex_model_list".to_owned(),
+                payload: json!({}),
+            };
+            if let Ok(response) = client.request(&models_request).await
+                && let cortexd::WireResult::Success { value } = response.result
+                && value["models"]
+                    .as_array()
+                    .is_some_and(|models| !models.is_empty())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
