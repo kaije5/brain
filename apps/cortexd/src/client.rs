@@ -113,14 +113,22 @@ impl AuthenticatedIpcClient {
         };
         write_frame(&mut stream, &proof).await?;
         write_frame(&mut stream, request).await?;
-        let response: DaemonResponse = serde_json::from_slice(&read_frame(&mut stream).await?)
-            .map_err(|_| DaemonError::TransportUnavailable)?;
-        if response.protocol_version != PROTOCOL_VERSION
-            || response.request_id != request.request_id
-        {
-            return Err(DaemonError::TransportUnavailable);
+        // Agent runs stream partial frames by default; a non-streaming
+        // caller skips them and returns only the terminal frame.
+        loop {
+            let response: DaemonResponse = serde_json::from_slice(&read_frame(&mut stream).await?)
+                .map_err(|_| DaemonError::TransportUnavailable)?;
+            if response.protocol_version != PROTOCOL_VERSION
+                || response.request_id != request.request_id
+            {
+                return Err(DaemonError::TransportUnavailable);
+            }
+            if matches!(&response.result, crate::ipc::WireResult::Success { value } if value.get("partial").is_some())
+            {
+                continue;
+            }
+            return Ok(response);
         }
-        Ok(response)
     }
 }
 

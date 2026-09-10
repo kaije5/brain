@@ -488,6 +488,7 @@ pub struct App {
     chat_input: String,
     chat_status: ChatStatus,
     transcript: Vec<(String, String)>,
+    partial_reply: Option<String>,
     tasks: Vec<(String, String)>,
     notes_query: String,
     note_results: Vec<String>,
@@ -504,6 +505,7 @@ impl Default for App {
             chat_input: String::new(),
             chat_status: ChatStatus::Ready,
             transcript: Vec::new(),
+            partial_reply: None,
             tasks: Vec::new(),
             notes_query: String::new(),
             note_results: Vec::new(),
@@ -589,12 +591,22 @@ impl App {
         .then(|| self.transcript[self.transcript.len() - 1].1.clone())
     }
 
+    /// Appends one streamed segment to the in-progress assistant reply.
+    pub fn receive_agent_partial(&mut self, chunk: &str) {
+        self.partial_reply
+            .get_or_insert_with(String::new)
+            .push_str(chunk);
+    }
+
+    /// Finalizes the streamed reply, replacing any accumulated partial text.
     pub fn receive_agent_reply(&mut self, reply: String) {
+        self.partial_reply = None;
         self.transcript.push(("assistant".to_owned(), reply));
         self.chat_status = ChatStatus::Ready;
     }
 
     pub fn receive_agent_error(&mut self, code: String) {
+        self.partial_reply = None;
         self.chat_status = ChatStatus::Degraded(code);
         self.transcript
             .push(("assistant".to_owned(), String::new()));
@@ -609,6 +621,12 @@ impl App {
     #[must_use]
     pub fn transcript(&self) -> &[(String, String)] {
         &self.transcript
+    }
+
+    /// The assistant reply currently streaming in, when one is in progress.
+    #[must_use]
+    pub fn partial_reply(&self) -> Option<&str> {
+        self.partial_reply.as_deref()
     }
 
     pub fn set_tasks(&mut self, rows: Vec<(String, String)>) {

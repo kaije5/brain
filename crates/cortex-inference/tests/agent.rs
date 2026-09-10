@@ -665,3 +665,63 @@ async fn provider_failure_fails_the_turn_safely_without_side_effects() {
         "no tool executes when the provider fails"
     );
 }
+
+#[tokio::test]
+async fn streaming_reports_each_assistant_segment_in_order() {
+    let provider = FakeProvider::from_responses(vec![
+        InferenceResponse {
+            content: Some("checking your notes".to_owned()),
+            tool_calls: vec![note_call("call-1", r#"{ "title": "t", "content": "c" }"#)],
+        },
+        final_response("all done"),
+    ]);
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    let recorded = chunks.clone();
+    let on_chunk = move |chunk: &str| {
+        chunks.lock().expect("chunk log").push(chunk.to_owned());
+    };
+    let runner = AgentRunner::new(
+        Arc::new(provider),
+        Arc::new(RecordingService::default()),
+        limits(4, Duration::from_secs(5)),
+    );
+
+    let output = runner
+        .run_streaming(
+            context(),
+            "stream please",
+            allowed([Capability::NoteCreate]),
+            &on_chunk,
+        )
+        .await
+        .expect("streaming run succeeds");
+
+    assert_eq!(output, "all done");
+    assert_eq!(
+        recorded.lock().unwrap().clone(),
+        vec!["checking your notes".to_owned(), "all done".to_owned()],
+        "intermediate text preceding tool calls and the final answer must both stream"
+    );
+}
+
+#[tokio::test]
+async fn non_streaming_runs_do_not_report_chunks() {
+    let provider = FakeProvider::from_responses(vec![final_response("quiet answer")]);
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    let recorded = chunks.clone();
+    let on_chunk = move |chunk: &str| {
+        chunks.lock().expect("chunk log").push(chunk.to_owned());
+    };
+    let runner = AgentRunner::new(
+        Arc::new(provider),
+        Arc::new(RecordingService::default()),
+        limits(4, Duration::from_secs(5)),
+    );
+
+    let output = runner
+        .run_streaming(context(), "hello", allowed([]), &on_chunk)
+        .await
+        .expect("run succeeds");
+    assert_eq!(output, "quiet answer");
+    assert_eq!(recorded.lock().unwrap().clone(), vec!["quiet answer"]);
+}

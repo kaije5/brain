@@ -12,6 +12,7 @@ use cortexd::{LocalSettings, data_directory};
 enum Effect {
     Tasks(Result<Vec<(String, String)>, String>),
     Notes(Result<Vec<String>, String>),
+    AgentChunk(String),
     Agent(Result<String, String>),
 }
 
@@ -227,6 +228,7 @@ fn apply_effect(app: &mut App, effect: Effect, client: &DaemonClient) {
             app.set_note_results(rows);
         }
         Effect::Notes(Err(code)) => app.set_status_line(format!("notes unavailable: {code}")),
+        Effect::AgentChunk(chunk) => app.receive_agent_partial(&chunk),
         Effect::Agent(Ok(reply)) => app.receive_agent_reply(reply),
         Effect::Agent(Err(code)) => app.receive_agent_error(code),
     }
@@ -283,25 +285,29 @@ fn request_agent_reply(client: &DaemonClient, sender: mpsc::Sender<Effect>, app:
     };
     let client = client.clone();
     tokio::spawn(async move {
-        let result = send_capability(
-            &client,
-            "cortex_agent_run",
-            serde_json::json!({"prompt": prompt}),
-        )
-        .await;
-        let reply = result.and_then(|mut values| {
-            values
-                .pop()
-                .ok_or_else(|| "malformed_agent_reply".to_owned())
-                .and_then(|value| {
-                    value
-                        .get("reply")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .ok_or_else(|| "malformed_agent_reply".to_owned())
-                })
-        });
-        let _ = sender.send(Effect::Agent(reply));
+        let request = crate::CommandRequest {
+            request_id: uuid::Uuid::now_v7(),
+            operation_id: uuid::Uuid::now_v7(),
+            capability: "cortex_agent_run".to_owned(),
+            payload: serde_json::json!({"prompt": prompt}),
+        };
+        let chunk_sender = sender.clone();
+        let on_partial = move |chunk: &str| {
+            let _ = chunk_sender.send(Effect::AgentChunk(chunk.to_owned()));
+        };
+        let result = client
+            .request_streaming(request, &on_partial)
+            .await
+            .map_err(|error| error.code().to_owned())
+            .and_then(|response| match response.result {
+                cortexd::WireResult::Success { value } => value
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| "malformed_agent_reply".to_owned()),
+                cortexd::WireResult::Error { code } => Err(code),
+            });
+        let _ = sender.send(Effect::Agent(result));
     });
 }
 

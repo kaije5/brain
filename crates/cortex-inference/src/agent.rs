@@ -189,8 +189,38 @@ where
         let deadline = tokio::time::Instant::now()
             .checked_add(self.limits.timeout)
             .ok_or(ApplicationError::Validation { field: "timeout" })?;
-        self.run_inner(context, prompt, &allowed_capabilities, deadline)
+        self.run_inner(context, prompt, &allowed_capabilities, deadline, None)
             .await
+    }
+
+    /// Runs one bounded agent conversation, reporting every assistant text
+    /// segment through `on_chunk` as the loop produces it: intermediate text
+    /// preceding tool calls and the final answer. Chunk delivery is
+    /// non-blocking and never widens the loop's bounds.
+    ///
+    /// # Errors
+    /// Returns typed inference, schema, policy, or application errors.
+    pub async fn run_streaming(
+        &self,
+        context: CommandContext,
+        prompt: &str,
+        allowed_capabilities: AuthorizedCapabilities,
+        on_chunk: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<String, ApplicationError> {
+        if prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+            return Err(ApplicationError::Validation { field: "prompt" });
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.limits.timeout)
+            .ok_or(ApplicationError::Validation { field: "timeout" })?;
+        self.run_inner(
+            context,
+            prompt,
+            &allowed_capabilities,
+            deadline,
+            Some(on_chunk),
+        )
+        .await
     }
 
     async fn run_inner(
@@ -199,6 +229,7 @@ where
         prompt: &str,
         allowed_capabilities: &AuthorizedCapabilities,
         deadline: tokio::time::Instant,
+        on_chunk: Option<&(dyn Fn(&str) + Send + Sync)>,
     ) -> Result<String, ApplicationError> {
         let tools: Vec<InferenceTool> = allowed_capabilities.iter().map(inference_tool).collect();
         let mut messages = vec![InferenceMessage::User {
@@ -222,6 +253,14 @@ where
             let response = tokio::time::timeout_at(deadline, self.provider.complete(request))
                 .await
                 .map_err(|_| ApplicationError::InferenceTimeout)??;
+            if let (Some(content), Some(on_chunk)) = (
+                response.content.as_deref().filter(|content| {
+                    !content.trim().is_empty() && content.len() <= MAX_TEXT_BYTES
+                }),
+                on_chunk,
+            ) {
+                on_chunk(content);
+            }
             if response.tool_calls.is_empty() {
                 return final_content(response, self.limits.max_message_bytes);
             }

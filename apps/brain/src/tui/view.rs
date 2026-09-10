@@ -119,10 +119,21 @@ fn render_chat(app: &App, area: Rect, buffer: &mut Buffer) {
         lines.push(Line::default());
     }
     if app.chat_status == ChatStatus::Waiting {
-        lines.push(Line::styled(
-            "Thinking... You can browse the other tabs while waiting.",
-            Style::default().fg(Color::Yellow),
-        ));
+        if let Some(partial) = app.partial_reply() {
+            lines.push(Line::styled(
+                "Brain",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.extend(partial.lines().map(|line| Line::from(line.to_owned())));
+            lines.push(Line::styled("▌", Style::default().fg(Color::Green)));
+        } else {
+            lines.push(Line::styled(
+                "Thinking... You can browse the other tabs while waiting.",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
     }
     if let ChatStatus::Degraded(code) = &app.chat_status {
         lines.push(Line::styled(

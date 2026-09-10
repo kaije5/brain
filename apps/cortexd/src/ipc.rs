@@ -813,10 +813,29 @@ impl LocalDaemon {
         principal_id: PrincipalId,
         request: &DaemonRequest,
     ) -> Result<DaemonResponse, DaemonError> {
+        self.run_agent_with_partials(principal_id, request, None)
+            .await
+    }
+
+    /// Streaming form of `cortex_agent_run`: every assistant text segment the
+    /// bounded loop produces is forwarded through `partials` as an
+    /// intermediate frame; the returned response is the terminal frame.
+    /// Authorization, auditing, and loop bounds are identical to the
+    /// non-streaming path.
+    async fn run_agent_with_partials(
+        &self,
+        principal_id: PrincipalId,
+        request: &DaemonRequest,
+        partials: Option<tokio::sync::mpsc::UnboundedSender<DaemonResponse>>,
+    ) -> Result<DaemonResponse, DaemonError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct AgentPayload {
             prompt: String,
+            // Opt-in marker routed by the session layer; read only for the
+            // wire contract, not for dispatch decisions.
+            #[allow(dead_code)]
+            stream: Option<bool>,
         }
         self.authorize_and_audit(
             principal_id,
@@ -838,7 +857,7 @@ impl LocalDaemon {
         ))
         .map_err(DaemonError::from)?;
         let context = self.command_context(principal_id, request)?;
-        let limits = AgentLimits::new(4, Duration::from_secs(5), 1, 32 * 1024, 128 * 1024)
+        let limits = AgentLimits::new(4, Duration::from_secs(30), 1, 32 * 1024, 128 * 1024)
             .map_err(DaemonError::from)?;
         let agent = AgentRunner::new(
             Arc::new(self.embedding_provider.clone()),
@@ -847,10 +866,25 @@ impl LocalDaemon {
             }),
             limits,
         );
-        let output = agent
-            .run(context, &payload.prompt, allowed)
-            .await
-            .map_err(DaemonError::from)?;
+        let output = match partials {
+            Some(sender) => {
+                let request_id = request.request_id;
+                let forward = move |chunk: &str| {
+                    let _ = sender.send(DaemonResponse {
+                        protocol_version: PROTOCOL_VERSION,
+                        request_id,
+                        result: WireResult::Success {
+                            value: json!({ "partial": chunk }),
+                        },
+                    });
+                };
+                agent
+                    .run_streaming(context, &payload.prompt, allowed, &forward)
+                    .await
+            }
+            None => agent.run(context, &payload.prompt, allowed).await,
+        }
+        .map_err(DaemonError::from)?;
         Ok(DaemonResponse {
             protocol_version: PROTOCOL_VERSION,
             request_id: request.request_id,
@@ -1301,7 +1335,71 @@ where
         .verify_pairing(&challenge, &pairing)
         .ok_or(DaemonError::Unauthenticated)?;
     let bytes = read_frame(stream).await?;
+    if requests_streaming_agent_output(&bytes) {
+        return stream_agent_response(daemon, principal_id, stream, &bytes).await;
+    }
     let response = response_for_request(daemon, principal_id, &bytes).await?;
+    write_response(stream, &response).await
+}
+
+/// True unless the frame explicitly opts out of streaming with
+/// `"stream": false`. Only `cortex_agent_run` streams; every other
+/// capability stays on the unchanged single-response path.
+fn requests_streaming_agent_output(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Peek {
+        capability: String,
+        payload: Value,
+    }
+    serde_json::from_slice::<Peek>(bytes).is_ok_and(|peek| {
+        peek.capability == "cortex_agent_run"
+            && peek.payload.get("stream").and_then(Value::as_bool) != Some(false)
+    })
+}
+
+/// Forwards intermediate agent frames as they are produced, then writes the
+/// terminal response. All frames share the request id and stay within the
+/// bounded-frame discipline; the stream terminates explicitly with the final
+/// frame, exactly like the non-streaming path.
+async fn stream_agent_response<S>(
+    daemon: &LocalDaemon,
+    principal_id: PrincipalId,
+    stream: &mut S,
+    bytes: &[u8],
+) -> Result<(), DaemonError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = daemon.decode_request(bytes)?;
+    let request_id = request.request_id;
+    let (partials_sender, mut partials_receiver) =
+        tokio::sync::mpsc::unbounded_channel::<DaemonResponse>();
+    let daemon = daemon.clone();
+    let runner = tokio::spawn(async move {
+        daemon
+            .run_agent_with_partials(principal_id, &request, Some(partials_sender))
+            .await
+    });
+    while let Some(frame) = partials_receiver.recv().await {
+        write_json_frame(stream, &frame).await?;
+    }
+    let response = match runner.await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: WireResult::Error {
+                code: error.wire_code().to_owned(),
+            },
+        },
+        Err(_) => DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            result: WireResult::Error {
+                code: DaemonError::TransportUnavailable.wire_code().to_owned(),
+            },
+        },
+    };
     write_response(stream, &response).await
 }
 
