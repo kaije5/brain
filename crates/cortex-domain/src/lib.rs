@@ -20,8 +20,8 @@ pub use note::{Note, NoteInput};
 pub use policy::{PolicyDecision, PolicyDeny};
 pub use provenance::{Source, SourceInput, SourceRef};
 pub use provider::{
-    ContentHash, ObservedRevision, ProviderId, ProviderProvenance, ProviderResourceId,
-    ProviderResourceKind, ProviderResourceRef,
+    ContentHash, ObservedRevision, ProviderAuditMetadata, ProviderId, ProviderProvenance,
+    ProviderResourceId, ProviderResourceKind, ProviderResourceRef, ResourceTarget,
 };
 pub use task::{Task, TaskInput, TaskStatus};
 

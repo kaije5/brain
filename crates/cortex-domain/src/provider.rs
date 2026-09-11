@@ -193,6 +193,52 @@ impl ProviderProvenance {
     }
 }
 
+/// The provider-neutral address of an authorization or audit target.
+///
+/// Cortex-owned runtime state is addressed as a [`ResourceTarget::CortexEntity`]
+/// during the migration period. Authoritative provider content is addressed by
+/// stable [`ProviderResourceRef`], and creates use [`ResourceTarget::ProviderScope`]
+/// because no provider-assigned resource identity exists yet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResourceTarget {
+    CortexEntity(crate::EntityId),
+    ProviderResource(ProviderResourceRef),
+    ProviderScope {
+        provider_id: ProviderId,
+        workspace_id: crate::WorkspaceId,
+        resource_kind: ProviderResourceKind,
+    },
+}
+
+/// Redacted before/after observation metadata retained with audit evidence.
+///
+/// Revisions and hashes are opaque attribution tokens only. This record must
+/// never carry titles, bodies, descriptions, local paths, or diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderAuditMetadata {
+    pub before_revision: Option<ObservedRevision>,
+    pub before_hash: Option<ContentHash>,
+    pub after_revision: Option<ObservedRevision>,
+    pub after_hash: Option<ContentHash>,
+}
+
+impl ProviderAuditMetadata {
+    #[must_use]
+    pub const fn new(
+        before_revision: Option<ObservedRevision>,
+        before_hash: Option<ContentHash>,
+        after_revision: Option<ObservedRevision>,
+        after_hash: Option<ContentHash>,
+    ) -> Self {
+        Self {
+            before_revision,
+            before_hash,
+            after_revision,
+            after_hash,
+        }
+    }
+}
+
 fn validate_opaque(
     value: String,
     field: &'static str,
