@@ -2,7 +2,7 @@ use cortex_application::{ApplicationError, AuditPort};
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, ContentHash, ObservedRevision, PolicyDecision,
     PolicyDeny, ProviderAuditMetadata, ProviderId, ProviderResourceId, ProviderResourceKind,
-    ResourceTarget, WorkspaceId,
+    ResourceTarget,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
@@ -150,7 +150,7 @@ fn decode_event(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Application
             row.try_get("capability")
                 .map_err(|_| storage_error("invalid audit row"))?,
         )?,
-        target: target.map(decode_target).transpose()?,
+        target: target.as_deref().map(decode_target).transpose()?,
         provider_metadata: decode_metadata(&metadata)?,
         policy_decision: decode_policy(
             row.try_get("policy_decision")
@@ -165,7 +165,7 @@ fn decode_event(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Application
 
 /// Encodes an audit target into the `target_id` column.
 ///
-/// Cortex entities remain plain UUIDv7 text so pre-provider rows and values
+/// `Cortex` entities remain plain `UUIDv7` text so pre-provider rows and values
 /// share one legacy-compatible representation; provider targets are tagged
 /// JSON because their identity is opaque and not workspace-scoped UUIDs.
 pub(crate) fn encode_target(
@@ -199,15 +199,15 @@ pub(crate) fn encode_target(
     Ok(encoded)
 }
 
-pub(crate) fn decode_target(value: String) -> Result<ResourceTarget, ApplicationError> {
+pub(crate) fn decode_target(value: &str) -> Result<ResourceTarget, ApplicationError> {
     // Plain UUID text is the legacy (and current) Cortex entity encoding.
-    if let Ok(uuid) = Uuid::parse_str(&value) {
+    if let Ok(uuid) = Uuid::parse_str(value) {
         return Ok(ResourceTarget::CortexEntity(
             cortex_domain::EntityId::try_from(uuid).map_err(ApplicationError::from)?,
         ));
     }
     let stored: StoredAuditTarget =
-        serde_json::from_str(&value).map_err(|_| storage_error("invalid audit target"))?;
+        serde_json::from_str(value).map_err(|_| storage_error("invalid audit target"))?;
     match stored {
         StoredAuditTarget::ProviderResource {
             workspace_id,
@@ -275,12 +275,12 @@ fn encode_metadata(metadata: Option<&ProviderAuditMetadata>) -> Result<String, A
                 .before_revision
                 .as_ref()
                 .map(|value| value.as_str().to_owned()),
-            before_hash: metadata.before_hash.map(encode_hash),
+            before_hash: metadata.before_hash.as_ref().map(encode_hash),
             after_revision: metadata
                 .after_revision
                 .as_ref()
                 .map(|value| value.as_str().to_owned()),
-            after_hash: metadata.after_hash.map(encode_hash),
+            after_hash: metadata.after_hash.as_ref().map(encode_hash),
         }),
     };
     serde_json::to_string(&stored).map_err(|_| storage_error("audit metadata encoding failed"))
@@ -300,12 +300,18 @@ fn decode_metadata(value: &str) -> Result<Option<ProviderAuditMetadata>, Applica
             .before_revision
             .map(|value| ObservedRevision::new(value).map_err(ApplicationError::from))
             .transpose()?,
-        provider.before_hash.map(decode_hash).transpose()?,
+        provider
+            .before_hash
+            .map(|value| decode_hash(&value))
+            .transpose()?,
         provider
             .after_revision
             .map(|value| ObservedRevision::new(value).map_err(ApplicationError::from))
             .transpose()?,
-        provider.after_hash.map(decode_hash).transpose()?,
+        provider
+            .after_hash
+            .map(|value| decode_hash(&value))
+            .transpose()?,
     )))
 }
 
@@ -322,14 +328,16 @@ struct StoredProviderAuditMetadata {
     after_hash: Option<String>,
 }
 
-fn encode_hash(hash: ContentHash) -> String {
-    hash.as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+fn encode_hash(hash: &ContentHash) -> String {
+    let mut encoded = String::with_capacity(hash.as_bytes().len() * 2);
+    for byte in hash.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
-fn decode_hash(value: String) -> Result<ContentHash, ApplicationError> {
+fn decode_hash(value: &str) -> Result<ContentHash, ApplicationError> {
     if value.len() != 64 {
         return Err(storage_error("invalid audit content hash"));
     }

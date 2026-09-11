@@ -487,12 +487,6 @@ async fn durable_replay_rejects_a_provider_target_change() -> Result<(), String>
         ProviderResourceKind::Knowledge,
     );
     let original_context = context(workspace_id, principal_id, operation_id);
-    let result = MutationResult {
-        entity_id: note.id(),
-        revision: note.revision(),
-        lifecycle: note.lifecycle(),
-        audit_correlation_id: original_context.correlation_id,
-    };
     operations
         .execute_once(bound_note_mutation(
             original_context,
@@ -510,12 +504,6 @@ async fn durable_replay_rejects_a_provider_target_change() -> Result<(), String>
         ProviderResourceKind::Knowledge,
     );
     let replay_context = context(workspace_id, principal_id, operation_id);
-    let result = MutationResult {
-        entity_id: note.id(),
-        revision: note.revision(),
-        lifecycle: note.lifecycle(),
-        audit_correlation_id: replay_context.correlation_id,
-    };
     let replay = operations
         .execute_once(bound_note_mutation(
             replay_context,

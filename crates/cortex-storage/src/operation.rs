@@ -441,7 +441,7 @@ impl AtomicMutationPort for OperationStore {
             .load_result(mutation.workspace_id, mutation.operation_id)
             .await?
         {
-            return replay_result(recorded, mutation.identity);
+            return replay_result(&recorded, &mutation.identity);
         }
 
         let outcome_json = encode_operation(&mutation)?;
@@ -468,7 +468,7 @@ impl AtomicMutationPort for OperationStore {
                 .load_result(mutation.workspace_id, mutation.operation_id)
                 .await?
             {
-                return replay_result(recorded, mutation.identity);
+                return replay_result(&recorded, &mutation.identity);
             }
             return Err(storage_error("operation reservation failed"));
         }
@@ -1100,7 +1100,7 @@ fn decode_operation(value: &str) -> Result<RecordedOperation, ApplicationError> 
     let capability = Capability::from_mcp_name(&stored.capability)
         .ok_or_else(|| storage_error("invalid operation capability"))?;
     let target = match stored.version {
-        3 => stored.target.map(decode_target).transpose()?,
+        3 => stored.target.as_deref().map(decode_target).transpose()?,
         // Legacy outcomes addressed only Cortex entities.
         2 => stored
             .target_id
@@ -1123,10 +1123,10 @@ fn decode_operation(value: &str) -> Result<RecordedOperation, ApplicationError> 
 }
 
 fn replay_result(
-    recorded: RecordedOperation,
-    requested: OperationIdentity,
+    recorded: &RecordedOperation,
+    requested: &OperationIdentity,
 ) -> Result<MutationResult, ApplicationError> {
-    if recorded.identity == requested {
+    if recorded.identity == *requested {
         Ok(recorded.result)
     } else {
         Err(ApplicationError::Conflict {

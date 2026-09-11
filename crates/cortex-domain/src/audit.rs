@@ -19,7 +19,7 @@ pub enum AuditResult {
 /// outcomes only. Callers must never place note content, memory text,
 /// credentials, tool prompts, or storage diagnostics in this record. The
 /// target addresses a Cortex entity, a provider resource, or a provider
-/// create scope without assuming a SQLite entity row; the optional provider
+/// create scope without assuming a `SQLite` entity row; the optional provider
 /// metadata records only before/after revisions and content hashes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditEvent {
