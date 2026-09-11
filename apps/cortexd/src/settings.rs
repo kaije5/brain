@@ -9,6 +9,10 @@ use cortex_inference::{
 };
 use serde::Deserialize;
 
+use crate::vault::{
+    VaultConfigError, VaultExclusion, VaultProviderConfig, VaultProviderMode, VaultScope,
+};
+
 /// Redacted failure category for the local settings file. The error never
 /// embeds file contents, because those must never include credentials.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -36,6 +40,32 @@ impl From<ApplicationError> for SettingsError {
 struct SettingsFile {
     daemon: Option<DaemonSection>,
     models: Option<ModelsSection>,
+    vault: Option<VaultSection>,
+}
+
+/// The `[vault]` section: the daemon-owned, non-secret declaration of the
+/// authoritative Markdown vault provider. The root is a local filesystem
+/// path and stays a cortexd composition input; scopes, exclusions, and the
+/// provider mode are validated through the typed vault configuration.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VaultSection {
+    provider_id: String,
+    root: String,
+    mode: ConfigVaultMode,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    exclusions: Vec<String>,
+}
+
+/// Explicit provider mode; there is no implicit default so a deployment must
+/// state its read/write posture.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum ConfigVaultMode {
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -108,6 +138,14 @@ fn enabled_by_default() -> bool {
     true
 }
 
+fn settings_error_from_vault(error: VaultConfigError) -> SettingsError {
+    let field = match error {
+        VaultConfigError::Invalid { field } => field,
+        VaultConfigError::RootInaccessible => "vault_root",
+    };
+    SettingsError::Invalid { field }
+}
+
 /// Per-profile timeouts; unset fields keep the historical 5 s default so
 /// existing single-profile configurations behave exactly as before.
 ///
@@ -137,6 +175,7 @@ fn profile_timeouts(entry: &ModelProfileEntry) -> Result<ProfileTimeouts, Settin
 pub struct LocalSettings {
     daemon: DaemonSection,
     models: ModelsSection,
+    vault: Option<VaultSection>,
 }
 
 impl LocalSettings {
@@ -163,6 +202,7 @@ impl LocalSettings {
                 default_profile: None,
                 profiles: None,
             }),
+            vault: file.vault,
         }))
     }
 
@@ -199,6 +239,17 @@ impl LocalSettings {
 #secret_ref = "keyring:cortexd/nim"
 #auth_type = "secret_ref"
 #request_timeout_ms = 5000
+
+#[vault]
+# The authoritative local Markdown vault provider (v0.2). Declares exactly
+# one local root, the allowed logical scopes, bounded vault-relative
+# exclusions, and an explicit provider mode. No credentials or sync
+# settings belong here. The root must exist and be a directory at startup.
+#provider_id = "markdown-vault"
+#root = "C:\\Users\\me\\Documents\\Vault"
+#mode = "read_only"
+#scopes = ["knowledge", "task"]
+#exclusions = [".obsidian", "archive"]
 "#
     }
 
@@ -277,6 +328,50 @@ impl LocalSettings {
             );
         }
         Ok(profiles)
+    }
+
+    /// Builds the validated vault provider configuration from the `[vault]`
+    /// section, or `None` when the section is absent (no vault provider is
+    /// configured). The declared root is a local filesystem path and is only
+    /// interpreted by the daemon composition, never by domain contracts.
+    ///
+    /// # Errors
+    /// Returns [`SettingsError::Invalid`] when any declared value fails
+    /// validation — including unknown scopes, absolute or traversing
+    /// exclusions, and contradictory bounds.
+    pub fn vault_config(&self) -> Result<Option<VaultProviderConfig>, SettingsError> {
+        let Some(section) = self.vault.as_ref() else {
+            return Ok(None);
+        };
+        let mode = match section.mode {
+            ConfigVaultMode::ReadOnly => VaultProviderMode::ReadOnly,
+            ConfigVaultMode::ReadWrite => VaultProviderMode::ReadWrite,
+        };
+        let mut scopes = std::collections::BTreeSet::new();
+        for scope in &section.scopes {
+            let scope = VaultScope::new(scope).map_err(settings_error_from_vault)?;
+            if !scopes.insert(scope) {
+                return Err(SettingsError::Invalid { field: "scopes" });
+            }
+        }
+        let mut exclusions = std::collections::BTreeSet::new();
+        for exclusion in &section.exclusions {
+            let exclusion = VaultExclusion::new(exclusion).map_err(settings_error_from_vault)?;
+            if !exclusions.insert(exclusion) {
+                return Err(SettingsError::Invalid {
+                    field: "exclusions",
+                });
+            }
+        }
+        VaultProviderConfig::new(
+            &section.provider_id,
+            std::path::PathBuf::from(&section.root),
+            mode,
+            scopes,
+            exclusions,
+        )
+        .map(Some)
+        .map_err(settings_error_from_vault)
     }
 
     /// Base endpoint declared for one profile id.

@@ -5,6 +5,7 @@ mod config;
 mod ipc;
 mod platform_secret_store;
 mod settings;
+mod vault;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_security;
@@ -21,4 +22,8 @@ pub use platform_secret_store::PlatformSecretStore;
 pub use settings::{
     LocalSettings, ModelResolution, SettingsError, data_directory, data_directory_for,
     default_database_path, default_database_path_for, resolve_default_model,
+};
+pub use vault::{
+    InMemoryVaultProvider, VaultConfigError, VaultExclusion, VaultProviderConfig,
+    VaultProviderMode, VaultScope,
 };
