@@ -219,7 +219,11 @@ where
     ) -> Result<MutationResult, ApplicationError> {
         let capability = Capability::NoteUpdate;
         if let Some(result) = self
-            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
+            .preflight(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+            )
             .await?
         {
             return Ok(result);
@@ -229,7 +233,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "note" }));
         let note = self
-            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
+            .audit_result(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+                loaded,
+            )
             .await?;
         self.audit_result(
             &context,
@@ -350,7 +359,11 @@ where
     ) -> Result<MutationResult, ApplicationError> {
         let capability = Capability::TaskComplete;
         if let Some(result) = self
-            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
+            .preflight(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+            )
             .await?
         {
             return Ok(result);
@@ -360,7 +373,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "task" }));
         let task = self
-            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
+            .audit_result(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+                loaded,
+            )
             .await?;
         self.audit_result(
             &context,
@@ -409,7 +427,11 @@ where
     ) -> Result<MutationResult, ApplicationError> {
         let capability = Capability::TaskUpdate;
         if let Some(result) = self
-            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
+            .preflight(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+            )
             .await?
         {
             return Ok(result);
@@ -419,7 +441,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "task" }));
         let task = self
-            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
+            .audit_result(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+                loaded,
+            )
             .await?;
         self.audit_result(
             &context,
@@ -547,7 +574,11 @@ where
     ) -> Result<MutationResult, ApplicationError> {
         let capability = Capability::MemoryCorrect;
         if let Some(result) = self
-            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
+            .preflight(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+            )
             .await?
         {
             return Ok(result);
@@ -557,7 +588,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "memory" }));
         let predecessor = self
-            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
+            .audit_result(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+                loaded,
+            )
             .await?;
         self.audit_result(
             &context,
@@ -566,8 +602,13 @@ where
             require_memory_active(&predecessor, expected_revision),
         )
         .await?;
-        self.validate_sources(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), &input.sources)
-            .await?;
+        self.validate_sources(
+            &context,
+            capability,
+            Some(ResourceTarget::CortexEntity(entity_id)),
+            &input.sources,
+        )
+        .await?;
         let successor = self
             .audit_result(
                 &context,
@@ -676,7 +717,11 @@ where
             ),
         };
         if let Some(result) = self
-            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
+            .preflight(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+            )
             .await?
         {
             return Ok(result);
@@ -686,7 +731,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "note" }));
         let note = self
-            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
+            .audit_result(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+                loaded,
+            )
             .await?;
         self.audit_result(
             &context,
@@ -745,7 +795,11 @@ where
             ),
         };
         if let Some(result) = self
-            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
+            .preflight(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+            )
             .await?
         {
             return Ok(result);
@@ -755,7 +809,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "task" }));
         let task = self
-            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
+            .audit_result(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+                loaded,
+            )
             .await?;
         self.audit_result(
             &context,
@@ -814,7 +873,11 @@ where
             ),
         };
         if let Some(result) = self
-            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
+            .preflight(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+            )
             .await?
         {
             return Ok(result);
@@ -824,7 +887,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "memory" }));
         let memory = self
-            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
+            .audit_result(
+                &context,
+                capability,
+                Some(ResourceTarget::CortexEntity(entity_id)),
+                loaded,
+            )
             .await?;
         self.audit_result(
             &context,
@@ -964,8 +1032,13 @@ where
             )
             .await?;
         let executed = self.mutations.execute_once(mutation).await;
-        self.audit_result(&context, capability, Some(ResourceTarget::CortexEntity(result.entity_id)), executed)
-            .await
+        self.audit_result(
+            &context,
+            capability,
+            Some(ResourceTarget::CortexEntity(result.entity_id)),
+            executed,
+        )
+        .await
     }
 
     async fn audit_result<T>(
@@ -997,9 +1070,7 @@ where
         };
         match self
             .audit
-            .append(audit_event(
-                context, capability, target, decision, result,
-            ))
+            .append(audit_event(context, capability, target, decision, result))
             .await
         {
             Ok(()) => error,

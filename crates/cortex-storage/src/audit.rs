@@ -1,5 +1,10 @@
 use cortex_application::{ApplicationError, AuditPort};
-use cortex_domain::{AuditEvent, AuditEventId, AuditResult, PolicyDecision, PolicyDeny};
+use cortex_domain::{
+    AuditEvent, AuditEventId, AuditResult, ContentHash, ObservedRevision, PolicyDecision,
+    PolicyDeny, ProviderAuditMetadata, ProviderId, ProviderResourceId, ProviderResourceKind,
+    ResourceTarget, WorkspaceId,
+};
+use serde::{Deserialize, Serialize};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
@@ -27,7 +32,7 @@ impl SqliteAuditPort {
     ) -> Result<Option<AuditEvent>, ApplicationError> {
         let row = sqlx::query(
             "SELECT id, workspace_id, principal_id, operation_id, correlation_id, \
-             capability, target_id, policy_decision, result \
+             capability, target_id, policy_decision, result, redacted_metadata \
              FROM audit_event WHERE workspace_id = ? AND id = ?",
         )
         .bind(uuid_text(workspace_id))
@@ -69,7 +74,7 @@ impl SqliteAuditPort {
     ) -> Result<Option<AuditEvent>, ApplicationError> {
         let rows = sqlx::query(
             "SELECT id, workspace_id, principal_id, operation_id, correlation_id, capability, \
-             target_id, policy_decision, result FROM audit_event \
+             target_id, policy_decision, result, redacted_metadata FROM audit_event \
              WHERE workspace_id = ? AND correlation_id = ? LIMIT 2",
         )
         .bind(uuid_text(workspace_id))
@@ -99,10 +104,11 @@ where
     E: sqlx::Executor<'e, Database = Sqlite>,
 {
     canonical_capability(event.capability)?;
+    let metadata_json = encode_metadata(event.provider_metadata.as_ref())?;
     sqlx::query(
         "INSERT INTO audit_event \
          (id, workspace_id, principal_id, operation_id, correlation_id, capability, target_id, \
-          policy_decision, result, redacted_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')",
+          policy_decision, result, redacted_metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(uuid_text(event.id))
     .bind(uuid_text(event.workspace_id))
@@ -110,9 +116,10 @@ where
     .bind(uuid_text(event.operation_id))
     .bind(event.correlation_id.to_string())
     .bind(event.capability)
-    .bind(event.target_id.map(uuid_text))
+    .bind(encode_target(event.target.as_ref())?)
     .bind(encode_policy(event.policy_decision))
     .bind(encode_result(event.result))
+    .bind(metadata_json)
     .execute(executor)
     .await
     .map_err(|_| storage_error("audit append failed"))?;
@@ -130,6 +137,9 @@ fn decode_event(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Application
     let target: Option<String> = row
         .try_get("target_id")
         .map_err(|_| storage_error("invalid audit row"))?;
+    let metadata: String = row
+        .try_get("redacted_metadata")
+        .map_err(|_| storage_error("invalid audit row"))?;
     Ok(AuditEvent {
         id: decode_id(row, "id")?,
         workspace_id: decode_id(row, "workspace_id")?,
@@ -140,7 +150,8 @@ fn decode_event(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Application
             row.try_get("capability")
                 .map_err(|_| storage_error("invalid audit row"))?,
         )?,
-        target_id: target.map(|value| parse_id(&value)).transpose()?,
+        target: target.map(decode_target).transpose()?,
+        provider_metadata: decode_metadata(&metadata)?,
         policy_decision: decode_policy(
             row.try_get("policy_decision")
                 .map_err(|_| storage_error("invalid audit row"))?,
@@ -150,6 +161,184 @@ fn decode_event(row: &sqlx::sqlite::SqliteRow) -> Result<AuditEvent, Application
                 .map_err(|_| storage_error("invalid audit row"))?,
         )?,
     })
+}
+
+/// Encodes an audit target into the `target_id` column.
+///
+/// Cortex entities remain plain UUIDv7 text so pre-provider rows and values
+/// share one legacy-compatible representation; provider targets are tagged
+/// JSON because their identity is opaque and not workspace-scoped UUIDs.
+pub(crate) fn encode_target(
+    target: Option<&ResourceTarget>,
+) -> Result<Option<String>, ApplicationError> {
+    let encoded = match target {
+        None => None,
+        Some(ResourceTarget::CortexEntity(entity_id)) => Some(uuid_text(*entity_id)),
+        Some(ResourceTarget::ProviderResource(resource)) => Some(
+            serde_json::to_string(&StoredAuditTarget::ProviderResource {
+                workspace_id: uuid_text(resource.workspace_id()),
+                provider_id: resource.provider_id().as_str().to_owned(),
+                resource_id: resource.resource_id().as_str().to_owned(),
+                resource_kind: encode_resource_kind(resource.kind()).to_owned(),
+            })
+            .map_err(|_| storage_error("audit target encoding failed"))?,
+        ),
+        Some(ResourceTarget::ProviderScope {
+            provider_id,
+            workspace_id,
+            resource_kind,
+        }) => Some(
+            serde_json::to_string(&StoredAuditTarget::ProviderScope {
+                workspace_id: uuid_text(*workspace_id),
+                provider_id: provider_id.as_str().to_owned(),
+                resource_kind: encode_resource_kind(*resource_kind).to_owned(),
+            })
+            .map_err(|_| storage_error("audit target encoding failed"))?,
+        ),
+    };
+    Ok(encoded)
+}
+
+pub(crate) fn decode_target(value: String) -> Result<ResourceTarget, ApplicationError> {
+    // Plain UUID text is the legacy (and current) Cortex entity encoding.
+    if let Ok(uuid) = Uuid::parse_str(&value) {
+        return Ok(ResourceTarget::CortexEntity(
+            cortex_domain::EntityId::try_from(uuid).map_err(ApplicationError::from)?,
+        ));
+    }
+    let stored: StoredAuditTarget =
+        serde_json::from_str(&value).map_err(|_| storage_error("invalid audit target"))?;
+    match stored {
+        StoredAuditTarget::ProviderResource {
+            workspace_id,
+            provider_id,
+            resource_id,
+            resource_kind,
+        } => Ok(ResourceTarget::ProviderResource(
+            cortex_domain::ProviderResourceRef::new(
+                parse_id(&workspace_id)?,
+                ProviderId::new(provider_id).map_err(ApplicationError::from)?,
+                ProviderResourceId::new(resource_id).map_err(ApplicationError::from)?,
+                decode_resource_kind(&resource_kind)?,
+            ),
+        )),
+        StoredAuditTarget::ProviderScope {
+            workspace_id,
+            provider_id,
+            resource_kind,
+        } => Ok(ResourceTarget::ProviderScope {
+            workspace_id: parse_id(&workspace_id)?,
+            provider_id: ProviderId::new(provider_id).map_err(ApplicationError::from)?,
+            resource_kind: decode_resource_kind(&resource_kind)?,
+        }),
+    }
+}
+
+fn encode_resource_kind(kind: ProviderResourceKind) -> &'static str {
+    match kind {
+        ProviderResourceKind::Knowledge => "knowledge",
+        ProviderResourceKind::Task => "task",
+    }
+}
+
+fn decode_resource_kind(value: &str) -> Result<ProviderResourceKind, ApplicationError> {
+    match value {
+        "knowledge" => Ok(ProviderResourceKind::Knowledge),
+        "task" => Ok(ProviderResourceKind::Task),
+        _ => Err(storage_error("invalid provider resource kind")),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StoredAuditTarget {
+    ProviderResource {
+        workspace_id: String,
+        provider_id: String,
+        resource_id: String,
+        resource_kind: String,
+    },
+    ProviderScope {
+        workspace_id: String,
+        provider_id: String,
+        resource_kind: String,
+    },
+}
+
+fn encode_metadata(metadata: Option<&ProviderAuditMetadata>) -> Result<String, ApplicationError> {
+    let Some(metadata) = metadata else {
+        return Ok("{}".to_owned());
+    };
+    let stored = StoredAuditMetadata {
+        provider: Some(StoredProviderAuditMetadata {
+            before_revision: metadata
+                .before_revision
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            before_hash: metadata.before_hash.map(encode_hash),
+            after_revision: metadata
+                .after_revision
+                .as_ref()
+                .map(|value| value.as_str().to_owned()),
+            after_hash: metadata.after_hash.map(encode_hash),
+        }),
+    };
+    serde_json::to_string(&stored).map_err(|_| storage_error("audit metadata encoding failed"))
+}
+
+fn decode_metadata(value: &str) -> Result<Option<ProviderAuditMetadata>, ApplicationError> {
+    if value.trim().is_empty() || value.trim() == "{}" {
+        return Ok(None);
+    }
+    let stored: StoredAuditMetadata =
+        serde_json::from_str(value).map_err(|_| storage_error("invalid audit metadata"))?;
+    let Some(provider) = stored.provider else {
+        return Ok(None);
+    };
+    Ok(Some(ProviderAuditMetadata::new(
+        provider
+            .before_revision
+            .map(|value| ObservedRevision::new(value).map_err(ApplicationError::from))
+            .transpose()?,
+        provider.before_hash.map(decode_hash).transpose()?,
+        provider
+            .after_revision
+            .map(|value| ObservedRevision::new(value).map_err(ApplicationError::from))
+            .transpose()?,
+        provider.after_hash.map(decode_hash).transpose()?,
+    )))
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredAuditMetadata {
+    provider: Option<StoredProviderAuditMetadata>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredProviderAuditMetadata {
+    before_revision: Option<String>,
+    before_hash: Option<String>,
+    after_revision: Option<String>,
+    after_hash: Option<String>,
+}
+
+fn encode_hash(hash: ContentHash) -> String {
+    hash.as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_hash(value: String) -> Result<ContentHash, ApplicationError> {
+    if value.len() != 64 {
+        return Err(storage_error("invalid audit content hash"));
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| storage_error("invalid audit content hash"))?;
+    }
+    Ok(ContentHash::new(bytes))
 }
 
 fn decode_id<T>(row: &sqlx::sqlite::SqliteRow, column: &str) -> Result<T, ApplicationError>
@@ -188,6 +377,7 @@ fn encode_policy(value: PolicyDecision) -> &'static str {
     match value {
         PolicyDecision::Allow => "allow",
         PolicyDecision::Deny(PolicyDeny::MissingGrant) => "deny_missing_grant",
+        PolicyDecision::Deny(PolicyDeny::TargetOutsideWorkspace) => "deny_target_outside_workspace",
     }
 }
 
@@ -195,6 +385,9 @@ fn decode_policy(value: &str) -> Result<PolicyDecision, ApplicationError> {
     match value {
         "allow" => Ok(PolicyDecision::Allow),
         "deny_missing_grant" => Ok(PolicyDecision::Deny(PolicyDeny::MissingGrant)),
+        "deny_target_outside_workspace" => {
+            Ok(PolicyDecision::Deny(PolicyDeny::TargetOutsideWorkspace))
+        }
         _ => Err(storage_error("invalid audit policy")),
     }
 }
@@ -277,7 +470,8 @@ mod tests {
             operation_id: OperationId::new(),
             correlation_id: Uuid::now_v7(),
             capability: "cortex_note_search",
-            target_id: None,
+            target: None,
+            provider_metadata: None,
             policy_decision: PolicyDecision::Allow,
             result: AuditResult::Succeeded,
         };

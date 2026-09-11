@@ -425,7 +425,10 @@ base_url = \"{model_base_url}\"
             .expect("audit lookup")
             .expect("mutation audit");
         assert_eq!(audit.capability, capability);
-        assert_eq!(audit.target_id, Some(entity_id));
+        assert_eq!(
+            audit.target,
+            Some(cortex_domain::ResourceTarget::CortexEntity(entity_id))
+        );
         assert_eq!(audit.policy_decision, PolicyDecision::Allow);
         assert_eq!(audit.result, AuditResult::Succeeded);
     }
@@ -568,7 +571,8 @@ async fn seed_source(
         operation_id: context.operation_id,
         correlation_id,
         capability: Capability::MemoryCreate.metadata().mcp_name,
-        target_id: Some(source.id()),
+        target: Some(cortex_domain::ResourceTarget::CortexEntity(source.id())),
+        provider_metadata: None,
         policy_decision: PolicyDecision::Allow,
         result: AuditResult::Succeeded,
     };

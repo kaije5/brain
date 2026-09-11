@@ -5,7 +5,7 @@ use cortex_application::{
 };
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion, Note, OperationId,
-    PolicyDecision, PrincipalId, Revision, Source, Task, WorkspaceId,
+    PolicyDecision, PrincipalId, ResourceTarget, Revision, Source, Task, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,7 +13,7 @@ use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    audit::insert_event_in_transaction,
+    audit::{decode_target, encode_target, insert_event_in_transaction},
     database::storage_error,
     repositories::{
         decode_lifecycle, encode_lifecycle, encode_memory_status, encode_task_status, id_text,
@@ -160,7 +160,8 @@ impl OperationStore {
                 operation_id: request.operation_id,
                 correlation_id: request.correlation_id,
                 capability: "cortex_remote_enroll",
-                target_id: None,
+                target: None,
+                provider_metadata: None,
                 policy_decision: PolicyDecision::Allow,
                 result: AuditResult::Succeeded,
             },
@@ -1067,6 +1068,9 @@ struct StoredMutationResult {
     version: u8,
     principal_id: String,
     capability: String,
+    /// Version 3 stored the provider-neutral target; version 2 stored a plain
+    /// Cortex entity UUID in `target_id` and decodes as a `CortexEntity` target.
+    target: Option<String>,
     target_id: Option<String>,
     entity_id: String,
     revision: u64,
@@ -1077,10 +1081,11 @@ struct StoredMutationResult {
 fn encode_operation(mutation: &AtomicMutation) -> Result<String, ApplicationError> {
     let result = mutation.result;
     let stored = StoredMutationResult {
-        version: 2,
+        version: 3,
         principal_id: id_text(mutation.identity.principal_id),
         capability: mutation.identity.capability.metadata().mcp_name.to_owned(),
-        target_id: mutation.identity.target_id.map(id_text),
+        target: encode_target(mutation.identity.target.as_ref())?,
+        target_id: None,
         entity_id: id_text(result.entity_id),
         revision: result.revision.get(),
         lifecycle: encode_lifecycle(result.lifecycle).to_owned(),
@@ -1092,17 +1097,21 @@ fn encode_operation(mutation: &AtomicMutation) -> Result<String, ApplicationErro
 fn decode_operation(value: &str) -> Result<RecordedOperation, ApplicationError> {
     let stored: StoredMutationResult = serde_json::from_str(value)
         .map_err(|_| storage_error("operation outcome decoding failed"))?;
-    if stored.version != 2 {
-        return Err(storage_error("unsupported operation outcome version"));
-    }
     let capability = Capability::from_mcp_name(&stored.capability)
         .ok_or_else(|| storage_error("invalid operation capability"))?;
+    let target = match stored.version {
+        3 => stored.target.map(decode_target).transpose()?,
+        // Legacy outcomes addressed only Cortex entities.
+        2 => stored
+            .target_id
+            .as_deref()
+            .map(parse_id)
+            .transpose()?
+            .map(ResourceTarget::CortexEntity),
+        _ => return Err(storage_error("unsupported operation outcome version")),
+    };
     Ok(RecordedOperation {
-        identity: OperationIdentity::new(
-            parse_id(&stored.principal_id)?,
-            capability,
-            stored.target_id.as_deref().map(parse_id).transpose()?,
-        ),
+        identity: OperationIdentity::new(parse_id(&stored.principal_id)?, capability, target),
         result: MutationResult {
             entity_id: parse_id(&stored.entity_id)?,
             revision: Revision::rehydrate(stored.revision).map_err(ApplicationError::from)?,
