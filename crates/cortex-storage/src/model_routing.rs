@@ -175,4 +175,71 @@ impl SqliteModelRoutingStore {
         }
         Ok(evidence)
     }
+
+    /// Records the latest routing decision as a typed `{profile_id, model_id}`
+    /// selection. Only identifiers and a timestamp are stored; provider
+    /// secrets and profile definitions never reach storage.
+    ///
+    /// # Errors
+    /// Returns a validation error for invalid identifiers and a storage error
+    /// when the write fails.
+    pub async fn record_route(
+        &self,
+        profile_id: &str,
+        model_id: &str,
+        routed_at: &str,
+    ) -> Result<(), ApplicationError> {
+        if profile_id.trim().is_empty() || profile_id.len() > 256 {
+            return Err(ApplicationError::Validation {
+                field: "provider_profile_id",
+            });
+        }
+        if model_id.trim().is_empty() || model_id.len() > 256 {
+            return Err(ApplicationError::Validation { field: "model_id" });
+        }
+        sqlx::query(
+            "INSERT INTO model_route_decision (id, profile_id, model_id, routed_at)
+             VALUES (1, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                model_id = excluded.model_id,
+                routed_at = excluded.routed_at",
+        )
+        .bind(profile_id)
+        .bind(model_id)
+        .bind(routed_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| storage_error("route decision write failed"))?;
+        Ok(())
+    }
+
+    /// Loads the latest recorded routing decision, when one exists.
+    ///
+    /// # Errors
+    /// Returns a storage error when the read fails.
+    pub async fn load_route(&self) -> Result<Option<StoredRouteDecision>, ApplicationError> {
+        let row = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT profile_id, model_id, routed_at FROM model_route_decision WHERE id = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| storage_error("route decision read failed"))?;
+        Ok(
+            row.map(|(profile_id, model_id, routed_at)| StoredRouteDecision {
+                profile_id,
+                model_id,
+                routed_at,
+            }),
+        )
+    }
+}
+
+/// The latest durable routing decision: which profile served which model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredRouteDecision {
+    pub profile_id: String,
+    pub model_id: String,
+    /// RFC 3339 timestamp of the resolution that produced this decision.
+    pub routed_at: String,
 }

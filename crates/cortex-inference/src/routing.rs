@@ -58,6 +58,107 @@ pub enum ModelCapability {
     StructuredOutput,
 }
 
+/// Wire protocol spoken by one provider profile. SCRUM-80's SSE streaming is
+/// the streaming mode of `OpenAiCompletions`; no other mode exists yet.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ApiMode {
+    /// OpenAI-compatible `POST /chat/completions` request/response protocol.
+    #[default]
+    OpenAiCompletions,
+}
+
+/// Typed authentication strategy for a profile. Secret material is always
+/// indirect: `SecretRef` resolves through the platform secret store, and no
+/// variant can ever carry a raw credential.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AuthStrategy {
+    /// The endpoint requires no credential (self-hosted, keyless).
+    #[default]
+    None,
+    /// The endpoint authenticates with the secret named by the profile's
+    /// `SecretRef` locator.
+    SecretRef,
+}
+
+/// Bounded, per-profile timeouts. Every variant must be non-zero.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfileTimeouts {
+    connect: Duration,
+    request: Duration,
+    stale_stream: Duration,
+}
+
+impl ProfileTimeouts {
+    /// # Errors
+    /// Returns a validation error when any timeout is zero.
+    pub fn new(
+        connect: Duration,
+        request: Duration,
+        stale_stream: Duration,
+    ) -> Result<Self, ApplicationError> {
+        if connect.is_zero() || request.is_zero() || stale_stream.is_zero() {
+            return Err(ApplicationError::Validation {
+                field: "profile_timeouts",
+            });
+        }
+        Ok(Self {
+            connect,
+            request,
+            stale_stream,
+        })
+    }
+
+    #[must_use]
+    pub const fn connect(&self) -> Duration {
+        self.connect
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> Duration {
+        self.request
+    }
+
+    #[must_use]
+    pub const fn stale_stream(&self) -> Duration {
+        self.stale_stream
+    }
+}
+
+impl Default for ProfileTimeouts {
+    fn default() -> Self {
+        // Preserves the historical single hard-coded 5 s timeout.
+        const FIVE_SECONDS: Duration = Duration::from_secs(5);
+        Self {
+            connect: FIVE_SECONDS,
+            request: FIVE_SECONDS,
+            stale_stream: FIVE_SECONDS,
+        }
+    }
+}
+
+/// Typed, narrowly scoped OpenAI-compatibility differences. Deliberately not
+/// a string→JSON escape hatch: every quirk is a validated field the transport
+/// can branch on.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProviderQuirks {
+    omit_tool_choice: bool,
+}
+
+impl ProviderQuirks {
+    /// Some OpenAI-compatible servers reject `tool_choice` alongside `tools`;
+    /// when set, requests omit the field and default tool selection applies.
+    #[must_use]
+    pub const fn with_omit_tool_choice(mut self, omit_tool_choice: bool) -> Self {
+        self.omit_tool_choice = omit_tool_choice;
+        self
+    }
+
+    #[must_use]
+    pub const fn omit_tool_choice(&self) -> bool {
+        self.omit_tool_choice
+    }
+}
+
 /// Durable, secret-free description of one configured provider endpoint.
 #[derive(Clone, Debug)]
 pub struct ProviderProfile {
@@ -65,6 +166,11 @@ pub struct ProviderProfile {
     enabled: bool,
     /// Opaque credential locator; resolved only by the platform secret store.
     secret_reference: Option<SecretRef>,
+    api_mode: ApiMode,
+    auth: AuthStrategy,
+    timeouts: ProfileTimeouts,
+    quirks: ProviderQuirks,
+    declared_models: Vec<ModelId>,
 }
 
 impl ProviderProfile {
@@ -75,12 +181,47 @@ impl ProviderProfile {
             id,
             enabled,
             secret_reference: None,
+            api_mode: ApiMode::default(),
+            auth: AuthStrategy::default(),
+            timeouts: ProfileTimeouts::default(),
+            quirks: ProviderQuirks::default(),
+            declared_models: Vec::new(),
         })
     }
 
     #[must_use]
     pub fn with_secret_reference(mut self, reference: Option<SecretRef>) -> Self {
         self.secret_reference = reference;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_api_mode(mut self, api_mode: ApiMode) -> Self {
+        self.api_mode = api_mode;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_auth_strategy(mut self, auth: AuthStrategy) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_timeouts(mut self, timeouts: ProfileTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_quirks(mut self, quirks: ProviderQuirks) -> Self {
+        self.quirks = quirks;
+        self
+    }
+
+    #[must_use]
+    pub fn with_declared_models(mut self, models: Vec<ModelId>) -> Self {
+        self.declared_models = models;
         self
     }
 
@@ -98,13 +239,50 @@ impl ProviderProfile {
     pub const fn secret_reference(&self) -> Option<&SecretRef> {
         self.secret_reference.as_ref()
     }
+
+    #[must_use]
+    pub const fn api_mode(&self) -> ApiMode {
+        self.api_mode
+    }
+
+    #[must_use]
+    pub const fn auth_strategy(&self) -> AuthStrategy {
+        self.auth
+    }
+
+    #[must_use]
+    pub const fn timeouts(&self) -> ProfileTimeouts {
+        self.timeouts
+    }
+
+    #[must_use]
+    pub const fn quirks(&self) -> ProviderQuirks {
+        self.quirks
+    }
+
+    /// Models the operator declared as supported by this profile; empty means
+    /// discovery evidence alone decides eligibility.
+    #[must_use]
+    pub fn declared_models(&self) -> &[ModelId] {
+        &self.declared_models
+    }
+
+    /// Whether `model_id` is usable on this profile: always yes when the
+    /// profile declares no explicit model set, otherwise only listed models.
+    #[must_use]
+    pub fn admits_model(&self, model_id: &ModelId) -> bool {
+        self.declared_models.is_empty() || self.declared_models.contains(model_id)
+    }
 }
 
-/// One discovered model with timestamped capability evidence.
+/// One discovered model with timestamped capability evidence and, when the
+/// discovery was per-profile, the profile the model was discovered on. A
+/// model without provenance is attributable to any enabled profile.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveredModel {
     model_id: ModelId,
     evidence: BTreeMap<ModelCapability, DateTime<Utc>>,
+    profile: Option<ProviderProfileId>,
 }
 
 impl DiscoveredModel {
@@ -113,7 +291,21 @@ impl DiscoveredModel {
         Self {
             model_id,
             evidence: BTreeMap::new(),
+            profile: None,
         }
+    }
+
+    /// Attributes this discovery to the profile it was observed on.
+    #[must_use]
+    pub fn with_profile(mut self, profile_id: ProviderProfileId) -> Self {
+        self.profile = Some(profile_id);
+        self
+    }
+
+    /// The profile this model was discovered on, when attributed.
+    #[must_use]
+    pub const fn profile(&self) -> Option<&ProviderProfileId> {
+        self.profile.as_ref()
     }
 
     #[must_use]
@@ -276,8 +468,13 @@ impl ModelRouter {
         let mut candidates: Vec<(&ProviderProfile, &DiscoveredModel)> = enabled
             .iter()
             .flat_map(|profile| {
+                // A model routes only to the profile it was discovered on;
+                // unattributed models (single-catalog callers) remain
+                // eligible for every enabled profile.
                 catalog
                     .eligible(policy, now)
+                    .filter(move |model| model.profile().is_none_or(|owner| owner == profile.id()))
+                    .filter(move |model| profile.admits_model(model.model_id()))
                     .map(move |model| (*profile, model))
             })
             .collect();

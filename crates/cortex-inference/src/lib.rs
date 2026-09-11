@@ -23,7 +23,8 @@ pub use provider::{
     ToolCall,
 };
 pub use routing::{
-    DiscoveredModel, ModelCapability, ModelCatalog, ModelId, ModelRouter, ProviderProfile,
-    ProviderProfileId, RoleRoutingPolicy, RoutedModel,
+    ApiMode, AuthStrategy, DiscoveredModel, ModelCapability, ModelCatalog, ModelId, ModelRouter,
+    ProfileTimeouts, ProviderProfile, ProviderProfileId, ProviderQuirks, RoleRoutingPolicy,
+    RoutedModel,
 };
 pub use system_prompt::SystemPrompt;

@@ -10,6 +10,7 @@ pub use audit::SqliteAuditPort;
 pub use database::SqliteDatabase;
 pub use model_routing::{
     SqliteModelRoutingStore, StoredCapability, StoredCapabilityEvidence, StoredProviderProfile,
+    StoredRouteDecision,
 };
 pub use operation::{OperationStore, RemoteEnrollmentRecord, RemoteEnrollmentRequest};
 pub use repositories::SqliteRepositories;
