@@ -2,6 +2,7 @@
 
 use std::{collections::BTreeMap, num::NonZeroUsize, sync::Mutex};
 
+use chrono::{TimeZone, Utc};
 use cortex_application::{
     KnowledgeCreate, KnowledgeDelete, KnowledgeDocument, KnowledgeProvider, KnowledgeQuery,
     KnowledgeUpdate, ProviderError, ProviderFreshness, ProviderMutation, ProviderPage,
@@ -96,6 +97,92 @@ impl FakeProvider {
             ObservedRevision::new(format!("rev-{revision}")).unwrap(),
             ContentHash::new(hash),
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn task_provenance(
+        resource: ProviderResourceRef,
+        revision: u64,
+        task_id: TaskId,
+        title: &str,
+        body: &str,
+        status: ProviderTaskStatus,
+        priority: ProviderTaskPriority,
+        scheduling: &TaskSchedulingMetadata,
+    ) -> ProviderProvenance {
+        let mut hasher = Sha256::new();
+        let task_uuid: uuid::Uuid = task_id.into();
+        Self::hash_field(&mut hasher, task_uuid.as_bytes());
+        Self::hash_field(&mut hasher, title.as_bytes());
+        Self::hash_field(&mut hasher, body.as_bytes());
+        hasher.update([match status {
+            ProviderTaskStatus::Todo => 0,
+            ProviderTaskStatus::InProgress => 1,
+            ProviderTaskStatus::Completed => 2,
+            ProviderTaskStatus::Cancelled => 3,
+        }]);
+        hasher.update([match priority {
+            ProviderTaskPriority::Low => 0,
+            ProviderTaskPriority::Normal => 1,
+            ProviderTaskPriority::High => 2,
+            ProviderTaskPriority::Urgent => 3,
+        }]);
+        Self::hash_datetime(&mut hasher, scheduling.due_at());
+        Self::hash_datetime(&mut hasher, scheduling.deadline_at());
+        Self::hash_optional_bytes(
+            &mut hasher,
+            scheduling
+                .duration_minutes()
+                .map(|value| value.get().to_le_bytes()),
+        );
+        Self::hash_datetime(&mut hasher, scheduling.earliest_start());
+        Self::hash_optional_bytes(
+            &mut hasher,
+            scheduling.split().map(|value| [u8::from(value)]),
+        );
+        Self::hash_optional_str(&mut hasher, scheduling.project());
+        Self::hash_optional_str(&mut hasher, scheduling.context());
+        ProviderProvenance::new(
+            resource,
+            ObservedRevision::new(format!("rev-{revision}")).unwrap(),
+            ContentHash::new(hasher.finalize().into()),
+        )
+    }
+
+    fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update(bytes.len().to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    fn hash_optional_bytes<const N: usize>(hasher: &mut Sha256, value: Option<[u8; N]>) {
+        match value {
+            Some(bytes) => {
+                hasher.update([1]);
+                Self::hash_field(hasher, &bytes);
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    fn hash_optional_str(hasher: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                Self::hash_field(hasher, value.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+
+    fn hash_datetime(hasher: &mut Sha256, value: Option<chrono::DateTime<Utc>>) {
+        match value {
+            Some(value) => {
+                hasher.update([1]);
+                hasher.update(value.timestamp().to_le_bytes());
+                hasher.update(value.timestamp_subsec_nanos().to_le_bytes());
+            }
+            None => hasher.update([0]),
+        }
     }
 
     fn revision(
@@ -389,7 +476,16 @@ impl TaskProvider for FakeProvider {
             state.sequence,
             ProviderResourceKind::Task,
         );
-        let provenance = Self::provenance(resource.clone(), 1, input.title(), input.body());
+        let provenance = Self::task_provenance(
+            resource.clone(),
+            1,
+            input.task_id(),
+            input.title(),
+            input.body(),
+            ProviderTaskStatus::Todo,
+            input.priority(),
+            input.scheduling(),
+        );
         let task = ProviderTask::new(
             provenance.clone(),
             input.task_id(),
@@ -416,11 +512,15 @@ impl TaskProvider for FakeProvider {
                 })?;
         let revision = Self::revision(current.provenance(), input.expected_revision())?;
         let previous = current.provenance().clone();
-        let provenance = Self::provenance(
+        let provenance = Self::task_provenance(
             input.resource().clone(),
             revision,
+            current.task_id(),
             input.title(),
             input.body(),
+            input.status(),
+            input.priority(),
+            input.scheduling(),
         );
         let updated = ProviderTask::new(
             provenance.clone(),
@@ -448,11 +548,15 @@ impl TaskProvider for FakeProvider {
                 })?;
         let revision = Self::revision(current.provenance(), input.expected_revision())?;
         let previous = current.provenance().clone();
-        let provenance = Self::provenance(
+        let provenance = Self::task_provenance(
             input.resource().clone(),
             revision,
+            current.task_id(),
             current.title(),
             current.body(),
+            ProviderTaskStatus::Completed,
+            current.priority(),
+            current.scheduling(),
         );
         let completed = ProviderTask::new(
             provenance.clone(),
@@ -921,4 +1025,90 @@ async fn content_hash_is_sha256_of_canonical_content_not_the_revision() {
     assert_eq!(first.content_hash().as_bytes(), &expected);
     assert_eq!(second.content_hash(), first.content_hash());
     assert_ne!(second.observed_revision(), first.observed_revision());
+}
+
+#[tokio::test]
+async fn task_hash_covers_status_priority_and_scheduling_but_not_revision() {
+    let provider = FakeProvider::new(ProviderFreshness::Current);
+    let first = current(
+        &provider
+            .create(
+                TaskCreate::new(
+                    WorkspaceId::new(),
+                    OperationId::new(),
+                    TaskId::new(),
+                    "A",
+                    "one",
+                    ProviderTaskPriority::Normal,
+                    TaskSchedulingMetadata::default(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+    let scheduling = TaskSchedulingMetadata::new(
+        Some(Utc.with_ymd_and_hms(2026, 9, 12, 10, 0, 0).unwrap()),
+        None,
+        None,
+        None,
+        Some(true),
+        Some("project"),
+        Some("context"),
+    )
+    .unwrap();
+    let second = current(
+        &provider
+            .update(
+                TaskUpdate::new(
+                    first.resource().clone(),
+                    OperationId::new(),
+                    first.observed_revision().clone(),
+                    "A",
+                    "one",
+                    ProviderTaskStatus::InProgress,
+                    ProviderTaskPriority::Urgent,
+                    scheduling.clone(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+    let third = current(
+        &provider
+            .update(
+                TaskUpdate::new(
+                    second.resource().clone(),
+                    OperationId::new(),
+                    second.observed_revision().clone(),
+                    "A",
+                    "one",
+                    ProviderTaskStatus::InProgress,
+                    ProviderTaskPriority::Urgent,
+                    scheduling,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+    let completed = current(
+        &provider
+            .complete(
+                TaskComplete::new(
+                    third.resource().clone(),
+                    OperationId::new(),
+                    third.observed_revision().clone(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+
+    assert_ne!(second.content_hash(), first.content_hash());
+    assert_eq!(third.content_hash(), second.content_hash());
+    assert_ne!(third.observed_revision(), second.observed_revision());
+    assert_ne!(completed.content_hash(), third.content_hash());
 }
