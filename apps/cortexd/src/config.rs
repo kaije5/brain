@@ -8,6 +8,8 @@ use cortex_application::{Capability, CapabilityCatalog, SecretRef};
 use cortex_domain::{PrincipalId, WorkspaceId};
 use cortex_inference::{OpenAiCompatibleConfig, ProviderLimits};
 use cortex_storage::RemoteEnrollmentRecord;
+
+use crate::vault::VaultProviderConfig;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
@@ -55,6 +57,7 @@ pub struct DaemonConfig {
     pub(crate) discovery_path: PathBuf,
     pub(crate) bootstrap_grants: Vec<Capability>,
     pub(crate) remote_clients: Vec<RemoteClientConfig>,
+    pub(crate) vault: Option<VaultProviderConfig>,
 }
 
 impl DaemonConfig {
@@ -92,6 +95,7 @@ impl DaemonConfig {
             discovery_path,
             bootstrap_grants: CapabilityCatalog::all().to_vec(),
             remote_clients: Vec::new(),
+            vault: None,
         }
     }
 
@@ -113,15 +117,29 @@ impl DaemonConfig {
         database_path: PathBuf,
         settings: Option<&crate::settings::LocalSettings>,
     ) -> Result<Self, crate::DaemonError> {
+        let vault = match settings.map(crate::settings::LocalSettings::vault_config) {
+            None => None,
+            Some(Ok(vault)) => vault,
+            // Missing, invalid, or contradictory vault declarations fail
+            // startup with a typed diagnostic instead of degrading silently.
+            Some(Err(_)) => return Err(crate::DaemonError::InvalidConfiguration),
+        };
+        if let Some(vault) = &vault {
+            vault
+                .validate_root_access()
+                .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+        }
         Self::from_database_path_with_endpoint(
             database_path,
             settings.and_then(crate::settings::LocalSettings::endpoint_override),
+            vault,
         )
     }
 
     fn from_database_path_with_endpoint(
         database_path: PathBuf,
         endpoint_override: Option<&str>,
+        vault: Option<VaultProviderConfig>,
     ) -> Result<Self, crate::DaemonError> {
         if database_path.as_os_str().is_empty() {
             return Err(crate::DaemonError::InvalidConfiguration);
@@ -162,9 +180,10 @@ impl DaemonConfig {
                 discovery_path,
                 bootstrap_grants: CapabilityCatalog::all().to_vec(),
                 remote_clients,
+                vault,
             });
         }
-        let config = Self::with_fresh_pairing(
+        let mut config = Self::with_fresh_pairing(
             database_path,
             endpoint_override.map_or_else(
                 || format!("cortexd-{}", uuid::Uuid::now_v7()),
@@ -174,6 +193,7 @@ impl DaemonConfig {
             PrincipalId::new(),
             discovery_path,
         );
+        config.vault = vault;
         config.write_pairing_key()?;
         config.write_discovery()?;
         Ok(config)
@@ -245,6 +265,30 @@ impl DaemonConfig {
     pub fn with_bootstrap_grants(mut self, grants: Vec<Capability>) -> Self {
         self.bootstrap_grants = grants;
         self
+    }
+
+    /// Attaches a validated vault provider configuration. Composition roots
+    /// that cannot read the declared root must not mount it: providers are
+    /// injected only with an accessible, validated configuration.
+    ///
+    /// # Errors
+    /// Returns a redacted configuration error when the declared root is
+    /// missing or not a directory.
+    pub fn with_vault_provider(
+        mut self,
+        config: VaultProviderConfig,
+    ) -> Result<Self, crate::DaemonError> {
+        config
+            .validate_root_access()
+            .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
+        self.vault = Some(config);
+        Ok(self)
+    }
+
+    /// Returns the configured vault provider configuration, when present.
+    #[must_use]
+    pub const fn vault_provider(&self) -> Option<&VaultProviderConfig> {
+        self.vault.as_ref()
     }
 
     /// Returns the local IPC endpoint name for diagnostics and tests.
