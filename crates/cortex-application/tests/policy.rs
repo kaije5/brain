@@ -16,7 +16,7 @@ fn delete_requires_an_explicit_matching_grant() {
     );
 
     assert_eq!(
-        policy.evaluate(&context, Capability::MemoryDelete),
+        policy.evaluate(&context, Capability::MemoryDelete, None),
         PolicyDecision::Deny(PolicyDeny::MissingGrant)
     );
 }
@@ -38,7 +38,7 @@ fn grant_for_another_capability_does_not_authorize_delete() {
     );
 
     assert_eq!(
-        policy.evaluate(&context, Capability::MemoryDelete),
+        policy.evaluate(&context, Capability::MemoryDelete, None),
         PolicyDecision::Deny(PolicyDeny::MissingGrant)
     );
 }

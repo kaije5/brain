@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion,
     MemoryAssertionInput, MemoryStatus, Note, NoteInput, PolicyDecision, PolicyDeny, PrincipalId,
-    Revision, Task, TaskInput, WorkspaceId,
+    ResourceTarget, Revision, Task, TaskInput, WorkspaceId,
 };
 
 use crate::{
@@ -38,7 +38,12 @@ impl CapabilityGrant {
 
 /// The policy boundary evaluated by Cortex before every capability invocation.
 pub trait PolicyPort: Send + Sync {
-    fn evaluate(&self, context: &CommandContext, capability: Capability) -> PolicyDecision;
+    fn evaluate(
+        &self,
+        context: &CommandContext,
+        capability: Capability,
+        target: Option<&ResourceTarget>,
+    ) -> PolicyDecision;
 }
 
 /// Append-only redacted audit boundary for rejected or failed commands.
@@ -214,7 +219,7 @@ where
     ) -> Result<MutationResult, ApplicationError> {
         let capability = Capability::NoteUpdate;
         if let Some(result) = self
-            .preflight(&context, capability, Some(entity_id))
+            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
             .await?
         {
             return Ok(result);
@@ -224,12 +229,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "note" }));
         let note = self
-            .audit_result(&context, capability, Some(entity_id), loaded)
+            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
             .await?;
         self.audit_result(
             &context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             require_state(
                 note.revision(),
                 expected_revision,
@@ -243,7 +248,7 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 expected_revision.next().map_err(ApplicationError::from),
             )
             .await?;
@@ -251,7 +256,7 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 Note::rehydrate(
                     entity_id,
                     context.workspace_id,
@@ -266,7 +271,7 @@ where
         self.commit(
             context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             mutation_result(&context, entity_id, revision, Lifecycle::Active),
             vec![AggregateChange::ReplaceNote {
                 entity_id,
@@ -345,7 +350,7 @@ where
     ) -> Result<MutationResult, ApplicationError> {
         let capability = Capability::TaskComplete;
         if let Some(result) = self
-            .preflight(&context, capability, Some(entity_id))
+            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
             .await?
         {
             return Ok(result);
@@ -355,12 +360,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "task" }));
         let task = self
-            .audit_result(&context, capability, Some(entity_id), loaded)
+            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
             .await?;
         self.audit_result(
             &context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             require_state(
                 task.revision(),
                 expected_revision,
@@ -374,7 +379,7 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 task.complete().map_err(ApplicationError::from),
             )
             .await?;
@@ -382,7 +387,7 @@ where
         self.commit(
             context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             mutation_result(&context, entity_id, revision, completed.lifecycle()),
             vec![AggregateChange::ReplaceTask {
                 entity_id,
@@ -404,7 +409,7 @@ where
     ) -> Result<MutationResult, ApplicationError> {
         let capability = Capability::TaskUpdate;
         if let Some(result) = self
-            .preflight(&context, capability, Some(entity_id))
+            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
             .await?
         {
             return Ok(result);
@@ -414,12 +419,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "task" }));
         let task = self
-            .audit_result(&context, capability, Some(entity_id), loaded)
+            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
             .await?;
         self.audit_result(
             &context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             require_state(
                 task.revision(),
                 expected_revision,
@@ -433,7 +438,7 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 expected_revision.next().map_err(ApplicationError::from),
             )
             .await?;
@@ -441,7 +446,7 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 Task::rehydrate(
                     entity_id,
                     context.workspace_id,
@@ -457,7 +462,7 @@ where
         self.commit(
             context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             mutation_result(&context, entity_id, revision, Lifecycle::Active),
             vec![AggregateChange::ReplaceTask {
                 entity_id,
@@ -542,7 +547,7 @@ where
     ) -> Result<MutationResult, ApplicationError> {
         let capability = Capability::MemoryCorrect;
         if let Some(result) = self
-            .preflight(&context, capability, Some(entity_id))
+            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
             .await?
         {
             return Ok(result);
@@ -552,22 +557,22 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "memory" }));
         let predecessor = self
-            .audit_result(&context, capability, Some(entity_id), loaded)
+            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
             .await?;
         self.audit_result(
             &context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             require_memory_active(&predecessor, expected_revision),
         )
         .await?;
-        self.validate_sources(&context, capability, Some(entity_id), &input.sources)
+        self.validate_sources(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), &input.sources)
             .await?;
         let successor = self
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 predecessor
                     .correct(MemoryAssertionInput {
                         workspace_id: context.workspace_id,
@@ -584,7 +589,7 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 expected_revision.next().map_err(ApplicationError::from),
             )
             .await?;
@@ -592,7 +597,7 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 memory_with_state(
                     &predecessor,
                     predecessor_revision,
@@ -607,7 +612,7 @@ where
         self.commit(
             context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             mutation_result(&context, result_id, result_revision, result_lifecycle),
             vec![
                 AggregateChange::ReplaceMemory {
@@ -671,7 +676,7 @@ where
             ),
         };
         if let Some(result) = self
-            .preflight(&context, capability, Some(entity_id))
+            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
             .await?
         {
             return Ok(result);
@@ -681,12 +686,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "note" }));
         let note = self
-            .audit_result(&context, capability, Some(entity_id), loaded)
+            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
             .await?;
         self.audit_result(
             &context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             require_state(
                 note.revision(),
                 expected_revision,
@@ -700,14 +705,14 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 expected_revision.next().map_err(ApplicationError::from),
             )
             .await?;
         self.commit(
             context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             mutation_result(&context, entity_id, revision, target),
             vec![change],
         )
@@ -740,7 +745,7 @@ where
             ),
         };
         if let Some(result) = self
-            .preflight(&context, capability, Some(entity_id))
+            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
             .await?
         {
             return Ok(result);
@@ -750,12 +755,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "task" }));
         let task = self
-            .audit_result(&context, capability, Some(entity_id), loaded)
+            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
             .await?;
         self.audit_result(
             &context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             require_state(
                 task.revision(),
                 expected_revision,
@@ -769,14 +774,14 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 expected_revision.next().map_err(ApplicationError::from),
             )
             .await?;
         self.commit(
             context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             mutation_result(&context, entity_id, revision, target),
             vec![change],
         )
@@ -809,7 +814,7 @@ where
             ),
         };
         if let Some(result) = self
-            .preflight(&context, capability, Some(entity_id))
+            .preflight(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)))
             .await?
         {
             return Ok(result);
@@ -819,12 +824,12 @@ where
                 .await
                 .and_then(|value| value.ok_or(ApplicationError::NotFound { entity: "memory" }));
         let memory = self
-            .audit_result(&context, capability, Some(entity_id), loaded)
+            .audit_result(&context, capability, Some(ResourceTarget::CortexEntity(entity_id)), loaded)
             .await?;
         self.audit_result(
             &context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             require_state(
                 memory.revision(),
                 expected_revision,
@@ -838,14 +843,14 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(entity_id),
+                Some(ResourceTarget::CortexEntity(entity_id)),
                 expected_revision.next().map_err(ApplicationError::from),
             )
             .await?;
         self.commit(
             context,
             capability,
-            Some(entity_id),
+            Some(ResourceTarget::CortexEntity(entity_id)),
             mutation_result(&context, entity_id, revision, target),
             vec![change],
         )
@@ -856,9 +861,9 @@ where
         &self,
         context: &CommandContext,
         capability: Capability,
-        target_id: Option<EntityId>,
+        target: Option<ResourceTarget>,
     ) -> Result<Option<MutationResult>, ApplicationError> {
-        let decision = self.policy.evaluate(context, capability);
+        let decision = self.policy.evaluate(context, capability, target.as_ref());
         let previous = self
             .mutations
             .find_result(context.workspace_id, context.operation_id)
@@ -870,7 +875,7 @@ where
                         == crate::OperationIdentity::new(
                             context.principal_id,
                             capability,
-                            target_id,
+                            target.clone(),
                         ) =>
                 {
                     Ok(Some(recorded.result))
@@ -891,7 +896,7 @@ where
                     .record_error(
                         context,
                         capability,
-                        target_id,
+                        target.clone(),
                         PolicyDecision::Deny(deny),
                         error,
                     )
@@ -904,7 +909,7 @@ where
         &self,
         context: &CommandContext,
         capability: Capability,
-        target_id: Option<EntityId>,
+        target: Option<ResourceTarget>,
         sources: &[cortex_domain::SourceRef],
     ) -> Result<(), ApplicationError> {
         for source in sources {
@@ -912,14 +917,14 @@ where
                 SourceRepository::find(&self.repositories, context.workspace_id, source.source_id)
                     .await;
             let found = self
-                .audit_result(context, capability, target_id, found)
+                .audit_result(context, capability, target.clone(), found)
                 .await?;
             if !matches!(found, Some(source) if source.lifecycle() == Lifecycle::Active) {
                 return Err(self
                     .record_error(
                         context,
                         capability,
-                        target_id,
+                        target.clone(),
                         PolicyDecision::Allow,
                         ApplicationError::NotFound { entity: "source" },
                     )
@@ -933,7 +938,7 @@ where
         &self,
         context: CommandContext,
         capability: Capability,
-        target_id: Option<EntityId>,
+        target: Option<ResourceTarget>,
         result: MutationResult,
         changes: Vec<AggregateChange>,
     ) -> Result<MutationResult, ApplicationError> {
@@ -941,17 +946,17 @@ where
             .audit_result(
                 &context,
                 capability,
-                Some(result.entity_id),
+                Some(ResourceTarget::CortexEntity(result.entity_id)),
                 AtomicMutation::new(
                     context,
                     capability,
-                    target_id,
+                    target,
                     changes,
                     result,
                     audit_event(
                         &context,
                         capability,
-                        Some(result.entity_id),
+                        Some(ResourceTarget::CortexEntity(result.entity_id)),
                         PolicyDecision::Allow,
                         AuditResult::Succeeded,
                     ),
@@ -959,7 +964,7 @@ where
             )
             .await?;
         let executed = self.mutations.execute_once(mutation).await;
-        self.audit_result(&context, capability, Some(result.entity_id), executed)
+        self.audit_result(&context, capability, Some(ResourceTarget::CortexEntity(result.entity_id)), executed)
             .await
     }
 
@@ -967,13 +972,13 @@ where
         &self,
         context: &CommandContext,
         capability: Capability,
-        target_id: Option<EntityId>,
+        target: Option<ResourceTarget>,
         result: Result<T, ApplicationError>,
     ) -> Result<T, ApplicationError> {
         match result {
             Ok(value) => Ok(value),
             Err(error) => Err(self
-                .record_error(context, capability, target_id, PolicyDecision::Allow, error)
+                .record_error(context, capability, target, PolicyDecision::Allow, error)
                 .await),
         }
     }
@@ -982,7 +987,7 @@ where
         &self,
         context: &CommandContext,
         capability: Capability,
-        target_id: Option<EntityId>,
+        target: Option<ResourceTarget>,
         decision: PolicyDecision,
         error: ApplicationError,
     ) -> ApplicationError {
@@ -993,7 +998,7 @@ where
         match self
             .audit
             .append(audit_event(
-                context, capability, target_id, decision, result,
+                context, capability, target, decision, result,
             ))
             .await
         {
@@ -1018,7 +1023,26 @@ impl GrantPolicy {
 }
 
 impl PolicyPort for GrantPolicy {
-    fn evaluate(&self, context: &CommandContext, capability: Capability) -> PolicyDecision {
+    fn evaluate(
+        &self,
+        context: &CommandContext,
+        capability: Capability,
+        target: Option<&ResourceTarget>,
+    ) -> PolicyDecision {
+        // A provider target may only be addressed inside the authenticated
+        // workspace, regardless of which capability grants the principal holds.
+        let target_in_workspace = match target {
+            None | Some(ResourceTarget::CortexEntity(_)) => true,
+            Some(ResourceTarget::ProviderResource(resource)) => {
+                resource.workspace_id() == context.workspace_id
+            }
+            Some(ResourceTarget::ProviderScope { workspace_id, .. }) => {
+                *workspace_id == context.workspace_id
+            }
+        };
+        if !target_in_workspace {
+            return PolicyDecision::Deny(PolicyDeny::TargetOutsideWorkspace);
+        }
         let grant = CapabilityGrant::new(
             context.workspace_id,
             context.principal_id,
@@ -1087,7 +1111,7 @@ fn memory_with_state(
 fn audit_event(
     context: &CommandContext,
     capability: Capability,
-    target_id: Option<EntityId>,
+    target: Option<ResourceTarget>,
     policy_decision: PolicyDecision,
     result: AuditResult,
 ) -> AuditEvent {
@@ -1098,7 +1122,8 @@ fn audit_event(
         operation_id: context.operation_id,
         correlation_id: context.correlation_id,
         capability: capability.metadata().mcp_name,
-        target_id,
+        target,
+        provider_metadata: None,
         policy_decision,
         result,
     }
