@@ -17,6 +17,9 @@ apple-native-keyring-store = { version = "1", features = ["keychain"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus-secret-service-keyring-store = "1.0.1"
+# The store leaves Secret Service's crypto backend to its consumer. Keep the
+# pure-Rust backend explicit so Linux builds never select an unusable default.
+secret-service = { version = "5.2", default-features = false, features = ["crypto-rust"] }
 
 [dev-dependencies]
 zeroize = "1"
