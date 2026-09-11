@@ -676,7 +676,8 @@ impl LocalDaemon {
                 operation_id: context.operation_id,
                 correlation_id: context.correlation_id,
                 capability: "cortex_remote_enroll",
-                target_id: None,
+                target: None,
+                provider_metadata: None,
                 policy_decision: if principal_id == self.owner_principal_id {
                     PolicyDecision::Allow
                 } else {
@@ -1075,7 +1076,8 @@ impl LocalDaemon {
                 operation_id: context.operation_id,
                 correlation_id: context.correlation_id,
                 capability: capability.metadata().mcp_name,
-                target_id: None,
+                target: None,
+                provider_metadata: None,
                 policy_decision: decision,
                 result,
             })

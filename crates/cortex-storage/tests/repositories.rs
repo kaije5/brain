@@ -4,8 +4,8 @@ use cortex_application::{
 };
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, Lifecycle, MemoryAssertion, MemoryAssertionInput, Note,
-    NoteInput, OperationId, PolicyDecision, PrincipalId, Source, SourceInput, SourceRef, Task,
-    TaskInput, WorkspaceId,
+    NoteInput, OperationId, PolicyDecision, PrincipalId, ResourceTarget, Source, SourceInput,
+    SourceRef, Task, TaskInput, WorkspaceId,
 };
 use cortex_storage::{SqliteDatabase, SqliteRepositories};
 use tempfile::TempDir;
@@ -171,7 +171,7 @@ async fn assert_note_tombstone_visibility(
     let delete = AtomicMutation::new(
         delete_context,
         Capability::NoteDelete,
-        Some(note.id()),
+        Some(ResourceTarget::CortexEntity(note.id())),
         vec![AggregateChange::DeleteNote {
             entity_id: note.id(),
             expected_revision: note.revision(),
@@ -238,7 +238,8 @@ fn audit(
         operation_id: context.operation_id,
         correlation_id: context.correlation_id,
         capability,
-        target_id: Some(target_id),
+        target: Some(ResourceTarget::CortexEntity(target_id)),
+        provider_metadata: None,
         policy_decision: PolicyDecision::Allow,
         result: AuditResult::Succeeded,
     }

@@ -97,6 +97,6 @@ async fn denied_note_create_is_rejected_audited_and_has_no_side_effect() -> Resu
         PolicyDecision::Deny(cortex_domain::PolicyDeny::MissingGrant)
     );
     assert_eq!(audits[0].result, AuditResult::Rejected);
-    assert_eq!(audits[0].target_id, None);
+    assert_eq!(audits[0].target, None);
     Ok(())
 }

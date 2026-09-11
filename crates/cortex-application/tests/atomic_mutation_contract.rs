@@ -3,7 +3,7 @@ use cortex_application::{
 };
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, Note, NoteInput, OperationId, PolicyDecision,
-    PrincipalId, WorkspaceId,
+    PrincipalId, ResourceTarget, WorkspaceId,
 };
 use uuid::Uuid;
 
@@ -109,7 +109,8 @@ fn audit_event(
         operation_id,
         correlation_id,
         capability: "cortex_note_create",
-        target_id: Some(target_id),
+        target: Some(ResourceTarget::CortexEntity(target_id)),
+        provider_metadata: None,
         policy_decision: PolicyDecision::Allow,
         result: AuditResult::Succeeded,
     }

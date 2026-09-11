@@ -9,4 +9,5 @@ pub enum PolicyDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PolicyDeny {
     MissingGrant,
+    TargetOutsideWorkspace,
 }

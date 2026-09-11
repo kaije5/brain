@@ -1,5 +1,6 @@
 use cortex_domain::{
-    AuditEvent, EntityId, MemoryAssertion, Note, OperationId, Revision, Source, Task, WorkspaceId,
+    AuditEvent, EntityId, MemoryAssertion, Note, OperationId, ResourceTarget, Revision, Source,
+    Task, WorkspaceId,
 };
 
 use crate::{ApplicationError, Capability, MutationResult};
@@ -90,11 +91,15 @@ pub trait OperationResultRepository: Send + Sync {
 }
 
 /// Authenticated command identity retained with a durable idempotency result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The target binds an operation to the exact resource it addressed so that
+/// replaying an operation ID against a different provider, scope, or resource
+/// is rejected instead of returning a foreign result.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
     pub principal_id: cortex_domain::PrincipalId,
     pub capability: Capability,
-    pub target_id: Option<EntityId>,
+    pub target: Option<ResourceTarget>,
 }
 
 impl OperationIdentity {
@@ -102,18 +107,18 @@ impl OperationIdentity {
     pub const fn new(
         principal_id: cortex_domain::PrincipalId,
         capability: Capability,
-        target_id: Option<EntityId>,
+        target: Option<ResourceTarget>,
     ) -> Self {
         Self {
             principal_id,
             capability,
-            target_id,
+            target,
         }
     }
 }
 
 /// A replayable mutation result together with the command identity that created it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedOperation {
     pub identity: OperationIdentity,
     pub result: MutationResult,
@@ -193,17 +198,21 @@ impl AtomicMutation {
     pub fn new(
         context: crate::CommandContext,
         capability: Capability,
-        target_id: Option<EntityId>,
+        target: Option<ResourceTarget>,
         changes: Vec<AggregateChange>,
         result: MutationResult,
         audit_event: AuditEvent,
     ) -> Result<Self, ApplicationError> {
+        // Atomic success evidence names the resulting Cortex entity, which may
+        // differ from the requested target (for example the superseded memory
+        // predecessor). Provider mutations append their evidence through the
+        // AuditPort instead of this SQLite boundary.
         let matching_audit_context = audit_event.workspace_id == context.workspace_id
             && audit_event.principal_id == context.principal_id
             && audit_event.operation_id == context.operation_id
             && audit_event.correlation_id == context.correlation_id
             && audit_event.capability == capability.metadata().mcp_name
-            && audit_event.target_id == Some(result.entity_id)
+            && audit_event.target == Some(ResourceTarget::CortexEntity(result.entity_id))
             && result.audit_correlation_id == context.correlation_id;
 
         if changes.is_empty() || !matching_audit_context {
@@ -213,7 +222,7 @@ impl AtomicMutation {
         Ok(Self {
             workspace_id: context.workspace_id,
             operation_id: context.operation_id,
-            identity: OperationIdentity::new(context.principal_id, capability, target_id),
+            identity: OperationIdentity::new(context.principal_id, capability, target),
             changes,
             result,
             audit_event,

@@ -131,7 +131,7 @@ impl AuthorizedCapabilities {
         let mut capabilities = BTreeSet::new();
         for capability in candidates {
             if matches!(
-                policy.evaluate(context, capability),
+                policy.evaluate(context, capability, None),
                 cortex_domain::PolicyDecision::Allow
             ) {
                 capabilities.insert(capability);

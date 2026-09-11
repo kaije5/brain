@@ -282,7 +282,7 @@ impl OperationResultRepository for FakeState {
             .map_err(|_| ApplicationError::Internal)?
             .operations
             .get(&(workspace_id, operation_id))
-            .copied())
+            .cloned())
     }
 }
 
