@@ -119,11 +119,16 @@ where
 
         let (semantic_records, semantic_ranked, semantic_degraded) = match semantic {
             Ok(Ok((records, ranked))) => (records, ranked, false),
-            Ok(Err(
-                ApplicationError::InferenceUnavailable | ApplicationError::InferenceTimeout,
-            ))
-            | Err(_) => (Vec::new(), Vec::new(), true),
+            // Transient embedding failures degrade to lexical-only results;
+            // permanent configuration failures still surface as typed errors.
+            Ok(Err(error))
+                if error.recovery_hint()
+                    == cortex_application::RecoveryHint::RetrySameSelection =>
+            {
+                (Vec::new(), Vec::new(), true)
+            }
             Ok(Err(error)) => return Err(error),
+            Err(_) => (Vec::new(), Vec::new(), true),
         };
 
         let mut details = BTreeMap::<EntityId, SearchCandidate>::new();

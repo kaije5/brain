@@ -17,7 +17,7 @@ pub use command::{
     NoteUpdateInput, TaskCreateInput, TaskUpdateInput,
 };
 pub use cortex_domain::{PolicyDecision, PolicyDeny};
-pub use error::ApplicationError;
+pub use error::{ApplicationError, RecoveryHint};
 pub use query::{
     AggregateChange, AtomicMutation, AtomicMutationPort, MemoryRepository, NoteRepository,
     OperationIdentity, OperationResultRepository, RecordedOperation, SourceRepository,

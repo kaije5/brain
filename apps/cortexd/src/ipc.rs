@@ -12,7 +12,7 @@ use cortex_domain::{
 };
 use cortex_inference::{
     AgentLimits, AgentRunner, AuthorizedCapabilities, OpenAiCompatibleProvider,
-    ReqwestOpenAiTransport,
+    ReqwestOpenAiTransport, SystemPrompt,
 };
 use cortex_search::{HybridSearchService, SearchRequest};
 use cortex_storage::{
@@ -88,6 +88,11 @@ pub enum DaemonError {
     StartupFailed,
     TransportUnavailable,
     SecretStoreUnavailable,
+    RateLimited,
+    AuthenticationFailed,
+    QuotaExceeded,
+    ContextOverflow,
+    InvalidInferenceRequest,
 }
 
 impl std::fmt::Display for DaemonError {
@@ -101,6 +106,11 @@ impl std::fmt::Display for DaemonError {
             Self::StartupFailed => "daemon startup failed",
             Self::TransportUnavailable => "local transport unavailable",
             Self::SecretStoreUnavailable => "OS keyring is unavailable or locked",
+            Self::RateLimited => "provider rate limited the request",
+            Self::AuthenticationFailed => "provider rejected the credential",
+            Self::QuotaExceeded => "provider quota or billing limit reached",
+            Self::ContextOverflow => "request exceeded the model context window",
+            Self::InvalidInferenceRequest => "provider rejected the request",
         })
     }
 }
@@ -237,8 +247,15 @@ impl cortex_application::AgentCapabilityExecutor for DaemonAgentExecutor {
 fn application_error_from_daemon(error: &DaemonError) -> ApplicationError {
     match error {
         DaemonError::PermissionDenied => ApplicationError::PermissionDenied,
-        DaemonError::InvalidRequest => ApplicationError::Validation { field: "payload" },
-        DaemonError::SecretStoreUnavailable => ApplicationError::SecretStoreUnavailable,
+        DaemonError::InvalidRequest | DaemonError::InvalidInferenceRequest => {
+            ApplicationError::Validation { field: "payload" }
+        }
+        DaemonError::RateLimited => ApplicationError::RateLimited {
+            retry_after_secs: None,
+        },
+        DaemonError::AuthenticationFailed => ApplicationError::AuthenticationFailed,
+        DaemonError::QuotaExceeded => ApplicationError::QuotaExceeded,
+        DaemonError::ContextOverflow => ApplicationError::ContextOverflow,
         DaemonError::Unauthenticated
         | DaemonError::UnsupportedCapability
         | DaemonError::InvalidConfiguration
@@ -924,13 +941,26 @@ impl LocalDaemon {
         let context = self.command_context(principal_id, request)?;
         let limits = AgentLimits::new(4, Duration::from_secs(30), 1, 32 * 1024, 128 * 1024)
             .map_err(DaemonError::from)?;
+        // SCRUM-79: the stable tier is the prompt-cache boundary and must stay
+        // byte-identical across sessions; per-session/turn tiers attach here
+        // once the daemon tracks that state.
+        let system_prompt = SystemPrompt::new(
+            "You are Cortex, a local-first personal knowledge agent. \
+             You can read and change the user's notes, tasks, and memories \
+             through the provided tools. Prefer a tool over guessing, never \
+             fabricate entity identifiers, and keep answers concise.",
+        )
+        .map_err(DaemonError::from)?;
         let agent = AgentRunner::new(
             Arc::new(self.embedding_provider.clone()),
             Arc::new(DaemonAgentExecutor {
                 daemon: self.clone(),
             }),
             limits,
-        );
+        )
+        .with_system_prompt(system_prompt)
+        .with_compaction_threshold(limits.max_request_bytes / 2)
+        .map_err(DaemonError::from)?;
         let output = match partials {
             Some(sender) => {
                 let request_id = request.request_id;
@@ -1664,11 +1694,16 @@ impl From<ApplicationError> for DaemonError {
             }
             ApplicationError::Validation { .. }
             | ApplicationError::NotFound { .. }
-            | ApplicationError::Conflict { .. } => Self::InvalidRequest,
-            ApplicationError::SecretStoreUnavailable => Self::SecretStoreUnavailable,
+            | ApplicationError::Conflict { .. }
+            | ApplicationError::InvalidInferenceRequest => Self::InvalidRequest,
+            ApplicationError::InferenceUnavailable | ApplicationError::InferenceTimeout => {
+                Self::TransportUnavailable
+            }
+            ApplicationError::RateLimited { .. } => Self::RateLimited,
+            ApplicationError::AuthenticationFailed => Self::AuthenticationFailed,
+            ApplicationError::QuotaExceeded => Self::QuotaExceeded,
+            ApplicationError::ContextOverflow => Self::ContextOverflow,
             ApplicationError::Storage(_)
-            | ApplicationError::InferenceUnavailable
-            | ApplicationError::InferenceTimeout
             | ApplicationError::NoSuitableModel
             | ApplicationError::MalformedModelOutput { .. }
             | ApplicationError::Internal => Self::StartupFailed,
@@ -1686,6 +1721,11 @@ impl DaemonError {
             Self::InvalidConfiguration | Self::StartupFailed => "unavailable",
             Self::TransportUnavailable => "transport_unavailable",
             Self::SecretStoreUnavailable => "secret_store_unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::AuthenticationFailed => "auth_failed",
+            Self::QuotaExceeded => "quota_exceeded",
+            Self::ContextOverflow => "context_overflow",
+            Self::InvalidInferenceRequest => "invalid_inference_request",
         }
     }
 }
@@ -1888,10 +1928,12 @@ mod tests {
             },
         )
         .await;
+        // SCRUM-84: transport-level inference failures carry the typed
+        // transport code rather than the coarse startup-failure code.
         assert_eq!(
             agent.result,
             WireResult::Error {
-                code: "unavailable".to_owned()
+                code: "transport_unavailable".to_owned()
             }
         );
         assert_eq!(

@@ -10,8 +10,8 @@ use std::{
 use cortex_application::{AgentCapabilityExecutor, ApplicationError, Capability, CommandContext};
 use cortex_domain::{OperationId, PrincipalId, WorkspaceId};
 use cortex_inference::{
-    AgentLimits, AgentRunner, AuthorizedCapabilities, InferenceProvider, InferenceRequest,
-    InferenceResponse, ToolCall,
+    AgentLimits, AgentRunner, AuthorizedCapabilities, InferenceMessage, InferenceProvider,
+    InferenceRequest, InferenceResponse, SystemPrompt, ToolCall,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -724,4 +724,209 @@ async fn non_streaming_runs_do_not_report_chunks() {
         .expect("run succeeds");
     assert_eq!(output, "quiet answer");
     assert_eq!(recorded.lock().unwrap().clone(), vec!["quiet answer"]);
+}
+
+fn stable_prompt() -> SystemPrompt {
+    SystemPrompt::new("stable cortex instructions").expect("stable tier is valid")
+}
+
+#[tokio::test]
+async fn system_prompt_prepends_a_byte_stable_system_message_to_every_request() {
+    let provider = Arc::new(FakeProvider::from_responses(vec![
+        tool_response(vec![note_call(
+            "call-sys-1",
+            "{\"title\":\"Cortex\",\"content\":\"local first\"}",
+        )]),
+        final_response("done"),
+    ]));
+    let service = Arc::new(RecordingService::default());
+    let runner = AgentRunner::new(
+        Arc::clone(&provider),
+        Arc::clone(&service),
+        limits(2, Duration::from_secs(1)),
+    )
+    .with_system_prompt(
+        stable_prompt()
+            .with_context("session context")
+            .expect("context tier is valid"),
+    );
+
+    let outcome = runner
+        .run(context(), "greet", allowed([Capability::NoteCreate]))
+        .await;
+
+    assert_eq!(outcome, Ok("done".to_owned()));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert!(matches!(
+            request.messages.first(),
+            Some(InferenceMessage::System { .. })
+        ));
+    }
+    assert_eq!(
+        requests[0].messages,
+        requests[1].messages[..requests[0].messages.len()]
+    );
+}
+
+#[tokio::test]
+async fn compaction_replaces_old_turns_with_a_summary_and_the_run_still_succeeds() {
+    let provider = Arc::new(FakeProvider::from_responses(vec![
+        tool_response(vec![note_call(
+            "call-compact-1",
+            "{\"title\":\"Cortex\",\"content\":\"first turn\"}",
+        )]),
+        tool_response(vec![note_call(
+            "call-compact-2",
+            "{\"title\":\"Cortex\",\"content\":\"second turn\"}",
+        )]),
+        InferenceResponse {
+            content: Some("summary of the earlier turns".to_owned()),
+            tool_calls: Vec::new(),
+        },
+        final_response("completed after compaction"),
+    ]));
+    let service = Arc::new(RecordingService::responding(
+        json!({ "data": "x".repeat(700) }),
+        Duration::ZERO,
+    ));
+    let runner = AgentRunner::new(
+        Arc::clone(&provider),
+        Arc::clone(&service),
+        constrained_limits(4, Duration::from_secs(5), 1, 8 * 1024, 4 * 1024),
+    )
+    .with_compaction_threshold(512)
+    .expect("compaction threshold below request limit");
+
+    let outcome = runner
+        .run(context(), "compact me", allowed([Capability::NoteCreate]))
+        .await;
+
+    assert_eq!(outcome, Ok("completed after compaction".to_owned()));
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4, "two turns, one compaction, one final");
+    let summary_request = &requests[2];
+    let summarized = summary_request.messages.iter().any(|message| {
+        matches!(message, InferenceMessage::User { content }
+            if content.contains("Summarize the following conversation excerpt"))
+    });
+    assert!(summarized, "compaction must send a summarization request");
+    let final_request = &requests[3];
+    assert!(
+        final_request
+            .messages
+            .iter()
+            .any(|message| matches!(message,
+            InferenceMessage::User { content }
+            if content.contains("summary of the earlier turns"))),
+        "the summary must replace the compacted turns"
+    );
+    assert!(
+        !final_request
+            .messages
+            .iter()
+            .any(|message| matches!(message,
+            InferenceMessage::Tool { content, .. }
+            if content.to_string().contains("second turn"))),
+        "compacted tool results must be gone from the final request"
+    );
+}
+
+#[tokio::test]
+async fn compaction_summary_is_never_streamed_to_the_user() {
+    let provider = Arc::new(FakeProvider::from_responses(vec![
+        tool_response(vec![note_call(
+            "call-stream-compact",
+            "{\"title\":\"Cortex\",\"content\":\"first turn\"}",
+        )]),
+        tool_response(vec![note_call(
+            "call-stream-compact-2",
+            "{\"title\":\"Cortex\",\"content\":\"second turn\"}",
+        )]),
+        InferenceResponse {
+            content: Some("internal summary".to_owned()),
+            tool_calls: Vec::new(),
+        },
+        final_response("final visible answer"),
+    ]));
+    let service = Arc::new(RecordingService::responding(
+        json!({ "data": "x".repeat(700) }),
+        Duration::ZERO,
+    ));
+    let runner = AgentRunner::new(
+        Arc::clone(&provider),
+        Arc::clone(&service),
+        constrained_limits(4, Duration::from_secs(5), 1, 8 * 1024, 4 * 1024),
+    )
+    .with_compaction_threshold(512)
+    .expect("compaction threshold below request limit");
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    let recorded = chunks.clone();
+    let on_chunk = move |chunk: &str| {
+        chunks.lock().expect("chunk log").push(chunk.to_owned());
+    };
+
+    let outcome = runner
+        .run_streaming(
+            context(),
+            "compact and stream",
+            allowed([Capability::NoteCreate]),
+            &on_chunk,
+        )
+        .await
+        .expect("streaming run with compaction succeeds");
+
+    assert_eq!(outcome, "final visible answer");
+    assert_eq!(
+        recorded.lock().unwrap().clone(),
+        vec!["final visible answer".to_owned()],
+        "compaction summaries are internal and must not stream"
+    );
+}
+
+#[tokio::test]
+async fn compaction_rejects_unusable_summaries_as_malformed_output() {
+    let provider = Arc::new(FakeProvider::from_responses(vec![
+        tool_response(vec![note_call(
+            "call-bad-summary",
+            "{\"title\":\"Cortex\",\"content\":\"first turn\"}",
+        )]),
+        final_response("   "),
+        final_response("unreachable"),
+    ]));
+    let service = Arc::new(RecordingService::responding(
+        json!({ "data": "x".repeat(700) }),
+        Duration::ZERO,
+    ));
+    let runner = AgentRunner::new(
+        Arc::clone(&provider),
+        Arc::clone(&service),
+        constrained_limits(4, Duration::from_secs(5), 1, 8 * 1024, 4 * 1024),
+    )
+    .with_compaction_threshold(512)
+    .expect("compaction threshold below request limit");
+
+    let outcome = runner
+        .run(context(), "compact me", allowed([Capability::NoteCreate]))
+        .await;
+
+    assert!(matches!(
+        outcome,
+        Err(ApplicationError::MalformedModelOutput { .. })
+    ));
+}
+
+#[test]
+fn compaction_threshold_must_leave_room_below_the_request_limit() {
+    let make_runner = || {
+        AgentRunner::new(
+            Arc::new(FakeProvider::from_responses(vec![final_response("x")])),
+            Arc::new(RecordingService::default()),
+            limits(1, Duration::from_secs(1)),
+        )
+    };
+    assert!(make_runner().with_compaction_threshold(0).is_err());
+    assert!(make_runner().with_compaction_threshold(64 * 1024).is_err());
+    assert!(make_runner().with_compaction_threshold(32 * 1024).is_ok());
 }

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use cortex_inference::TransportError;
+use cortex_inference::{ProviderError, ProviderFailureCategory};
 use cortexd::{LocalSettings, ModelResolution, resolve_default_model};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -38,12 +38,14 @@ impl cortex_inference::NimTransport for FakeNimTransport {
         bearer: Option<&str>,
         _timeout: Duration,
         _max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         if let Ok(mut seen) = self.discovery_bearer.lock() {
             seen.push(bearer.map(str::to_owned));
         }
         if self.unavailable {
-            return Err(TransportError::Unavailable);
+            return Err(ProviderError::from_category(
+                ProviderFailureCategory::Unavailable,
+            ));
         }
         Ok(
             serde_json::to_vec(&json!({"data": [{"id": "model-b"}, {"id": "model-a"}]}))
@@ -58,9 +60,11 @@ impl cortex_inference::NimTransport for FakeNimTransport {
         _body: Value,
         _timeout: Duration,
         _max_response_bytes: usize,
-    ) -> Result<Vec<u8>, TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         if self.unavailable {
-            return Err(TransportError::Unavailable);
+            return Err(ProviderError::from_category(
+                ProviderFailureCategory::Unavailable,
+            ));
         }
         Ok(b"{}".to_vec())
     }

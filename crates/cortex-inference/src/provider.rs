@@ -13,6 +13,9 @@ pub struct InferenceTool {
 /// Provider-neutral conversation state retained by the bounded agent loop.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub enum InferenceMessage {
+    System {
+        content: String,
+    },
     User {
         content: String,
     },
