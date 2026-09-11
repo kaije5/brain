@@ -17,6 +17,10 @@ pub enum ApplicationError {
     PermissionDenied,
     PolicyDenied(PolicyDeny),
     Storage(String),
+    /// The OS credential service is absent, locked, or inaccessible. There is
+    /// no plaintext fallback: the operator must unlock or configure the
+    /// platform keyring.
+    SecretStoreUnavailable,
     InferenceUnavailable,
     InferenceTimeout,
     /// Degraded routing state: no enabled provider exposes a model with fresh

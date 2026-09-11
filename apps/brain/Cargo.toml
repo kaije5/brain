@@ -21,10 +21,10 @@ thiserror = "2.0"
 tokio = { version = "1.47", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 uuid = { version = "1.24", features = ["serde", "v7"] }
 
+zeroize = "1.8"
+cortex-keyring = { path = "../../crates/cortex-keyring" }
+
+
 [dev-dependencies]
 ratatui = "0.29"
 tempfile = "3.23"
-[target.'cfg(windows)'.dependencies]
-keyring-core = "1.0"
-windows-native-keyring-store = "1.1"
-zeroize = "1.8"

@@ -106,32 +106,20 @@ fn validate_profile(profile: &str) -> Result<(), LocalOpError> {
     }
 }
 
-/// Writes into the current user's platform secret store. Windows uses the
-/// native credential store; other platforms currently have no supported
-/// store and fail closed, matching `PlatformSecretStore` resolution.
+/// Writes into the current user's platform secret store (Windows Credential
+/// Manager, macOS Keychain, or a Linux Secret Service-compatible backend),
+/// matching `PlatformSecretStore` resolution. Absent or locked credential
+/// services fail closed with [`LocalOpError::StoreUnavailable`]; there is no
+/// plaintext fallback.
 pub struct PlatformSecretWriter;
 
 impl SecretWriter for PlatformSecretWriter {
     fn write(&self, service: &str, username: &str, secret: &[u8]) -> Result<(), LocalOpError> {
-        #[cfg(windows)]
-        {
-            use keyring_core::api::CredentialStoreApi;
-            use zeroize::Zeroize;
-            let store = windows_native_keyring_store::Store::new()
-                .map_err(|_| LocalOpError::StoreUnavailable)?;
-            let entry = store
-                .build(service, username, None)
-                .map_err(|_| LocalOpError::StoreUnavailable)?;
-            let mut material = secret.to_vec();
-            let result = entry.set_secret(&material);
-            material.zeroize();
-            result.map_err(|_| LocalOpError::StoreUnavailable)
-        }
-
-        #[cfg(not(windows))]
-        {
-            let _ = (service, username, secret);
-            Err(LocalOpError::StoreUnavailable)
-        }
+        use zeroize::Zeroize;
+        let store = cortex_keyring::platform_store().map_err(|_| LocalOpError::StoreUnavailable)?;
+        let mut material = secret.to_vec();
+        let result = cortex_keyring::write_secret(store.as_ref(), service, username, &material);
+        material.zeroize();
+        result.map_err(|_| LocalOpError::StoreUnavailable)
     }
 }

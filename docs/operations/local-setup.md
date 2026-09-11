@@ -127,7 +127,8 @@ Environment variables are not a configuration channel.
 ## Provider credentials: keyring-backed `SecretRef`s
 
 Provider API keys are imported into the OS secret store (Windows Credential
-Manager) and referenced by non-secret `keyring:` locators:
+Manager, macOS Keychain, or a Linux Secret Service-compatible backend such as
+GNOME Keyring) and referenced by non-secret `keyring:` locators:
 
 ```powershell
 cargo run -p brain -- secret import --profile nim

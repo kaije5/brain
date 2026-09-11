@@ -87,6 +87,7 @@ pub enum DaemonError {
     InvalidConfiguration,
     StartupFailed,
     TransportUnavailable,
+    SecretStoreUnavailable,
 }
 
 impl std::fmt::Display for DaemonError {
@@ -99,6 +100,7 @@ impl std::fmt::Display for DaemonError {
             Self::InvalidConfiguration => "invalid daemon configuration",
             Self::StartupFailed => "daemon startup failed",
             Self::TransportUnavailable => "local transport unavailable",
+            Self::SecretStoreUnavailable => "OS keyring is unavailable or locked",
         })
     }
 }
@@ -236,6 +238,7 @@ fn application_error_from_daemon(error: &DaemonError) -> ApplicationError {
     match error {
         DaemonError::PermissionDenied => ApplicationError::PermissionDenied,
         DaemonError::InvalidRequest => ApplicationError::Validation { field: "payload" },
+        DaemonError::SecretStoreUnavailable => ApplicationError::SecretStoreUnavailable,
         DaemonError::Unauthenticated
         | DaemonError::UnsupportedCapability
         | DaemonError::InvalidConfiguration
@@ -1662,6 +1665,7 @@ impl From<ApplicationError> for DaemonError {
             ApplicationError::Validation { .. }
             | ApplicationError::NotFound { .. }
             | ApplicationError::Conflict { .. } => Self::InvalidRequest,
+            ApplicationError::SecretStoreUnavailable => Self::SecretStoreUnavailable,
             ApplicationError::Storage(_)
             | ApplicationError::InferenceUnavailable
             | ApplicationError::InferenceTimeout
@@ -1681,6 +1685,7 @@ impl DaemonError {
             Self::PermissionDenied => "permission_denied",
             Self::InvalidConfiguration | Self::StartupFailed => "unavailable",
             Self::TransportUnavailable => "transport_unavailable",
+            Self::SecretStoreUnavailable => "secret_store_unavailable",
         }
     }
 }
