@@ -190,7 +190,7 @@ impl cortex_inference::NimTransport for SelectiveTransport {
         _bearer: Option<&str>,
         _timeout: Duration,
         _max_response_bytes: usize,
-    ) -> Result<Vec<u8>, cortex_inference::TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         Ok(serde_json::to_vec(&json!({"data": [{"id": "model-a"}]})).expect("static JSON"))
     }
 
@@ -201,9 +201,11 @@ impl cortex_inference::NimTransport for SelectiveTransport {
         _body: Value,
         _timeout: Duration,
         _max_response_bytes: usize,
-    ) -> Result<Vec<u8>, cortex_inference::TransportError> {
+    ) -> Result<Vec<u8>, ProviderError> {
         if endpoint.contains(self.probe_fails_for_endpoint_containing) {
-            return Err(cortex_inference::TransportError::Unavailable);
+            return Err(ProviderError::from_category(
+                ProviderFailureCategory::Unavailable,
+            ));
         }
         Ok(serde_json::to_vec(&json!({
             "choices": [{"message": {"role": "assistant", "content": "ok"}}]
