@@ -20,4 +20,6 @@ pub use document::{
 };
 pub use error::VaultFormatError;
 pub use frontmatter::{FrontmatterBlock, split_frontmatter};
-pub use task::{ParsedTask, TASK_MANAGED_KEYS, parse_task, serialize_task_frontmatter};
+pub use task::{
+    ParsedTask, TASK_MANAGED_KEYS, parse_task, rewrite_task_file, serialize_task_frontmatter,
+};

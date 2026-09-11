@@ -32,4 +32,8 @@ pub enum VaultFormatError {
     /// The file or a collection exceeds its format bound.
     #[error("file exceeds format bounds")]
     TooLarge,
+    /// A rewrite would replace one stable task identity with another; Brain
+    /// never overwrites one task's `brain_id` with a different task's.
+    #[error("task identity conflict")]
+    IdentityConflict,
 }
