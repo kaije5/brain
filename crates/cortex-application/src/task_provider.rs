@@ -10,7 +10,8 @@ use cortex_domain::{
 
 use crate::provider::{
     MAX_PROVIDER_LABEL_BYTES, MAX_PROVIDER_QUERY_BYTES, MAX_PROVIDER_TEXT_BYTES, ProviderError,
-    validate_body, validate_limit, validate_required_text, validate_resource_kind,
+    ProviderMutation, ProviderPage, ProviderRead, validate_body, validate_limit,
+    validate_required_text, validate_resource_kind,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -390,3 +391,16 @@ macro_rules! existing_task_input {
 
 existing_task_input!(TaskComplete);
 existing_task_input!(TaskDelete);
+
+#[allow(async_fn_in_trait)]
+pub trait TaskProvider: Send + Sync {
+    async fn get(
+        &self,
+        resource: &ProviderResourceRef,
+    ) -> Result<Option<ProviderRead<ProviderTask>>, ProviderError>;
+    async fn search(&self, query: &TaskQuery) -> Result<ProviderPage<ProviderTask>, ProviderError>;
+    async fn create(&self, input: TaskCreate) -> Result<ProviderMutation, ProviderError>;
+    async fn update(&self, input: TaskUpdate) -> Result<ProviderMutation, ProviderError>;
+    async fn complete(&self, input: TaskComplete) -> Result<ProviderMutation, ProviderError>;
+    async fn delete(&self, input: TaskDelete) -> Result<ProviderMutation, ProviderError>;
+}

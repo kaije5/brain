@@ -22,7 +22,8 @@ pub use command::{
 pub use cortex_domain::{PolicyDecision, PolicyDeny};
 pub use error::{ApplicationError, RecoveryHint};
 pub use knowledge::{
-    KnowledgeCreate, KnowledgeDelete, KnowledgeDocument, KnowledgeQuery, KnowledgeUpdate,
+    KnowledgeCreate, KnowledgeDelete, KnowledgeDocument, KnowledgeProvider, KnowledgeQuery,
+    KnowledgeUpdate,
 };
 pub use provider::{
     MAX_PROVIDER_RESULTS, ProviderError, ProviderFreshness, ProviderMutation, ProviderPage,
@@ -43,5 +44,5 @@ pub use service::{
 };
 pub use task_provider::{
     ProviderTask, ProviderTaskPriority, ProviderTaskStatus, TaskComplete, TaskCreate, TaskDelete,
-    TaskQuery, TaskSchedulingMetadata, TaskUpdate,
+    TaskProvider, TaskQuery, TaskSchedulingMetadata, TaskUpdate,
 };

@@ -8,8 +8,9 @@ use cortex_domain::{
 };
 
 use crate::provider::{
-    MAX_PROVIDER_QUERY_BYTES, MAX_PROVIDER_TEXT_BYTES, ProviderError, validate_body,
-    validate_limit, validate_required_text, validate_resource_kind,
+    MAX_PROVIDER_QUERY_BYTES, MAX_PROVIDER_TEXT_BYTES, ProviderError, ProviderMutation,
+    ProviderPage, ProviderRead, validate_body, validate_limit, validate_required_text,
+    validate_resource_kind,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -223,4 +224,19 @@ impl KnowledgeDelete {
     pub const fn expected_revision(&self) -> &ObservedRevision {
         &self.expected_revision
     }
+}
+
+#[allow(async_fn_in_trait)]
+pub trait KnowledgeProvider: Send + Sync {
+    async fn get(
+        &self,
+        resource: &ProviderResourceRef,
+    ) -> Result<Option<ProviderRead<KnowledgeDocument>>, ProviderError>;
+    async fn search(
+        &self,
+        query: &KnowledgeQuery,
+    ) -> Result<ProviderPage<KnowledgeDocument>, ProviderError>;
+    async fn create(&self, input: KnowledgeCreate) -> Result<ProviderMutation, ProviderError>;
+    async fn update(&self, input: KnowledgeUpdate) -> Result<ProviderMutation, ProviderError>;
+    async fn delete(&self, input: KnowledgeDelete) -> Result<ProviderMutation, ProviderError>;
 }
