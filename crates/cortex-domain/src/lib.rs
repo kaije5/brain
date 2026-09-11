@@ -8,16 +8,21 @@ mod memory;
 mod note;
 mod policy;
 mod provenance;
+mod provider;
 mod task;
 
 pub use audit::{AuditEvent, AuditResult};
 pub use entity::{Lifecycle, Revision};
 pub use error::DomainError;
-pub use ids::{AuditEventId, EntityId, OperationId, PrincipalId, WorkspaceId};
+pub use ids::{AuditEventId, EntityId, OperationId, PrincipalId, TaskId, WorkspaceId};
 pub use memory::{ConflictSet, MemoryAssertion, MemoryAssertionInput, MemoryStatus};
 pub use note::{Note, NoteInput};
 pub use policy::{PolicyDecision, PolicyDeny};
 pub use provenance::{Source, SourceInput, SourceRef};
+pub use provider::{
+    ContentHash, ObservedRevision, ProviderId, ProviderProvenance, ProviderResourceId,
+    ProviderResourceKind, ProviderResourceRef,
+};
 pub use task::{Task, TaskInput, TaskStatus};
 
 pub const WORKSPACE_ARCHITECTURE: &str = "modular-monolith";

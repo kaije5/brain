@@ -39,3 +39,4 @@ domain_id!(PrincipalId);
 domain_id!(EntityId);
 domain_id!(OperationId);
 domain_id!(AuditEventId);
+domain_id!(TaskId);
