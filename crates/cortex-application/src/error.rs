@@ -33,6 +33,10 @@ pub enum ApplicationError {
     PermissionDenied,
     PolicyDenied(PolicyDeny),
     Storage(String),
+    /// The OS credential service is absent, locked, or inaccessible. There is
+    /// no plaintext fallback: the operator must unlock or configure the
+    /// platform keyring.
+    SecretStoreUnavailable,
     InferenceUnavailable,
     InferenceTimeout,
     /// The provider throttled the request (HTTP 429 without a quota/billing
@@ -88,6 +92,7 @@ impl ApplicationError {
             | Self::PermissionDenied
             | Self::PolicyDenied(_)
             | Self::Storage(_)
+            | Self::SecretStoreUnavailable
             | Self::AuthenticationFailed
             | Self::QuotaExceeded
             | Self::InvalidInferenceRequest
@@ -95,5 +100,18 @@ impl ApplicationError {
             | Self::MalformedModelOutput { .. }
             | Self::Internal => RecoveryHint::Abort,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApplicationError, RecoveryHint};
+
+    #[test]
+    fn unavailable_secret_store_requires_operator_action() {
+        assert_eq!(
+            ApplicationError::SecretStoreUnavailable.recovery_hint(),
+            RecoveryHint::Abort
+        );
     }
 }

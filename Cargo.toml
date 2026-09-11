@@ -3,6 +3,7 @@ members = [
     "crates/cortex-domain",
     "crates/cortex-application",
     "crates/cortex-inference",
+    "crates/cortex-keyring",
     "crates/cortex-search",
     "crates/cortex-storage",
     "apps/cortexd",

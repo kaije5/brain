@@ -10,3 +10,10 @@ fn storage_error_becomes_safe_mcp_internal_error() {
     assert!(!error.message.contains("sqlite"));
     assert!(!error.message.contains("C:/private"));
 }
+
+#[test]
+fn unavailable_secret_store_becomes_safe_mcp_unavailable_error() {
+    let error = map_application_error(&ApplicationError::SecretStoreUnavailable);
+    assert_eq!(error.code, "cortex_unavailable");
+    assert!(!error.message.contains("keyring"));
+}

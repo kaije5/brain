@@ -87,6 +87,7 @@ pub enum DaemonError {
     InvalidConfiguration,
     StartupFailed,
     TransportUnavailable,
+    SecretStoreUnavailable,
     RateLimited,
     AuthenticationFailed,
     QuotaExceeded,
@@ -104,6 +105,7 @@ impl std::fmt::Display for DaemonError {
             Self::InvalidConfiguration => "invalid daemon configuration",
             Self::StartupFailed => "daemon startup failed",
             Self::TransportUnavailable => "local transport unavailable",
+            Self::SecretStoreUnavailable => "OS keyring is unavailable or locked",
             Self::RateLimited => "provider rate limited the request",
             Self::AuthenticationFailed => "provider rejected the credential",
             Self::QuotaExceeded => "provider quota or billing limit reached",
@@ -254,6 +256,7 @@ fn application_error_from_daemon(error: &DaemonError) -> ApplicationError {
         DaemonError::AuthenticationFailed => ApplicationError::AuthenticationFailed,
         DaemonError::QuotaExceeded => ApplicationError::QuotaExceeded,
         DaemonError::ContextOverflow => ApplicationError::ContextOverflow,
+        DaemonError::SecretStoreUnavailable => ApplicationError::SecretStoreUnavailable,
         DaemonError::Unauthenticated
         | DaemonError::UnsupportedCapability
         | DaemonError::InvalidConfiguration
@@ -1719,6 +1722,7 @@ impl From<ApplicationError> for DaemonError {
             ApplicationError::AuthenticationFailed => Self::AuthenticationFailed,
             ApplicationError::QuotaExceeded => Self::QuotaExceeded,
             ApplicationError::ContextOverflow => Self::ContextOverflow,
+            ApplicationError::SecretStoreUnavailable => Self::SecretStoreUnavailable,
             ApplicationError::Storage(_)
             | ApplicationError::NoSuitableModel
             | ApplicationError::MalformedModelOutput { .. }
@@ -1736,6 +1740,7 @@ impl DaemonError {
             Self::PermissionDenied => "permission_denied",
             Self::InvalidConfiguration | Self::StartupFailed => "unavailable",
             Self::TransportUnavailable => "transport_unavailable",
+            Self::SecretStoreUnavailable => "secret_store_unavailable",
             Self::RateLimited => "rate_limited",
             Self::AuthenticationFailed => "auth_failed",
             Self::QuotaExceeded => "quota_exceeded",
@@ -1790,6 +1795,17 @@ mod tests {
                 .expect("response JSON");
         serving.await.expect("server task").expect("wire request");
         response
+    }
+
+    #[test]
+    fn secret_store_unavailability_round_trips_across_ipc_error_mapping() {
+        let daemon_error =
+            super::DaemonError::from(cortex_application::ApplicationError::SecretStoreUnavailable);
+        assert_eq!(daemon_error, super::DaemonError::SecretStoreUnavailable);
+        assert_eq!(
+            super::application_error_from_daemon(&daemon_error),
+            cortex_application::ApplicationError::SecretStoreUnavailable
+        );
     }
 
     #[tokio::test]

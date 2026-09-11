@@ -1,0 +1,25 @@
+[package]
+name = "cortex-keyring"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cortex-application = { path = "../cortex-application" }
+thiserror = "2"
+keyring-core = "1.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = "1.0.1"
+# The store leaves Secret Service's crypto backend to its consumer. Keep the
+# pure-Rust backend explicit so Linux builds never select an unusable default.
+secret-service = { version = "5.2", default-features = false, features = ["crypto-rust"] }
+
+[dev-dependencies]
+zeroize = "1"
