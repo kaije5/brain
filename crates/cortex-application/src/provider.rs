@@ -1,5 +1,7 @@
 #![allow(clippy::missing_errors_doc, clippy::result_large_err)]
 
+use std::fmt;
+
 use cortex_domain::{ProviderProvenance, ProviderResourceKind, ProviderResourceRef};
 
 pub const MAX_PROVIDER_RESULTS: usize = 100;
@@ -13,10 +15,20 @@ pub enum ProviderFreshness {
     Stale,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProviderRead<T> {
     item: T,
     freshness: ProviderFreshness,
+}
+
+impl<T> fmt::Debug for ProviderRead<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderRead")
+            .field("item", &"[redacted]")
+            .field("freshness", &self.freshness)
+            .finish()
+    }
 }
 
 impl<T> ProviderRead<T> {
@@ -41,10 +53,20 @@ impl<T> ProviderRead<T> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProviderPage<T> {
     items: Vec<T>,
     freshness: ProviderFreshness,
+}
+
+impl<T> fmt::Debug for ProviderPage<T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderPage")
+            .field("item_count", &self.items.len())
+            .field("freshness", &self.freshness)
+            .finish()
+    }
 }
 
 impl<T> ProviderPage<T> {
@@ -134,6 +156,7 @@ impl ProviderMutation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProviderError {
     Validation { field: &'static str },
+    Unauthorized,
     NotFound { resource: ProviderResourceRef },
     Conflict { current: ProviderProvenance },
     Unavailable,

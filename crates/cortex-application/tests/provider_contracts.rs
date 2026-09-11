@@ -12,6 +12,14 @@ use cortex_domain::{
     ContentHash, ObservedRevision, OperationId, ProviderId, ProviderProvenance, ProviderResourceId,
     ProviderResourceKind, ProviderResourceRef, TaskId, WorkspaceId,
 };
+use sha2::{Digest, Sha256};
+
+#[derive(Clone, Copy)]
+enum Access {
+    Available,
+    Unauthorized,
+    Unavailable,
+}
 
 #[derive(Default)]
 struct State {
@@ -23,7 +31,7 @@ struct State {
 struct FakeProvider {
     state: Mutex<State>,
     freshness: ProviderFreshness,
-    unavailable: bool,
+    access: Access,
 }
 
 impl FakeProvider {
@@ -31,7 +39,7 @@ impl FakeProvider {
         Self {
             state: Mutex::new(State::default()),
             freshness,
-            unavailable: false,
+            access: Access::Available,
         }
     }
 
@@ -39,15 +47,23 @@ impl FakeProvider {
         Self {
             state: Mutex::new(State::default()),
             freshness: ProviderFreshness::Current,
-            unavailable: true,
+            access: Access::Unavailable,
+        }
+    }
+
+    fn unauthorized() -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            freshness: ProviderFreshness::Current,
+            access: Access::Unauthorized,
         }
     }
 
     fn check(&self) -> Result<(), ProviderError> {
-        if self.unavailable {
-            Err(ProviderError::Unavailable)
-        } else {
-            Ok(())
+        match self.access {
+            Access::Available => Ok(()),
+            Access::Unauthorized => Err(ProviderError::Unauthorized),
+            Access::Unavailable => Err(ProviderError::Unavailable),
         }
     }
 
@@ -64,9 +80,17 @@ impl FakeProvider {
         )
     }
 
-    fn provenance(resource: ProviderResourceRef, revision: u64) -> ProviderProvenance {
-        let mut hash = [0_u8; 32];
-        hash[..8].copy_from_slice(&revision.to_le_bytes());
+    fn provenance(
+        resource: ProviderResourceRef,
+        revision: u64,
+        title: &str,
+        body: &str,
+    ) -> ProviderProvenance {
+        let mut hasher = Sha256::new();
+        hasher.update(title.as_bytes());
+        hasher.update([0]);
+        hasher.update(body.as_bytes());
+        let hash = hasher.finalize().into();
         ProviderProvenance::new(
             resource,
             ObservedRevision::new(format!("rev-{revision}")).unwrap(),
@@ -234,7 +258,7 @@ impl KnowledgeProvider for FakeProvider {
         query: &KnowledgeQuery,
     ) -> Result<ProviderPage<KnowledgeDocument>, ProviderError> {
         self.check()?;
-        let text = query.text().to_lowercase();
+        let text = query.text().map(str::to_lowercase);
         let items = self
             .state
             .lock()
@@ -243,8 +267,10 @@ impl KnowledgeProvider for FakeProvider {
             .values()
             .filter(|item| item.provenance().resource().workspace_id() == query.workspace_id())
             .filter(|item| {
-                item.title().to_lowercase().contains(&text)
-                    || item.body().to_lowercase().contains(&text)
+                text.as_ref().is_none_or(|text| {
+                    item.title().to_lowercase().contains(text)
+                        || item.body().to_lowercase().contains(text)
+                })
             })
             .take(query.limit().get())
             .cloned()
@@ -261,7 +287,7 @@ impl KnowledgeProvider for FakeProvider {
             state.sequence,
             ProviderResourceKind::Knowledge,
         );
-        let provenance = Self::provenance(resource.clone(), 1);
+        let provenance = Self::provenance(resource.clone(), 1, input.title(), input.body());
         let document = KnowledgeDocument::new(provenance.clone(), input.title(), input.body())?;
         state.knowledge.insert(resource, document);
         Ok(ProviderMutation::created(provenance))
@@ -279,7 +305,12 @@ impl KnowledgeProvider for FakeProvider {
             })?;
         let revision = Self::revision(current.provenance(), input.expected_revision())?;
         let previous = current.provenance().clone();
-        let provenance = Self::provenance(input.resource().clone(), revision);
+        let provenance = Self::provenance(
+            input.resource().clone(),
+            revision,
+            input.title(),
+            input.body(),
+        );
         state.knowledge.insert(
             input.resource().clone(),
             KnowledgeDocument::new(provenance.clone(), input.title(), input.body())?,
@@ -358,7 +389,7 @@ impl TaskProvider for FakeProvider {
             state.sequence,
             ProviderResourceKind::Task,
         );
-        let provenance = Self::provenance(resource.clone(), 1);
+        let provenance = Self::provenance(resource.clone(), 1, input.title(), input.body());
         let task = ProviderTask::new(
             provenance.clone(),
             input.task_id(),
@@ -385,7 +416,12 @@ impl TaskProvider for FakeProvider {
                 })?;
         let revision = Self::revision(current.provenance(), input.expected_revision())?;
         let previous = current.provenance().clone();
-        let provenance = Self::provenance(input.resource().clone(), revision);
+        let provenance = Self::provenance(
+            input.resource().clone(),
+            revision,
+            input.title(),
+            input.body(),
+        );
         let updated = ProviderTask::new(
             provenance.clone(),
             current.task_id(),
@@ -412,7 +448,12 @@ impl TaskProvider for FakeProvider {
                 })?;
         let revision = Self::revision(current.provenance(), input.expected_revision())?;
         let previous = current.provenance().clone();
-        let provenance = Self::provenance(input.resource().clone(), revision);
+        let provenance = Self::provenance(
+            input.resource().clone(),
+            revision,
+            current.title(),
+            current.body(),
+        );
         let completed = ProviderTask::new(
             provenance.clone(),
             current.task_id(),
@@ -809,4 +850,75 @@ async fn searches_respect_requested_limits_and_explicit_freshness() {
         .unwrap();
     assert_eq!(page.items().len(), 2);
     assert_eq!(page.freshness(), ProviderFreshness::Stale);
+}
+
+#[tokio::test]
+async fn knowledge_list_is_bounded_without_requiring_search_text() {
+    let provider = FakeProvider::new(ProviderFreshness::Current);
+    let workspace = WorkspaceId::new();
+    for title in ["one", "two", "three"] {
+        provider
+            .create(KnowledgeCreate::new(workspace, OperationId::new(), title, "body").unwrap())
+            .await
+            .unwrap();
+    }
+    let page = provider
+        .search(&KnowledgeQuery::list(workspace, NonZeroUsize::new(2).unwrap()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(page.items().len(), 2);
+}
+
+#[tokio::test]
+async fn authorization_denial_is_typed_for_reads_and_mutations() {
+    let provider = FakeProvider::unauthorized();
+    let resource = FakeProvider::resource(WorkspaceId::new(), 1, ProviderResourceKind::Knowledge);
+    assert_eq!(
+        read_knowledge(&provider, &resource).await,
+        Err(ProviderError::Unauthorized)
+    );
+    assert_eq!(
+        provider
+            .create(
+                KnowledgeCreate::new(resource.workspace_id(), OperationId::new(), "A", "").unwrap()
+            )
+            .await,
+        Err(ProviderError::Unauthorized)
+    );
+}
+
+#[tokio::test]
+async fn content_hash_is_sha256_of_canonical_content_not_the_revision() {
+    let provider = FakeProvider::new(ProviderFreshness::Current);
+    let first = current(
+        &provider
+            .create(
+                KnowledgeCreate::new(WorkspaceId::new(), OperationId::new(), "A", "one").unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+    let second = current(
+        &provider
+            .update(
+                KnowledgeUpdate::new(
+                    first.resource().clone(),
+                    OperationId::new(),
+                    first.observed_revision().clone(),
+                    "A",
+                    "one",
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap(),
+    );
+    let expected = [
+        0xdc, 0xcf, 0xa4, 0x4e, 0xcb, 0x53, 0x96, 0x13, 0x27, 0xd6, 0x00, 0xc7, 0x5a, 0xef, 0x5f,
+        0x98, 0xbf, 0xae, 0x12, 0x94, 0xf1, 0x6e, 0x68, 0xae, 0xfc, 0xf3, 0xfb, 0x7a, 0xb1, 0x73,
+        0x57, 0xca,
+    ];
+    assert_eq!(first.content_hash().as_bytes(), &expected);
+    assert_eq!(second.content_hash(), first.content_hash());
+    assert_ne!(second.observed_revision(), first.observed_revision());
 }

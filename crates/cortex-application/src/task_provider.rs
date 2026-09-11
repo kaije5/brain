@@ -1,6 +1,9 @@
 #![allow(clippy::missing_errors_doc, clippy::result_large_err)]
 
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::{
+    fmt,
+    num::{NonZeroU32, NonZeroUsize},
+};
 
 use chrono::{DateTime, Utc};
 use cortex_domain::{
@@ -30,7 +33,7 @@ pub enum ProviderTaskPriority {
     Urgent,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct TaskSchedulingMetadata {
     due_at: Option<DateTime<Utc>>,
     deadline_at: Option<DateTime<Utc>>,
@@ -101,7 +104,7 @@ impl TaskSchedulingMetadata {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProviderTask {
     provenance: ProviderProvenance,
     task_id: TaskId,
@@ -169,7 +172,7 @@ impl ProviderTask {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TaskQuery {
     workspace_id: WorkspaceId,
     text: Option<String>,
@@ -208,7 +211,7 @@ impl TaskQuery {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TaskCreate {
     workspace_id: WorkspaceId,
     operation_id: OperationId,
@@ -275,7 +278,7 @@ impl TaskCreate {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct TaskUpdate {
     resource: ProviderResourceRef,
     operation_id: OperationId,
@@ -352,7 +355,7 @@ impl TaskUpdate {
 
 macro_rules! existing_task_input {
     ($name:ident) => {
-        #[derive(Clone, Debug, Eq, PartialEq)]
+        #[derive(Clone, Eq, PartialEq)]
         pub struct $name {
             resource: ProviderResourceRef,
             operation_id: OperationId,
@@ -391,6 +394,26 @@ macro_rules! existing_task_input {
 
 existing_task_input!(TaskComplete);
 existing_task_input!(TaskDelete);
+
+macro_rules! redacted_debug {
+    ($($name:ty),+ $(,)?) => {$(
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(concat!(stringify!($name), "([redacted])"))
+            }
+        }
+    )+};
+}
+
+redacted_debug!(
+    TaskSchedulingMetadata,
+    ProviderTask,
+    TaskQuery,
+    TaskCreate,
+    TaskUpdate,
+    TaskComplete,
+    TaskDelete,
+);
 
 #[allow(async_fn_in_trait)]
 pub trait TaskProvider: Send + Sync {

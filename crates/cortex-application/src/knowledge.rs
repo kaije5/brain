@@ -1,6 +1,6 @@
 #![allow(clippy::missing_errors_doc, clippy::result_large_err)]
 
-use std::num::NonZeroUsize;
+use std::{fmt, num::NonZeroUsize};
 
 use cortex_domain::{
     ObservedRevision, OperationId, ProviderProvenance, ProviderResourceKind, ProviderResourceRef,
@@ -13,7 +13,7 @@ use crate::provider::{
     validate_resource_kind,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct KnowledgeDocument {
     provenance: ProviderProvenance,
     title: String,
@@ -54,10 +54,10 @@ impl KnowledgeDocument {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct KnowledgeQuery {
     workspace_id: WorkspaceId,
-    text: String,
+    text: Option<String>,
     limit: NonZeroUsize,
 }
 
@@ -72,7 +72,16 @@ impl KnowledgeQuery {
         validate_limit(limit)?;
         Ok(Self {
             workspace_id,
-            text,
+            text: Some(text),
+            limit,
+        })
+    }
+
+    pub fn list(workspace_id: WorkspaceId, limit: NonZeroUsize) -> Result<Self, ProviderError> {
+        validate_limit(limit)?;
+        Ok(Self {
+            workspace_id,
+            text: None,
             limit,
         })
     }
@@ -83,8 +92,8 @@ impl KnowledgeQuery {
     }
 
     #[must_use]
-    pub fn text(&self) -> &str {
-        &self.text
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
     }
 
     #[must_use]
@@ -93,7 +102,7 @@ impl KnowledgeQuery {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct KnowledgeCreate {
     workspace_id: WorkspaceId,
     operation_id: OperationId,
@@ -138,7 +147,7 @@ impl KnowledgeCreate {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct KnowledgeUpdate {
     resource: ProviderResourceRef,
     operation_id: OperationId,
@@ -191,12 +200,30 @@ impl KnowledgeUpdate {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct KnowledgeDelete {
     resource: ProviderResourceRef,
     operation_id: OperationId,
     expected_revision: ObservedRevision,
 }
+
+macro_rules! redacted_debug {
+    ($($name:ty),+ $(,)?) => {$(
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(concat!(stringify!($name), "([redacted])"))
+            }
+        }
+    )+};
+}
+
+redacted_debug!(
+    KnowledgeDocument,
+    KnowledgeQuery,
+    KnowledgeCreate,
+    KnowledgeUpdate,
+    KnowledgeDelete
+);
 
 impl KnowledgeDelete {
     pub fn new(

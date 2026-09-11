@@ -225,3 +225,72 @@ fn mutations_reject_resource_kind_mismatches() {
         .is_err()
     );
 }
+
+#[test]
+fn public_debug_output_redacts_user_authored_provider_content() {
+    let knowledge_provenance = provenance(ProviderResourceKind::Knowledge, "rev-1", 1);
+    let document = KnowledgeDocument::new(
+        knowledge_provenance.clone(),
+        "private-title",
+        "private-body",
+    )
+    .unwrap();
+    let query = KnowledgeQuery::new(
+        knowledge_provenance.resource().workspace_id(),
+        "private-query",
+        NonZeroUsize::new(1).unwrap(),
+    )
+    .unwrap();
+    let create = KnowledgeCreate::new(
+        knowledge_provenance.resource().workspace_id(),
+        OperationId::new(),
+        "private-title",
+        "private-body",
+    )
+    .unwrap();
+    let scheduling = TaskSchedulingMetadata::new(
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("private-project"),
+        Some("private-context"),
+    )
+    .unwrap();
+
+    for (debug, secret) in [
+        (format!("{document:?}"), "private-title"),
+        (format!("{query:?}"), "private-query"),
+        (format!("{create:?}"), "private-body"),
+        (format!("{scheduling:?}"), "private-project"),
+        (
+            format!(
+                "{:?}",
+                ProviderRead::new(document.clone(), ProviderFreshness::Current)
+            ),
+            "private-title",
+        ),
+        (
+            format!(
+                "{:?}",
+                ProviderPage::new(vec![document], ProviderFreshness::Current).unwrap()
+            ),
+            "private-body",
+        ),
+    ] {
+        assert!(!debug.contains(secret));
+    }
+}
+
+#[test]
+fn knowledge_query_supports_a_bounded_list_without_search_text() {
+    let query = KnowledgeQuery::list(WorkspaceId::new(), NonZeroUsize::new(25).unwrap()).unwrap();
+    assert_eq!(query.text(), None);
+    assert_eq!(query.limit().get(), 25);
+}
+
+#[test]
+fn provider_authorization_denial_is_typed_and_payload_free() {
+    assert_eq!(format!("{:?}", ProviderError::Unauthorized), "Unauthorized");
+}

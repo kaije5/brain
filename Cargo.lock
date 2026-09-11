@@ -598,6 +598,7 @@ dependencies = [
  "chrono",
  "cortex-domain",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "uuid",
 ]
