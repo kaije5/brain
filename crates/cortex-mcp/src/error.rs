@@ -62,6 +62,7 @@ pub fn map_application_error(error: &ApplicationError) -> McpError {
         ApplicationError::InferenceUnavailable
         | ApplicationError::InferenceTimeout
         | ApplicationError::RateLimited { .. }
+        | ApplicationError::SecretStoreUnavailable
         | ApplicationError::NoSuitableModel => McpError::unavailable(),
         ApplicationError::Storage(_) | ApplicationError::Internal => McpError {
             code: "cortex_internal_error".to_owned(),

@@ -256,6 +256,7 @@ fn application_error_from_daemon(error: &DaemonError) -> ApplicationError {
         DaemonError::AuthenticationFailed => ApplicationError::AuthenticationFailed,
         DaemonError::QuotaExceeded => ApplicationError::QuotaExceeded,
         DaemonError::ContextOverflow => ApplicationError::ContextOverflow,
+        DaemonError::SecretStoreUnavailable => ApplicationError::SecretStoreUnavailable,
         DaemonError::Unauthenticated
         | DaemonError::UnsupportedCapability
         | DaemonError::InvalidConfiguration
@@ -1703,6 +1704,7 @@ impl From<ApplicationError> for DaemonError {
             ApplicationError::AuthenticationFailed => Self::AuthenticationFailed,
             ApplicationError::QuotaExceeded => Self::QuotaExceeded,
             ApplicationError::ContextOverflow => Self::ContextOverflow,
+            ApplicationError::SecretStoreUnavailable => Self::SecretStoreUnavailable,
             ApplicationError::Storage(_)
             | ApplicationError::NoSuitableModel
             | ApplicationError::MalformedModelOutput { .. }
@@ -1775,6 +1777,17 @@ mod tests {
                 .expect("response JSON");
         serving.await.expect("server task").expect("wire request");
         response
+    }
+
+    #[test]
+    fn secret_store_unavailability_round_trips_across_ipc_error_mapping() {
+        let daemon_error =
+            super::DaemonError::from(cortex_application::ApplicationError::SecretStoreUnavailable);
+        assert_eq!(daemon_error, super::DaemonError::SecretStoreUnavailable);
+        assert_eq!(
+            super::application_error_from_daemon(&daemon_error),
+            cortex_application::ApplicationError::SecretStoreUnavailable
+        );
     }
 
     #[tokio::test]
