@@ -90,8 +90,11 @@ fn vault_exclusions_reject_escape_and_absolute_patterns() {
             field: "exclusions"
         })
     ));
+    // Absolute paths are rejected per-platform: `C:\vault` on Windows,
+    // `/vault` elsewhere.
+    let absolute = if cfg!(windows) { "C:\\vault" } else { "/vault" };
     assert!(matches!(
-        VaultExclusion::new("C:\\\\vault"),
+        VaultExclusion::new(absolute),
         Err(VaultConfigError::Invalid {
             field: "exclusions"
         })
