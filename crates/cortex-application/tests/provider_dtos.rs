@@ -64,6 +64,25 @@ fn provider_errors_are_redacted_and_typed() {
 }
 
 #[test]
+fn provider_error_debug_does_not_expose_opaque_resource_or_revision_values() {
+    let current = ProviderProvenance::new(
+        ProviderResourceRef::new(
+            WorkspaceId::new(),
+            ProviderId::new("secret-provider").unwrap(),
+            ProviderResourceId::new("C:\\Users\\person\\private-note.md").unwrap(),
+            ProviderResourceKind::Knowledge,
+        ),
+        ObservedRevision::new("private-revision-token").unwrap(),
+        ContentHash::new([7; 32]),
+    );
+    let debug = format!("{:?}", ProviderError::Conflict { current });
+
+    assert!(!debug.contains("secret-provider"));
+    assert!(!debug.contains("private-note.md"));
+    assert!(!debug.contains("private-revision-token"));
+}
+
+#[test]
 fn knowledge_dtos_keep_expected_revision_and_provider_neutral_content() {
     let current = provenance(ProviderResourceKind::Knowledge, "rev-2", 2);
     let document = KnowledgeDocument::new(current.clone(), "Runbook", "line one\nline two")

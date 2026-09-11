@@ -1,11 +1,19 @@
+use std::fmt;
+
 use crate::{DomainError, WorkspaceId};
 
 const MAX_PROVIDER_ID_BYTES: usize = 128;
 const MAX_RESOURCE_ID_BYTES: usize = 512;
 const MAX_REVISION_BYTES: usize = 512;
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProviderId(String);
+
+impl fmt::Debug for ProviderId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProviderId([redacted])")
+    }
+}
 
 impl ProviderId {
     /// Creates a bounded provider identifier.
@@ -24,8 +32,14 @@ impl ProviderId {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProviderResourceId(String);
+
+impl fmt::Debug for ProviderResourceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProviderResourceId([redacted])")
+    }
+}
 
 impl ProviderResourceId {
     /// Creates a bounded provider-owned resource identifier.
@@ -44,8 +58,14 @@ impl ProviderResourceId {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ObservedRevision(String);
+
+impl fmt::Debug for ObservedRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ObservedRevision([redacted])")
+    }
+}
 
 impl ObservedRevision {
     /// Creates a bounded opaque provider revision.
@@ -64,8 +84,14 @@ impl ObservedRevision {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ContentHash([u8; 32]);
+
+impl fmt::Debug for ContentHash {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContentHash([redacted])")
+    }
+}
 
 impl ContentHash {
     #[must_use]
