@@ -14,6 +14,7 @@ cortex-domain = { path = "../../crates/cortex-domain" }
 cortex-storage = { path = "../../crates/cortex-storage" }
 cortex-search = { path = "../../crates/cortex-search" }
 cortex-inference = { path = "../../crates/cortex-inference" }
+cortex-vault = { path = "../../crates/cortex-vault" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 serde = { version = "1.0", features = ["derive"] }
