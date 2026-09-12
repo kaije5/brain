@@ -291,6 +291,93 @@ impl MarkdownVaultProvider {
         relatives
     }
 
+    /// Reads a confined file and observes its revision and content hash in
+    /// one pass (storage plan §7 step 2).
+    ///
+    /// # Errors
+    /// Returns a redacted [`ProviderError`]: `NotFound` for missing files,
+    /// `Unavailable` for other IO faults.
+    pub fn read_observed(
+        &self,
+        confined: &ConfinedPath,
+        kind: ProviderResourceKind,
+    ) -> Result<(ProviderResourceRef, Vec<u8>, ProviderProvenance), ProviderError> {
+        let bytes = std::fs::read(confined.absolute()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ProviderError::NotFound {
+                    resource: self.document_reference(confined.relative(), kind),
+                }
+            } else {
+                ProviderError::Unavailable
+            }
+        })?;
+        let resource = self.document_reference(confined.relative(), kind);
+        let provenance = Self::provenance(&resource, &bytes)?;
+        Ok((resource, bytes, provenance))
+    }
+
+    /// Observes the current revision of a confined file by re-reading it.
+    ///
+    /// # Errors
+    /// Returns a redacted [`ProviderError`] when the file is missing or
+    /// unreadable.
+    pub fn current_revision(
+        &self,
+        confined: &ConfinedPath,
+    ) -> Result<ObservedRevision, ProviderError> {
+        let bytes = std::fs::read(confined.absolute()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ProviderError::NotFound {
+                    resource: self
+                        .document_reference(confined.relative(), ProviderResourceKind::Knowledge),
+                }
+            } else {
+                ProviderError::Unavailable
+            }
+        })?;
+        let digest = Sha256::digest(&bytes);
+        hex_revision(&digest)
+    }
+
+    /// Optimistic concurrency gate (storage plan §7 steps 3-6): re-reads the
+    /// file and compares against the caller's expected revision. On mismatch
+    /// the error carries the freshly observed provenance so the caller can
+    /// re-read and reconcile; a blind last-writer-wins overwrite is
+    /// structurally impossible through this primitive.
+    ///
+    /// # Errors
+    /// Returns [`ProviderError::Conflict`] with the current provenance on a
+    /// revision mismatch, and redacted IO errors when the file disappeared.
+    pub fn verify_revision(
+        &self,
+        confined: &ConfinedPath,
+        expected: &ObservedRevision,
+    ) -> Result<(), ProviderError> {
+        let bytes = std::fs::read(confined.absolute()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ProviderError::NotFound {
+                    resource: self
+                        .document_reference(confined.relative(), ProviderResourceKind::Knowledge),
+                }
+            } else {
+                ProviderError::Unavailable
+            }
+        })?;
+        let digest = Sha256::digest(&bytes);
+        let current = hex_revision(&digest)?;
+        if current != *expected {
+            let hash = ContentHash::new(digest.into());
+            return Err(ProviderError::Conflict {
+                current: ProviderProvenance::new(
+                    self.document_reference(confined.relative(), ProviderResourceKind::Knowledge),
+                    current,
+                    hash,
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Enumerates knowledge documents as bounded resource references.
     ///
     /// # Errors
@@ -332,6 +419,26 @@ impl MarkdownVaultProvider {
         let parsed =
             parse_document(text).map_err(|_| ProviderError::Validation { field: "markdown" })?;
         let provenance = Self::provenance(resource, &bytes)?;
+        // Mid-read change detection: if the file changed while it was being
+        // parsed, re-read and reconcile once (storage plan §7.1).
+        if self
+            .verify_revision(&confined, provenance.observed_revision())
+            .is_err()
+        {
+            let reread_bytes =
+                std::fs::read(confined.absolute()).map_err(|_| ProviderError::Unavailable)?;
+            let reread_text = std::str::from_utf8(&reread_bytes)
+                .map_err(|_| ProviderError::Validation { field: "encoding" })?;
+            let reread_parsed = parse_document(reread_text)
+                .map_err(|_| ProviderError::Validation { field: "markdown" })?;
+            let reread_provenance = Self::provenance(resource, &reread_bytes)?;
+            let document = KnowledgeDocument::new(
+                reread_provenance,
+                reread_parsed.title(confined.relative()),
+                reread_parsed.body(),
+            )?;
+            return Ok(ProviderRead::new(document, ProviderFreshness::Stale));
+        }
         let document =
             KnowledgeDocument::new(provenance, parsed.title(confined.relative()), parsed.body())?;
         Ok(ProviderRead::new(document, ProviderFreshness::Current))
