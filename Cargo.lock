@@ -748,7 +748,11 @@ dependencies = [
 name = "cortex-vault"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "cortex-application",
+ "cortex-domain",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

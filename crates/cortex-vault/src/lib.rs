@@ -12,6 +12,7 @@
 mod document;
 mod error;
 mod frontmatter;
+mod task;
 
 pub use document::{
     InlineLink, ParsedDocument, Wikilink, normalize_line_endings, parse_document,
@@ -19,3 +20,4 @@ pub use document::{
 };
 pub use error::VaultFormatError;
 pub use frontmatter::{FrontmatterBlock, split_frontmatter};
+pub use task::{ParsedTask, TASK_MANAGED_KEYS, parse_task, serialize_task_frontmatter};

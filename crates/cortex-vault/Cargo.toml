@@ -10,3 +10,7 @@ workspace = true
 
 [dependencies]
 thiserror = "2.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+cortex-application = { path = "../../crates/cortex-application" }
+cortex-domain = { path = "../../crates/cortex-domain" }
+uuid = { version = "1.24", features = ["v7"] }
