@@ -420,6 +420,9 @@ fn decode_result(value: &str) -> Result<AuditResult, ApplicationError> {
 fn canonical_capability(value: &str) -> Result<&'static str, ApplicationError> {
     match value {
         "cortex_knowledge_search" => Ok("cortex_knowledge_search"),
+        "cortex_knowledge_create" => Ok("cortex_knowledge_create"),
+        "cortex_knowledge_update" => Ok("cortex_knowledge_update"),
+        "cortex_knowledge_delete" => Ok("cortex_knowledge_delete"),
         "cortex_agent_run" => Ok("cortex_agent_run"),
         "cortex_memory_correct" => Ok("cortex_memory_correct"),
         "cortex_memory_create" => Ok("cortex_memory_create"),
