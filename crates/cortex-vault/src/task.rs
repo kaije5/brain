@@ -247,6 +247,42 @@ pub fn serialize_task_frontmatter(
     Ok(output)
 }
 
+/// Recomposes a full task file from the rewritten task and the existing
+/// document: canonical managed frontmatter, the existing document's unknown
+/// properties preserved byte-for-byte, and the body verbatim (format spec
+/// §7). Renames and file moves never participate — identity is `brain_id`.
+///
+/// # Errors
+/// Returns [`VaultFormatError::IdentityConflict`] when the existing file
+/// carries a `brain_id` that parses to a *different* task identity: Brain
+/// never overwrites one task's identity with another's.
+pub fn rewrite_task_file(
+    existing: &ParsedDocument,
+    task: &ParsedTask,
+) -> Result<String, VaultFormatError> {
+    if let Some(block) = existing.frontmatter()
+        && let Some(existing_id) = block.scalar("brain_id")
+    {
+        let existing_task_id = parse_brain_id(existing_id)?;
+        if existing_task_id != *task.task_id() {
+            return Err(VaultFormatError::IdentityConflict);
+        }
+    }
+    let frontmatter = serialize_task_frontmatter(task, existing.frontmatter())?;
+    let mut output = String::with_capacity(frontmatter.len() + task.body().len() + 8);
+    output.push_str(
+        "---
+",
+    );
+    output.push_str(&frontmatter);
+    output.push_str(
+        "---
+",
+    );
+    output.push_str(existing.body());
+    Ok(output)
+}
+
 fn parse_brain_id(brain_id: &str) -> Result<TaskId, VaultFormatError> {
     let normalized = brain_id.replace('-', "");
     let uuid = uuid::Uuid::parse_str(&normalized)
