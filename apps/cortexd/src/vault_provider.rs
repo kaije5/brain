@@ -59,6 +59,10 @@ pub enum VaultPathError {
     /// The configured root could not be canonicalized.
     #[error("vault root is invalid")]
     InvalidRoot,
+    /// A rename target already exists; renames never clobber another
+    /// writer's file.
+    #[error("rename target exists")]
+    TargetExists,
 }
 
 impl From<VaultConfigError> for VaultPathError {
@@ -211,6 +215,10 @@ impl MarkdownVaultProvider {
     ) -> Result<(), VaultPathError> {
         let from = self.confine(from_relative, kind)?;
         let to = self.confine(to_relative, kind)?;
+        // Renames never clobber another writer's file.
+        if to.absolute().exists() {
+            return Err(VaultPathError::TargetExists);
+        }
         std::fs::rename(from.absolute(), to.absolute()).map_err(|_| VaultPathError::InvalidPath)
     }
 
@@ -288,6 +296,14 @@ impl MarkdownVaultProvider {
                     continue;
                 }
                 if path.extension().is_none_or(|extension| extension != "md") {
+                    continue;
+                }
+                // Leftovers of a crashed atomic write never enter the model.
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".tmp-"))
+                {
                     continue;
                 }
                 let Ok(relative) = path.strip_prefix(&self.canonical_root) else {
@@ -396,6 +412,35 @@ impl MarkdownVaultProvider {
             });
         }
         Ok(())
+    }
+
+    /// Enumerates Brain-managed task resource references (bounded).
+    /// Enumerates Brain-managed task resource references (bounded).
+    ///
+    /// # Errors
+    /// Returns a redacted [`ProviderError`] when the enumeration itself
+    /// fails; individual unreadable or identity-less files are skipped.
+    pub fn enumerate_tasks_public(
+        &self,
+        limit: NonZeroUsize,
+    ) -> Result<Vec<ProviderResourceRef>, ProviderError> {
+        let mut references = Vec::new();
+        for relative in self.enumerate_paths(ProviderResourceKind::Task, limit) {
+            let Ok(bytes) = std::fs::read(self.canonical_root.join(&relative)) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let Ok(parsed) = parse_document(text) else {
+                continue;
+            };
+            let Ok(task) = parse_task(&parsed, "task") else {
+                continue;
+            };
+            references.push(self.reference(task.brain_id(), ProviderResourceKind::Task));
+        }
+        Ok(references)
     }
 
     /// Enumerates knowledge documents as bounded resource references.
