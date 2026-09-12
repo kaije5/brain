@@ -249,9 +249,12 @@ async fn atomic_create_writes_a_parseable_document_in_a_dedicated_directory() {
         .expect("get succeeds")
         .expect("created document found");
     assert_eq!(read.item().title(), "Atlas Plan");
-    assert_eq!(read.item().body(), "
+    assert_eq!(
+        read.item().body(),
+        "
 created body
-");
+"
+    );
 }
 
 #[test]
