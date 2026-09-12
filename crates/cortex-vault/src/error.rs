@@ -36,4 +36,7 @@ pub enum VaultFormatError {
     /// never overwrites one task's `brain_id` with a different task's.
     #[error("task identity conflict")]
     IdentityConflict,
+    /// Two task files claim the same stable `brain_id`.
+    #[error("duplicate task identity")]
+    DuplicateIdentity,
 }

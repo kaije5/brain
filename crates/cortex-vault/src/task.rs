@@ -269,18 +269,32 @@ pub fn rewrite_task_file(
         }
     }
     let frontmatter = serialize_task_frontmatter(task, existing.frontmatter())?;
-    let mut output = String::with_capacity(frontmatter.len() + task.body().len() + 8);
-    output.push_str(
-        "---
-",
-    );
+    // A Brain write normalizes CRLF to LF (format spec §2).
+    let body = crate::document::normalize_line_endings(existing.body());
+    let mut output = String::with_capacity(frontmatter.len() + body.len() + 8);
+    output.push_str("---\n");
     output.push_str(&frontmatter);
-    output.push_str(
-        "---
-",
-    );
-    output.push_str(existing.body());
+    output.push_str("---\n");
+    output.push_str(&body);
     Ok(output)
+}
+
+/// Verifies that no two parsed task files claim the same canonical
+/// `brain_id` (format spec §6.2; duplicate identities across files are a
+/// bounded typed error, naming neither path).
+///
+/// # Errors
+/// Returns [`VaultFormatError::DuplicateIdentity`] when two tasks share an
+/// identity.
+pub fn assert_unique_identities(tasks: &[ParsedTask]) -> Result<(), VaultFormatError> {
+    for (index, task) in tasks.iter().enumerate() {
+        for other in &tasks[index + 1..] {
+            if task.task_id() == other.task_id() {
+                return Err(VaultFormatError::DuplicateIdentity);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_brain_id(brain_id: &str) -> Result<TaskId, VaultFormatError> {
