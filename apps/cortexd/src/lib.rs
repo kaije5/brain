@@ -2,6 +2,7 @@
 
 mod client;
 mod config;
+mod governed;
 mod ipc;
 mod platform_secret_store;
 mod settings;
@@ -15,6 +16,7 @@ pub use client::AuthenticatedIpcClient;
 pub use config::{DaemonConfig, InferenceBearer};
 pub use cortex_application::SecretRef;
 pub use cortex_inference::ReqwestNimTransport;
+pub use governed::GovernedVaultProvider;
 pub use ipc::{
     AuthenticatedLocalClient, DaemonError, DaemonRequest, DaemonResponse, LocalDaemon,
     PROTOCOL_VERSION, PairingChallenge, PairingResponse, ProvisionedLocalClient, WireResult,

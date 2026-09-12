@@ -62,6 +62,15 @@ struct Entity {
 }
 #[derive(Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct KnowledgeTitleBody {
+    #[schemars(length(min = 1, max = MAX_TEXT_BYTES))]
+    title: String,
+    #[schemars(length(min = 1, max = MAX_TEXT_BYTES))]
+    body: String,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct Search {
     #[schemars(length(min = 1, max = MAX_TEXT_BYTES))]
     query: String,
@@ -139,6 +148,11 @@ impl ValidToolInput for NoteCreate {
 impl ValidToolInput for NoteUpdate {
     fn is_valid(&self) -> bool {
         valid_entity_id(self.entity_id) && valid_text(&self.title) && valid_text(&self.content)
+    }
+}
+impl ValidToolInput for KnowledgeTitleBody {
+    fn is_valid(&self) -> bool {
+        valid_text(&self.title) && valid_text(&self.body)
     }
 }
 
@@ -249,8 +263,12 @@ pub fn decode_arguments(name: &str, value: Value) -> Result<Value, McpError> {
         .ok_or_else(McpError::invalid_input)?;
     match c {
         Capability::NoteCreate => decode::<NoteCreate>(value),
+        Capability::KnowledgeCreate | Capability::KnowledgeUpdate => {
+            decode::<KnowledgeTitleBody>(value)
+        }
         Capability::NoteUpdate => decode::<NoteUpdate>(value),
         Capability::NoteDelete
+        | Capability::KnowledgeDelete
         | Capability::NoteRestore
         | Capability::TaskComplete
         | Capability::TaskDelete
@@ -279,8 +297,10 @@ fn schema(c: Capability) -> ToolSchema {
     let m = c.metadata();
     let input_schema = match c {
         Capability::NoteCreate => js::<NoteCreate>(),
+        Capability::KnowledgeCreate | Capability::KnowledgeUpdate => js::<KnowledgeTitleBody>(),
         Capability::NoteUpdate => js::<NoteUpdate>(),
         Capability::NoteDelete
+        | Capability::KnowledgeDelete
         | Capability::NoteRestore
         | Capability::TaskComplete
         | Capability::TaskDelete

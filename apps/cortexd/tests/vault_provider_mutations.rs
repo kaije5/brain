@@ -1,12 +1,10 @@
 //! Atomic create/update/delete/rename with optimistic concurrency (SCRUM-108).
 
 use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
 
 use cortex_application::{
-    KnowledgeDelete, KnowledgeProvider, KnowledgeQuery, KnowledgeUpdate, ProviderError,
-    ProviderTaskPriority, ProviderTaskStatus, TaskComplete, TaskCreate, TaskProvider, TaskQuery,
-    TaskSchedulingMetadata,
+    KnowledgeDelete, KnowledgeProvider, KnowledgeUpdate, ProviderError, ProviderTaskPriority,
+    ProviderTaskStatus, TaskComplete, TaskCreate, TaskProvider, TaskSchedulingMetadata,
 };
 use cortex_domain::{OperationId, ProviderResourceKind, WorkspaceId};
 use cortexd::{MarkdownVaultProvider, VaultProviderConfig, VaultProviderMode, VaultScope};

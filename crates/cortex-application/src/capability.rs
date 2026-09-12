@@ -18,6 +18,9 @@ pub enum Capability {
     MemoryRestore,
     MemorySearch,
     KnowledgeRetrieve,
+    KnowledgeCreate,
+    KnowledgeUpdate,
+    KnowledgeDelete,
     AgentRun,
 }
 
@@ -212,6 +215,27 @@ const KNOWLEDGE_RETRIEVE: CapabilityMetadata = query_metadata!(
     "KnowledgeSearchRequest",
     "KnowledgeSearchResultList"
 );
+const KNOWLEDGE_CREATE: CapabilityMetadata = mutation_metadata!(
+    Capability::KnowledgeCreate,
+    "cortex_knowledge_create",
+    "Create a knowledge document",
+    false,
+    "KnowledgeCreateInput"
+);
+const KNOWLEDGE_UPDATE: CapabilityMetadata = mutation_metadata!(
+    Capability::KnowledgeUpdate,
+    "cortex_knowledge_update",
+    "Update a knowledge document",
+    false,
+    "KnowledgeUpdateInput"
+);
+const KNOWLEDGE_DELETE: CapabilityMetadata = mutation_metadata!(
+    Capability::KnowledgeDelete,
+    "cortex_knowledge_delete",
+    "Delete a knowledge document",
+    true,
+    "KnowledgeDeleteInput"
+);
 const AGENT_RUN: CapabilityMetadata = query_metadata!(
     Capability::AgentRun,
     "cortex_agent_run",
@@ -241,6 +265,9 @@ impl Capability {
             Self::MemoryRestore => MEMORY_RESTORE,
             Self::MemorySearch => MEMORY_SEARCH,
             Self::KnowledgeRetrieve => KNOWLEDGE_RETRIEVE,
+            Self::KnowledgeCreate => KNOWLEDGE_CREATE,
+            Self::KnowledgeUpdate => KNOWLEDGE_UPDATE,
+            Self::KnowledgeDelete => KNOWLEDGE_DELETE,
             Self::AgentRun => AGENT_RUN,
         }
     }

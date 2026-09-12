@@ -574,6 +574,7 @@ fn object_schema(required: &[&str], properties: Value) -> Value {
     schema
 }
 
+#[allow(clippy::too_many_lines)] // One JSON schema arm per capability keeps review simple.
 fn input_schema(capability: Capability) -> Value {
     let entity_revision = json!({
         "entity_id": { "type": "string", "format": "uuid" },
@@ -598,6 +599,7 @@ fn input_schema(capability: Capability) -> Value {
             ),
         ),
         Capability::NoteDelete
+        | Capability::KnowledgeDelete
         | Capability::NoteRestore
         | Capability::TaskComplete
         | Capability::TaskDelete
@@ -652,6 +654,29 @@ fn input_schema(capability: Capability) -> Value {
             ],
             merge_properties(entity_revision, memory_properties()),
         ),
+        Capability::KnowledgeCreate => object_schema(
+            &["title", "body"],
+            json!({
+                "title": { "type": "string", "minLength": 1 },
+                "body": { "type": "string" }
+            }),
+        ),
+        Capability::KnowledgeUpdate => object_schema(
+            &[
+                "resource_id",
+                "workspace_id",
+                "expected_revision",
+                "title",
+                "body",
+            ],
+            merge_properties(
+                entity_revision,
+                json!({
+                    "title": { "type": "string", "minLength": 1 },
+                    "body": { "type": "string" }
+                }),
+            ),
+        ),
         Capability::NoteSearch
         | Capability::MemorySearch
         | Capability::KnowledgeRetrieve
@@ -700,8 +725,11 @@ fn validated_arguments(capability: Capability, arguments: &str) -> Result<Value,
         })?;
     let normalized = match capability {
         Capability::NoteCreate => decode::<NoteCreateArguments>(value),
+        Capability::KnowledgeCreate => decode::<KnowledgeCreateArguments>(value),
+        Capability::KnowledgeUpdate => decode::<KnowledgeUpdateArguments>(value),
         Capability::NoteUpdate => decode::<NoteUpdateArguments>(value),
         Capability::NoteDelete
+        | Capability::KnowledgeDelete
         | Capability::NoteRestore
         | Capability::TaskComplete
         | Capability::TaskDelete
@@ -795,6 +823,23 @@ struct NoteUpdateArguments {
     expected_revision: NonZeroU64,
     title: String,
     content: String,
+}
+
+#[derive(serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeCreateArguments {
+    title: String,
+    body: String,
+}
+
+#[derive(serde::Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeUpdateArguments {
+    resource_id: V7Uuid,
+    workspace_id: V7Uuid,
+    expected_revision: NonZeroU64,
+    title: String,
+    body: String,
 }
 
 #[derive(serde::Deserialize, Serialize)]
