@@ -28,7 +28,6 @@ const VALID_FIXTURES: &[(&str, &str)] = &[
         "unicode-document.md",
         include_str!("fixtures/valid/unicode-document.md"),
     ),
-    ("crlf-task.md", include_str!("fixtures/valid/crlf-task.md")),
     (
         "unknown-interleaved.md",
         include_str!("fixtures/valid/unknown-interleaved.md"),
@@ -138,10 +137,9 @@ fn task_fixtures_survive_a_managed_rewrite_and_round_trip_again() {
 
 #[test]
 fn crlf_fixture_is_accepted_and_normalized_only_on_rewrite() {
-    let (_, raw) = VALID_FIXTURES
-        .iter()
-        .find(|(name, _)| *name == "crlf-task.md")
-        .expect("crlf fixture present");
+    // Built at runtime: git normalizes CRLF in committed text files, so the
+    // CRLF variant cannot be a checked-in fixture.
+    let raw = fixture("minimal-task.md").replace('\n', "\r\n");
     assert!(raw.contains("\r\n"), "fixture is authored with CRLF");
     let document = parse_document(raw).expect("CRLF accepted on read");
     let task = parse_task(&document, "crlf").expect("valid task");
