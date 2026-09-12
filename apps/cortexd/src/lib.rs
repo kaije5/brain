@@ -6,6 +6,7 @@ mod ipc;
 mod platform_secret_store;
 mod settings;
 mod vault;
+mod vault_provider;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_security;
@@ -27,3 +28,4 @@ pub use vault::{
     InMemoryVaultProvider, VaultConfigError, VaultExclusion, VaultProviderConfig,
     VaultProviderMode, VaultScope,
 };
+pub use vault_provider::{ConfinedPath, MarkdownVaultProvider, VaultPathError};
