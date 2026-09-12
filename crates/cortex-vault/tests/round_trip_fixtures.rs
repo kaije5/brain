@@ -138,8 +138,11 @@ fn task_fixtures_survive_a_managed_rewrite_and_round_trip_again() {
 #[test]
 fn crlf_fixture_is_accepted_and_normalized_only_on_rewrite() {
     // Built at runtime: git normalizes CRLF in committed text files, so the
-    // CRLF variant cannot be a checked-in fixture.
-    let raw = fixture("minimal-task.md").replace('\n', "\r\n");
+    // CRLF variant cannot be a checked-in fixture. Normalize to LF first —
+    // on Windows checkouts the file itself may already carry CRLF.
+    let raw = fixture("minimal-task.md")
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n");
     assert!(raw.contains("\r\n"), "fixture is authored with CRLF");
     let document = parse_document(&raw).expect("CRLF accepted on read");
     let task = parse_task(&document, "crlf").expect("valid task");
