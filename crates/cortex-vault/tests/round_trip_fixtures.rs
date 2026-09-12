@@ -141,7 +141,7 @@ fn crlf_fixture_is_accepted_and_normalized_only_on_rewrite() {
     // CRLF variant cannot be a checked-in fixture.
     let raw = fixture("minimal-task.md").replace('\n', "\r\n");
     assert!(raw.contains("\r\n"), "fixture is authored with CRLF");
-    let document = parse_document(raw).expect("CRLF accepted on read");
+    let document = parse_document(&raw).expect("CRLF accepted on read");
     let task = parse_task(&document, "crlf").expect("valid task");
     assert_eq!(task.status(), ProviderTaskStatus::Todo);
 
