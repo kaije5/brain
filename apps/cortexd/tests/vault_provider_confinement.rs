@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use cortex_domain::ProviderResourceKind;
+use cortex_domain::{ProviderResourceKind, WorkspaceId};
 use cortexd::{
     MarkdownVaultProvider, VaultExclusion, VaultPathError, VaultProviderConfig, VaultProviderMode,
     VaultScope,
@@ -29,7 +29,7 @@ fn open_vault(root: &std::path::Path) -> MarkdownVaultProvider {
         BTreeSet::new(),
     )
     .expect("valid config");
-    MarkdownVaultProvider::open(config).expect("vault opens")
+    MarkdownVaultProvider::open(config, WorkspaceId::new()).expect("vault opens")
 }
 
 #[test]
@@ -51,7 +51,7 @@ fn open_canonicalizes_the_root_and_requires_a_directory() {
     )
     .expect("valid config");
     assert!(matches!(
-        MarkdownVaultProvider::open(config),
+        MarkdownVaultProvider::open(config, WorkspaceId::new()),
         Err(VaultPathError::InvalidRoot)
     ));
 }
@@ -147,7 +147,7 @@ fn configured_exclusions_are_enforced() {
         exclusions,
     )
     .expect("valid config");
-    let provider = MarkdownVaultProvider::open(config).expect("opens");
+    let provider = MarkdownVaultProvider::open(config, WorkspaceId::new()).expect("opens");
 
     assert!(matches!(
         provider.confine(".obsidian/app.json", ProviderResourceKind::Knowledge),
@@ -189,7 +189,7 @@ fn resource_kinds_outside_the_configured_scopes_are_rejected() {
         BTreeSet::new(),
     )
     .expect("valid config");
-    let provider = MarkdownVaultProvider::open(config).expect("opens");
+    let provider = MarkdownVaultProvider::open(config, WorkspaceId::new()).expect("opens");
 
     assert!(
         provider
@@ -213,7 +213,7 @@ fn read_only_mode_is_visible_for_future_policy() {
         BTreeSet::new(),
     )
     .expect("valid config");
-    let provider = MarkdownVaultProvider::open(config).expect("opens");
+    let provider = MarkdownVaultProvider::open(config, WorkspaceId::new()).expect("opens");
     assert_eq!(provider.config().mode(), VaultProviderMode::ReadOnly);
 }
 

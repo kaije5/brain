@@ -1,4 +1,6 @@
-//! The first-party Markdown vault provider: root/scope confinement.
+#![allow(clippy::result_large_err)]
+//! The first-party Markdown vault provider: root/scope confinement and the
+//! confined read operations.
 //!
 //! This module owns the security boundary between Cortex and the configured
 //! local vault (format spec; storage plan §9). Every read and mutation in
@@ -10,14 +12,31 @@
 
 use std::{
     collections::BTreeSet,
+    num::NonZeroUsize,
     path::{Component, Path, PathBuf},
 };
 
-use cortex_domain::ProviderResourceKind;
+use cortex_application::{
+    KnowledgeCreate, KnowledgeDelete, KnowledgeDocument, KnowledgeProvider, KnowledgeQuery,
+    KnowledgeUpdate, ProviderError, ProviderFreshness, ProviderMutation, ProviderPage,
+    ProviderRead, ProviderTask, TaskComplete, TaskCreate, TaskDelete, TaskProvider, TaskQuery,
+    TaskUpdate,
+};
+use cortex_domain::{
+    ContentHash, ObservedRevision, ProviderId, ProviderProvenance, ProviderResourceId,
+    ProviderResourceKind, ProviderResourceRef, WorkspaceId,
+};
+use cortex_vault::{parse_document, parse_task};
+use sha2::{Digest, Sha256};
 
 use crate::vault::{VaultConfigError, VaultProviderConfig};
 
 const MAX_RELATIVE_BYTES: usize = 1024;
+const MAX_ENUMERATED_FILES: usize = 10_000;
+/// Documents are addressed by their vault-relative path: the format spec has
+/// no on-disk stable document id, so document rename semantics are handled by
+/// the derived index (SCRUM-92). Tasks use the rename-stable `brain_id`.
+const DOCUMENT_ID_PREFIX: &str = "path:";
 
 /// Typed, value-free confinement failures. Variants never carry paths.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -80,23 +99,33 @@ impl ConfinedPath {
 #[derive(Clone, Debug)]
 pub struct MarkdownVaultProvider {
     config: VaultProviderConfig,
+    workspace_id: WorkspaceId,
+    provider_id: ProviderId,
     canonical_root: PathBuf,
 }
 
 impl MarkdownVaultProvider {
     /// Opens the vault: validates the configuration and canonicalizes the
     /// root so every later confinement check compares against one exact
-    /// prefix.
+    /// prefix. The daemon workspace scopes every constructed resource
+    /// reference.
     ///
     /// # Errors
     /// Returns [`VaultPathError::InvalidRoot`] when the root is missing,
     /// not a directory, or cannot be canonicalized.
-    pub fn open(config: VaultProviderConfig) -> Result<Self, VaultPathError> {
+    pub fn open(
+        config: VaultProviderConfig,
+        workspace_id: WorkspaceId,
+    ) -> Result<Self, VaultPathError> {
         config.validate_root_access()?;
         let canonical_root =
             std::fs::canonicalize(config.root()).map_err(|_| VaultPathError::InvalidRoot)?;
+        let provider_id = ProviderId::new(config.provider_id().as_str())
+            .map_err(|_| VaultPathError::InvalidPath)?;
         Ok(Self {
             config,
+            workspace_id,
+            provider_id,
             canonical_root,
         })
     }
@@ -105,6 +134,12 @@ impl MarkdownVaultProvider {
     #[must_use]
     pub const fn config(&self) -> &VaultProviderConfig {
         &self.config
+    }
+
+    /// The workspace every constructed resource reference is scoped to.
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
     }
 
     /// The canonical vault root (for internal composition only).
@@ -183,6 +218,181 @@ impl MarkdownVaultProvider {
             }
         }
     }
+
+    fn reference(&self, resource_id: &str, kind: ProviderResourceKind) -> ProviderResourceRef {
+        let id = ProviderResourceId::new(resource_id)
+            .unwrap_or_else(|_| ProviderResourceId::new("invalid-id").expect("static id"));
+        ProviderResourceRef::new(self.workspace_id, self.provider_id.clone(), id, kind)
+    }
+
+    fn document_reference(
+        &self,
+        relative: &str,
+        kind: ProviderResourceKind,
+    ) -> ProviderResourceRef {
+        self.reference(&format!("{DOCUMENT_ID_PREFIX}{relative}"), kind)
+    }
+
+    fn provenance(
+        resource: &ProviderResourceRef,
+        bytes: &[u8],
+    ) -> Result<ProviderProvenance, ProviderError> {
+        let digest = Sha256::digest(bytes);
+        let revision = hex_revision(&digest)?;
+        Ok(ProviderProvenance::new(
+            resource.clone(),
+            revision,
+            ContentHash::new(digest.into()),
+        ))
+    }
+
+    /// Bounded recursive enumeration of `.md` files under the root that pass
+    /// confinement for the given kind. Oversized or unreadable paths are
+    /// skipped, never fatal.
+    fn enumerate_paths(&self, kind: ProviderResourceKind, limit: NonZeroUsize) -> Vec<String> {
+        let mut relatives = Vec::new();
+        let mut stack = vec![self.canonical_root.clone()];
+        let mut visited = 0_usize;
+        while let Some(directory) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                visited += 1;
+                if visited > MAX_ENUMERATED_FILES || relatives.len() >= limit.get() {
+                    return relatives;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|extension| extension != "md") {
+                    continue;
+                }
+                let Ok(relative) = path.strip_prefix(&self.canonical_root) else {
+                    continue;
+                };
+                let Some(relative) = relative.to_str() else {
+                    continue;
+                };
+                // The format uses `/` separators regardless of platform.
+                let normalized = relative.replace('\\', "/");
+                // `Tasks/` is the Brain-managed task directory; its files are
+                // never knowledge documents.
+                if kind == ProviderResourceKind::Knowledge && normalized.starts_with("Tasks/") {
+                    continue;
+                }
+                if self.confine(&normalized, kind).is_ok() {
+                    relatives.push(normalized);
+                }
+            }
+        }
+        relatives
+    }
+
+    /// Enumerates knowledge documents as bounded resource references.
+    ///
+    /// # Errors
+    /// Returns a redacted [`ProviderError`] when the enumeration itself
+    /// fails; individual unreadable files are skipped.
+    pub fn enumerate_knowledge(
+        &self,
+        limit: NonZeroUsize,
+    ) -> Result<ProviderPage<ProviderResourceRef>, ProviderError> {
+        let references = self
+            .enumerate_paths(ProviderResourceKind::Knowledge, limit)
+            .into_iter()
+            .map(|relative| self.document_reference(&relative, ProviderResourceKind::Knowledge))
+            .collect();
+        ProviderPage::new(references, ProviderFreshness::Current)
+    }
+    /// Reads and parses one knowledge document by resource id.
+    fn read_knowledge(
+        &self,
+        resource: &ProviderResourceRef,
+    ) -> Result<ProviderRead<KnowledgeDocument>, ProviderError> {
+        let relative = document_relative(resource)?;
+        let confined = self
+            .confine(relative, ProviderResourceKind::Knowledge)
+            .map_err(|_| ProviderError::NotFound {
+                resource: resource.clone(),
+            })?;
+        let bytes = std::fs::read(confined.absolute()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ProviderError::NotFound {
+                    resource: resource.clone(),
+                }
+            } else {
+                ProviderError::Unavailable
+            }
+        })?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| ProviderError::Validation { field: "encoding" })?;
+        let parsed =
+            parse_document(text).map_err(|_| ProviderError::Validation { field: "markdown" })?;
+        let provenance = Self::provenance(resource, &bytes)?;
+        let document =
+            KnowledgeDocument::new(provenance, parsed.title(confined.relative()), parsed.body())?;
+        Ok(ProviderRead::new(document, ProviderFreshness::Current))
+    }
+
+    /// Reads and parses one Brain-managed task file by resource id.
+    fn read_task(
+        &self,
+        resource: &ProviderResourceRef,
+    ) -> Result<ProviderRead<ProviderTask>, ProviderError> {
+        let brain_id = resource.resource_id().as_str();
+        for relative in self.enumerate_paths(ProviderResourceKind::Task, MAX_ENUMERATED_LIMIT) {
+            let Ok(bytes) = std::fs::read(self.canonical_root.join(&relative)) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let Ok(parsed) = parse_document(text) else {
+                continue;
+            };
+            let Ok(task) = parse_task(&parsed, "task") else {
+                continue;
+            };
+            if task.brain_id() == brain_id {
+                let provenance = Self::provenance(resource, &bytes)?;
+                let provider_task = ProviderTask::new(
+                    provenance,
+                    *task.task_id(),
+                    task.title().to_owned(),
+                    task.body().to_owned(),
+                    task.status(),
+                    task.priority(),
+                    task.scheduling().clone(),
+                )?;
+                return Ok(ProviderRead::new(provider_task, ProviderFreshness::Current));
+            }
+        }
+        Err(ProviderError::NotFound {
+            resource: resource.clone(),
+        })
+    }
+}
+
+const MAX_ENUMERATED_LIMIT: NonZeroUsize = NonZeroUsize::MAX;
+
+fn document_relative(resource: &ProviderResourceRef) -> Result<&str, ProviderError> {
+    let id = resource.resource_id().as_str();
+    id.strip_prefix(DOCUMENT_ID_PREFIX)
+        .ok_or(ProviderError::Validation {
+            field: "resource_id",
+        })
+}
+
+fn hex_revision(digest: &[u8]) -> Result<ObservedRevision, ProviderError> {
+    let mut hex = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    ObservedRevision::new(format!("rev-{hex}")).map_err(|_| ProviderError::Internal)
 }
 
 /// Validates and normalizes a vault-relative path: `/`-separated, no
@@ -209,4 +419,135 @@ fn validate_relative(relative: &str) -> Result<String, VaultPathError> {
         return Err(VaultPathError::Traversal);
     }
     Ok(relative.to_owned())
+}
+
+impl KnowledgeProvider for MarkdownVaultProvider {
+    async fn get(
+        &self,
+        resource: &ProviderResourceRef,
+    ) -> Result<Option<ProviderRead<KnowledgeDocument>>, ProviderError> {
+        if resource.kind() != ProviderResourceKind::Knowledge
+            || resource.workspace_id() != self.workspace_id
+        {
+            return Err(ProviderError::Validation {
+                field: "resource_kind",
+            });
+        }
+        Ok(Some(self.read_knowledge(resource)?))
+    }
+
+    async fn search(
+        &self,
+        query: &KnowledgeQuery,
+    ) -> Result<ProviderPage<KnowledgeDocument>, ProviderError> {
+        if query.workspace_id() != self.workspace_id {
+            return Err(ProviderError::Validation { field: "workspace" });
+        }
+        let text = query.text().map(str::to_lowercase);
+        let mut documents = Vec::new();
+        for reference in self.enumerate_knowledge(MAX_ENUMERATED_LIMIT)?.into_items() {
+            if documents.len() >= query.limit().get() {
+                break;
+            }
+            let read = self.read_knowledge(&reference)?;
+            let include = text.as_ref().is_none_or(|text| {
+                read.item().title().to_lowercase().contains(text)
+                    || read.item().body().to_lowercase().contains(text)
+            });
+            if include {
+                documents.push(read.into_item());
+            }
+        }
+        ProviderPage::new(documents, ProviderFreshness::Current)
+    }
+
+    async fn create(&self, _input: KnowledgeCreate) -> Result<ProviderMutation, ProviderError> {
+        // Atomic mutations arrive with SCRUM-108.
+        Err(ProviderError::Unavailable)
+    }
+
+    async fn update(&self, _input: KnowledgeUpdate) -> Result<ProviderMutation, ProviderError> {
+        Err(ProviderError::Unavailable)
+    }
+
+    async fn delete(&self, _input: KnowledgeDelete) -> Result<ProviderMutation, ProviderError> {
+        Err(ProviderError::Unavailable)
+    }
+}
+
+impl TaskProvider for MarkdownVaultProvider {
+    async fn get(
+        &self,
+        resource: &ProviderResourceRef,
+    ) -> Result<Option<ProviderRead<ProviderTask>>, ProviderError> {
+        if resource.kind() != ProviderResourceKind::Task
+            || resource.workspace_id() != self.workspace_id
+        {
+            return Err(ProviderError::Validation {
+                field: "resource_kind",
+            });
+        }
+        self.read_task(resource).map(Some)
+    }
+
+    async fn search(&self, query: &TaskQuery) -> Result<ProviderPage<ProviderTask>, ProviderError> {
+        if query.workspace_id() != self.workspace_id {
+            return Err(ProviderError::Validation { field: "workspace" });
+        }
+        let text = query.text().map(str::to_lowercase);
+        let mut tasks = Vec::new();
+        for relative in self.enumerate_paths(ProviderResourceKind::Task, MAX_ENUMERATED_LIMIT) {
+            if tasks.len() >= query.limit().get() {
+                break;
+            }
+            let Ok(bytes) = std::fs::read(self.canonical_root.join(&relative)) else {
+                continue;
+            };
+            let Ok(parsed_text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let Ok(parsed) = parse_document(parsed_text) else {
+                continue;
+            };
+            let Ok(task) = parse_task(&parsed, "task") else {
+                continue;
+            };
+            let include = text.as_ref().is_none_or(|text| {
+                task.title().to_lowercase().contains(text)
+                    || task.body().to_lowercase().contains(text)
+            });
+            if !include {
+                continue;
+            }
+            let resource = self.reference(task.brain_id(), ProviderResourceKind::Task);
+            let provenance = Self::provenance(&resource, &bytes)?;
+            tasks.push(ProviderTask::new(
+                provenance,
+                *task.task_id(),
+                task.title().to_owned(),
+                task.body().to_owned(),
+                task.status(),
+                task.priority(),
+                task.scheduling().clone(),
+            )?);
+        }
+        ProviderPage::new(tasks, ProviderFreshness::Current)
+    }
+
+    async fn create(&self, _input: TaskCreate) -> Result<ProviderMutation, ProviderError> {
+        // Atomic mutations arrive with SCRUM-108.
+        Err(ProviderError::Unavailable)
+    }
+
+    async fn update(&self, _input: TaskUpdate) -> Result<ProviderMutation, ProviderError> {
+        Err(ProviderError::Unavailable)
+    }
+
+    async fn complete(&self, _input: TaskComplete) -> Result<ProviderMutation, ProviderError> {
+        Err(ProviderError::Unavailable)
+    }
+
+    async fn delete(&self, _input: TaskDelete) -> Result<ProviderMutation, ProviderError> {
+        Err(ProviderError::Unavailable)
+    }
 }

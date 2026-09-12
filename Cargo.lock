@@ -766,6 +766,7 @@ dependencies = [
  "cortex-keyring",
  "cortex-search",
  "cortex-storage",
+ "cortex-vault",
  "ed25519-dalek",
  "serde",
  "serde_json",
