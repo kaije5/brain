@@ -170,11 +170,13 @@ async fn permission_failures_leave_the_original_intact() {
         .strip_prefix("path:")
         .expect("path id");
     let path = directory.path().join(relative);
+    let parent = path.parent().expect("parent exists").to_path_buf();
 
-    // Make the file read-only; an update must fail without corrupting it.
-    let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
-    permissions.set_mode(0o444);
-    std::fs::set_permissions(&path, permissions).expect("chmod");
+    // Make the parent directory read-only: the permission boundary that
+    // governs atomic rename-based writes.
+    let mut permissions = std::fs::metadata(parent).expect("metadata").permissions();
+    permissions.set_mode(0o555);
+    std::fs::set_permissions(parent, permissions).expect("chmod");
 
     let read = KnowledgeProvider::get(&provider, &resource)
         .await
@@ -195,10 +197,10 @@ async fn permission_failures_leave_the_original_intact() {
     .await;
     assert!(matches!(update, Err(ProviderError::Unavailable)));
 
-    // Restore permissions and prove the original content survived.
-    let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
-    permissions.set_mode(0o644);
-    std::fs::set_permissions(&path, permissions).expect("chmod");
+    // Restore directory permissions and prove the original content survived.
+    let mut permissions = std::fs::metadata(parent).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(parent, permissions).expect("chmod");
     let content = std::fs::read_to_string(&path).expect("readable");
     assert!(content.contains("locked body"));
     assert!(!content.contains("must not land"));
