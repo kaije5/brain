@@ -4,6 +4,7 @@ members = [
     "crates/cortex-application",
     "crates/cortex-inference",
     "crates/cortex-keyring",
+    "crates/cortex-vault",
     "crates/cortex-search",
     "crates/cortex-storage",
     "apps/cortexd",

@@ -745,6 +745,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortex-vault"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "cortexd"
 version = "0.1.0"
 dependencies = [
