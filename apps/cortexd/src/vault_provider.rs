@@ -19,8 +19,8 @@ use std::{
 use cortex_application::{
     KnowledgeCreate, KnowledgeDelete, KnowledgeDocument, KnowledgeProvider, KnowledgeQuery,
     KnowledgeUpdate, ProviderError, ProviderFreshness, ProviderMutation, ProviderPage,
-    ProviderRead, ProviderTask, TaskComplete, TaskCreate, TaskDelete, TaskProvider, TaskQuery,
-    TaskUpdate,
+    ProviderRead, ProviderTask, ProviderTaskPriority, ProviderTaskStatus, TaskComplete, TaskCreate,
+    TaskDelete, TaskProvider, TaskQuery, TaskSchedulingMetadata, TaskUpdate,
 };
 use cortex_domain::{
     ContentHash, ObservedRevision, ProviderId, ProviderProvenance, ProviderResourceId,
@@ -192,6 +192,26 @@ impl MarkdownVaultProvider {
             let exclusion = exclusion.as_str().trim_end_matches('/');
             prefixes.contains(exclusion)
         })
+    }
+
+    /// Atomically renames a confined file to a new confined location within
+    /// the vault (same filesystem, single rename). Task identity lives in
+    /// `brain_id` and is unaffected; document identities follow their path
+    /// (format spec §4; SCRUM-92 owns rename-stable document identity).
+    ///
+    /// # Errors
+    /// Returns the matching typed [`VaultPathError`] when either endpoint
+    /// fails confinement, or an IO error surfaces as [`VaultPathError::InvalidPath`]
+    /// only when the source is missing; all other failures propagate.
+    pub fn rename(
+        &self,
+        from_relative: &str,
+        to_relative: &str,
+        kind: ProviderResourceKind,
+    ) -> Result<(), VaultPathError> {
+        let from = self.confine(from_relative, kind)?;
+        let to = self.confine(to_relative, kind)?;
+        std::fs::rename(from.absolute(), to.absolute()).map_err(|_| VaultPathError::InvalidPath)
     }
 
     /// Detects symlink escape: canonicalize the deepest existing ancestor of
@@ -460,7 +480,8 @@ impl MarkdownVaultProvider {
             let Ok(parsed) = parse_document(text) else {
                 continue;
             };
-            let Ok(task) = parse_task(&parsed, "task") else {
+            let stem = file_stem(&relative);
+            let Ok(task) = parse_task(&parsed, &stem) else {
                 continue;
             };
             if task.brain_id() == brain_id {
@@ -502,6 +523,17 @@ fn hex_revision(digest: &[u8]) -> Result<ObservedRevision, ProviderError> {
     ObservedRevision::new(format!("rev-{hex}")).map_err(|_| ProviderError::Internal)
 }
 
+/// The file stem (name without `.md`) of a vault-relative path.
+fn file_stem(relative: &str) -> String {
+    relative
+        .rsplit('/')
+        .next()
+        .unwrap_or(relative)
+        .strip_suffix(".md")
+        .unwrap_or_else(|| relative.rsplit('/').next().unwrap_or(relative))
+        .to_owned()
+}
+
 /// Validates and normalizes a vault-relative path: `/`-separated, no
 /// absolute or traversal components, bounded.
 fn validate_relative(relative: &str) -> Result<String, VaultPathError> {
@@ -540,7 +572,12 @@ impl KnowledgeProvider for MarkdownVaultProvider {
                 field: "resource_kind",
             });
         }
-        Ok(Some(self.read_knowledge(resource)?))
+        match self.read_knowledge(resource) {
+            Ok(read) => Ok(Some(read)),
+            // Missing files are a normal read outcome, not an error.
+            Err(ProviderError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     async fn search(
@@ -568,17 +605,79 @@ impl KnowledgeProvider for MarkdownVaultProvider {
         ProviderPage::new(documents, ProviderFreshness::Current)
     }
 
-    async fn create(&self, _input: KnowledgeCreate) -> Result<ProviderMutation, ProviderError> {
-        // Atomic mutations arrive with SCRUM-108.
-        Err(ProviderError::Unavailable)
+    async fn create(&self, input: KnowledgeCreate) -> Result<ProviderMutation, ProviderError> {
+        let slug = slug_from_title(input.title());
+        // New documents live under `Documents/` (spec §3 allows any
+        // non-task location; this keeps creates out of `Tasks/`).
+        let relative = unique_relative(self, "Documents", &slug);
+        let confined = self
+            .confine(&relative, ProviderResourceKind::Knowledge)
+            .map_err(|_| ProviderError::Validation { field: "path" })?;
+        let mut content = String::new();
+        content.push_str("---\ntitle: ");
+        content.push_str(&quote_yaml(input.title()));
+        content.push_str("\n---\n\n");
+        content.push_str(input.body());
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        let bytes = content.into_bytes();
+        write_atomic(&confined, &bytes).map_err(|_| ProviderError::Unavailable)?;
+        let resource =
+            self.document_reference(confined.relative(), ProviderResourceKind::Knowledge);
+        let current = Self::provenance(&resource, &bytes)?;
+        Ok(ProviderMutation::created(current))
     }
 
-    async fn update(&self, _input: KnowledgeUpdate) -> Result<ProviderMutation, ProviderError> {
-        Err(ProviderError::Unavailable)
+    async fn update(&self, input: KnowledgeUpdate) -> Result<ProviderMutation, ProviderError> {
+        let relative = document_relative(input.resource())?;
+        let confined = self
+            .confine(relative, ProviderResourceKind::Knowledge)
+            .map_err(|_| ProviderError::NotFound {
+                resource: input.resource().clone(),
+            })?;
+        // Optimistic concurrency: the file must still observe the caller's
+        // revision, otherwise the conflict carries the current provenance.
+        self.verify_revision(&confined, input.expected_revision())?;
+        let bytes = std::fs::read(confined.absolute()).map_err(|_| ProviderError::Unavailable)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| ProviderError::Validation { field: "encoding" })?;
+        let parsed =
+            parse_document(text).map_err(|_| ProviderError::Validation { field: "markdown" })?;
+        let previous = Self::provenance(input.resource(), &bytes)?;
+
+        // Rewrite only the managed title; unknown properties are preserved.
+        let frontmatter = match parsed.frontmatter() {
+            Some(block) => block
+                .with_managed_properties(&[("title", quote_yaml(input.title()))])
+                .map_err(|_| ProviderError::Internal)?,
+            None => format!("title: {}\n", quote_yaml(input.title())),
+        };
+        let mut content = String::from("---\n");
+        content.push_str(&frontmatter);
+        content.push_str("---\n");
+        content.push_str(input.body());
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        let new_bytes = content.into_bytes();
+        write_atomic(&confined, &new_bytes).map_err(|_| ProviderError::Unavailable)?;
+        let current = Self::provenance(input.resource(), &new_bytes)?;
+        ProviderMutation::updated(previous, current)
     }
 
-    async fn delete(&self, _input: KnowledgeDelete) -> Result<ProviderMutation, ProviderError> {
-        Err(ProviderError::Unavailable)
+    async fn delete(&self, input: KnowledgeDelete) -> Result<ProviderMutation, ProviderError> {
+        let relative = document_relative(input.resource())?;
+        let confined = self
+            .confine(relative, ProviderResourceKind::Knowledge)
+            .map_err(|_| ProviderError::NotFound {
+                resource: input.resource().clone(),
+            })?;
+        let bytes = std::fs::read(confined.absolute()).map_err(|_| ProviderError::Unavailable)?;
+        let previous = Self::provenance(input.resource(), &bytes)?;
+        self.verify_revision(&confined, input.expected_revision())?;
+        std::fs::remove_file(confined.absolute()).map_err(|_| ProviderError::Unavailable)?;
+        Ok(ProviderMutation::deleted(previous))
     }
 }
 
@@ -616,7 +715,8 @@ impl TaskProvider for MarkdownVaultProvider {
             let Ok(parsed) = parse_document(parsed_text) else {
                 continue;
             };
-            let Ok(task) = parse_task(&parsed, "task") else {
+            let stem = file_stem(&relative);
+            let Ok(task) = parse_task(&parsed, &stem) else {
                 continue;
             };
             let include = text.as_ref().is_none_or(|text| {
@@ -641,20 +741,300 @@ impl TaskProvider for MarkdownVaultProvider {
         ProviderPage::new(tasks, ProviderFreshness::Current)
     }
 
-    async fn create(&self, _input: TaskCreate) -> Result<ProviderMutation, ProviderError> {
-        // Atomic mutations arrive with SCRUM-108.
-        Err(ProviderError::Unavailable)
+    async fn create(&self, input: TaskCreate) -> Result<ProviderMutation, ProviderError> {
+        let brain_id = uuid::Uuid::from(input.task_id()).hyphenated().to_string();
+        let slug = slug_from_title(input.title());
+        let relative = format!("Tasks/{brain_id}-{slug}.md");
+        let confined = self
+            .confine(&relative, ProviderResourceKind::Task)
+            .map_err(|_| ProviderError::Validation { field: "path" })?;
+        if confined.absolute().exists() {
+            return Err(ProviderError::Conflict {
+                current: Self::provenance(
+                    &self.reference(&brain_id, ProviderResourceKind::Task),
+                    &[],
+                )?,
+            });
+        }
+        let scheduling = input.scheduling().clone();
+        let managed = task_managed_values(
+            &brain_id,
+            ProviderTaskStatus::Todo,
+            input.priority(),
+            &scheduling,
+        );
+        let mut content = String::from("---\n");
+        content.push_str(&managed);
+        content.push_str("---\n\n");
+        content.push_str(input.body());
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        let bytes = content.into_bytes();
+        write_atomic(&confined, &bytes).map_err(|_| ProviderError::Unavailable)?;
+        let resource = self.reference(&brain_id, ProviderResourceKind::Task);
+        let current = Self::provenance(&resource, &bytes)?;
+        Ok(ProviderMutation::created(current))
     }
 
-    async fn update(&self, _input: TaskUpdate) -> Result<ProviderMutation, ProviderError> {
-        Err(ProviderError::Unavailable)
+    async fn update(&self, input: TaskUpdate) -> Result<ProviderMutation, ProviderError> {
+        let confined = self.find_task_confined(input.resource())?;
+        let bytes = std::fs::read(confined.absolute()).map_err(|_| ProviderError::Unavailable)?;
+        let previous = Self::provenance(input.resource(), &bytes)?;
+        self.verify_revision(&confined, input.expected_revision())?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| ProviderError::Validation { field: "encoding" })?;
+        let parsed =
+            parse_document(text).map_err(|_| ProviderError::Validation { field: "markdown" })?;
+        let parsed_task =
+            parse_task(&parsed, "task").map_err(|_| ProviderError::Validation { field: "task" })?;
+        let brain_id = parsed_task.brain_id().to_owned();
+        let frontmatter = task_managed_values(
+            &brain_id,
+            input.status(),
+            input.priority(),
+            input.scheduling(),
+        );
+        let mut content = String::from("---\n");
+        content.push_str(&frontmatter);
+        content.push_str("---\n");
+        content.push_str(parsed.body());
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        let new_bytes = content.into_bytes();
+        write_atomic(&confined, &new_bytes).map_err(|_| ProviderError::Unavailable)?;
+        let current = Self::provenance(input.resource(), &new_bytes)?;
+        ProviderMutation::updated(previous, current)
     }
 
-    async fn complete(&self, _input: TaskComplete) -> Result<ProviderMutation, ProviderError> {
-        Err(ProviderError::Unavailable)
+    async fn complete(&self, input: TaskComplete) -> Result<ProviderMutation, ProviderError> {
+        let confined = self.find_task_confined(input.resource())?;
+        let bytes = std::fs::read(confined.absolute()).map_err(|_| ProviderError::Unavailable)?;
+        let previous = Self::provenance(input.resource(), &bytes)?;
+        self.verify_revision(&confined, input.expected_revision())?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| ProviderError::Validation { field: "encoding" })?;
+        let parsed =
+            parse_document(text).map_err(|_| ProviderError::Validation { field: "markdown" })?;
+        let parsed_task =
+            parse_task(&parsed, "task").map_err(|_| ProviderError::Validation { field: "task" })?;
+        let brain_id = parsed_task.brain_id().to_owned();
+        let managed = task_managed_values(
+            &brain_id,
+            ProviderTaskStatus::Completed,
+            parsed_task.priority(),
+            parsed_task.scheduling(),
+        );
+        let frontmatter = managed;
+        let mut content = String::from("---\n");
+        content.push_str(&frontmatter);
+        content.push_str("---\n");
+        content.push_str(parsed.body());
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        let new_bytes = content.into_bytes();
+        write_atomic(&confined, &new_bytes).map_err(|_| ProviderError::Unavailable)?;
+        let current = Self::provenance(input.resource(), &new_bytes)?;
+        ProviderMutation::updated(previous, current)
     }
 
-    async fn delete(&self, _input: TaskDelete) -> Result<ProviderMutation, ProviderError> {
-        Err(ProviderError::Unavailable)
+    async fn delete(&self, input: TaskDelete) -> Result<ProviderMutation, ProviderError> {
+        let confined = self.find_task_confined(input.resource())?;
+        let bytes = std::fs::read(confined.absolute()).map_err(|_| ProviderError::Unavailable)?;
+        let previous = Self::provenance(input.resource(), &bytes)?;
+        self.verify_revision(&confined, input.expected_revision())?;
+        std::fs::remove_file(confined.absolute()).map_err(|_| ProviderError::Unavailable)?;
+        Ok(ProviderMutation::deleted(previous))
+    }
+}
+
+/// Locates the confined task file owning a resource identity.
+impl MarkdownVaultProvider {
+    fn find_task_confined(
+        &self,
+        resource: &ProviderResourceRef,
+    ) -> Result<ConfinedPath, ProviderError> {
+        let brain_id = resource.resource_id().as_str();
+        for relative in self.enumerate_paths(ProviderResourceKind::Task, MAX_ENUMERATED_LIMIT) {
+            let Ok(confined) = self.confine(&relative, ProviderResourceKind::Task) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(confined.absolute()) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let Ok(parsed) = parse_document(text) else {
+                continue;
+            };
+            let stem = file_stem(&relative);
+            let Ok(task) = parse_task(&parsed, &stem) else {
+                continue;
+            };
+            if task.brain_id() == brain_id {
+                return Ok(confined);
+            }
+        }
+        Err(ProviderError::NotFound {
+            resource: resource.clone(),
+        })
+    }
+}
+
+/// Serializes the managed task properties in canonical §6.1 order.
+fn task_managed_values(
+    brain_id: &str,
+    status: ProviderTaskStatus,
+    priority: ProviderTaskPriority,
+    scheduling: &TaskSchedulingMetadata,
+) -> String {
+    let mut managed: Vec<(&str, String)> = vec![
+        ("type", "task".to_owned()),
+        ("brain_id", brain_id.to_owned()),
+        (
+            "status",
+            match status {
+                ProviderTaskStatus::Todo => "todo",
+                ProviderTaskStatus::InProgress => "in_progress",
+                ProviderTaskStatus::Completed => "done",
+                ProviderTaskStatus::Cancelled => "cancelled",
+            }
+            .to_owned(),
+        ),
+        (
+            "priority",
+            match priority {
+                ProviderTaskPriority::Low => "low",
+                ProviderTaskPriority::Normal => "normal",
+                ProviderTaskPriority::High => "high",
+                ProviderTaskPriority::Urgent => "urgent",
+            }
+            .to_owned(),
+        ),
+    ];
+    if let Some(due) = scheduling.due_at() {
+        managed.push(("due", format_instant(due)));
+    }
+    if let Some(deadline) = scheduling.deadline_at() {
+        managed.push(("deadline", format_instant(deadline)));
+    }
+    if let Some(duration) = scheduling.duration_minutes() {
+        managed.push(("duration_minutes", duration.get().to_string()));
+    }
+    if let Some(start) = scheduling.earliest_start() {
+        managed.push(("earliest_start", format_instant(start)));
+    }
+    if let Some(split) = scheduling.split() {
+        managed.push(("split", if split { "true" } else { "false" }.to_owned()));
+    }
+    if let Some(project) = scheduling.project() {
+        managed.push(("project", quote_yaml(project)));
+    }
+    if let Some(context) = scheduling.context() {
+        managed.push(("context", quote_yaml(context)));
+    }
+    let mut output = String::new();
+    for (key, value) in managed {
+        output.push_str(key);
+        output.push_str(": ");
+        output.push_str(&value);
+        output.push('\n');
+    }
+    output
+}
+
+/// Date-only output when the instant is midnight UTC, RFC 3339 otherwise.
+fn format_instant(instant: chrono::DateTime<chrono::Utc>) -> String {
+    if instant.time() == chrono::NaiveTime::MIN {
+        instant.format("%Y-%m-%d").to_string()
+    } else {
+        instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    }
+}
+
+/// Derives a bounded file slug from a title.
+fn slug_from_title(title: &str) -> String {
+    let mut slug = String::new();
+    for character in title.chars() {
+        if character.is_alphanumeric() {
+            slug.extend(character.to_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("untitled");
+    }
+    slug
+}
+
+/// Quotes a scalar when it could otherwise be misread as another YAML type.
+fn quote_yaml(value: &str) -> String {
+    let needs_quotes = value.parse::<f64>().is_ok()
+        || matches!(value, "true" | "false" | "null" | "~")
+        || value.starts_with(['[', '{', '\'', '"', '#', ' '])
+        || value.ends_with(' ');
+    if needs_quotes {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+/// Finds a non-existing `directory/slug(–N).md` path, bounded attempts.
+fn unique_relative(provider: &MarkdownVaultProvider, directory: &str, slug: &str) -> String {
+    for index in 1..100 {
+        let candidate = if index == 1 {
+            format!("{directory}/{slug}.md")
+        } else {
+            format!("{directory}/{slug}-{index}.md")
+        };
+        if provider
+            .confine(&candidate, ProviderResourceKind::Knowledge)
+            .is_ok()
+            && !provider.canonical_root().join(&candidate).exists()
+        {
+            return candidate;
+        }
+    }
+    format!("{directory}/{slug}-unnumbered.md")
+}
+
+/// Writes bytes through a same-filesystem temporary file plus atomic rename,
+/// so faults cannot leave a partially written authoritative file.
+fn write_atomic(confined: &ConfinedPath, bytes: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let target = confined.absolute();
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = target.with_extension(format!(
+        "{}.tmp-{}",
+        target
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("md"),
+        uuid::Uuid::now_v7().simple()
+    ));
+    {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    match std::fs::rename(&temporary, target) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
     }
 }

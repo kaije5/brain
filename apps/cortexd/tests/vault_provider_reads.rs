@@ -126,8 +126,9 @@ async fn knowledge_get_for_a_missing_resource_is_typed_not_found() {
         cortex_domain::ProviderResourceId::new("path:notes/ghost.md").expect("valid id"),
         ProviderResourceKind::Knowledge,
     );
+    // Missing files are a normal read outcome, not an error.
     let result = KnowledgeProvider::get(&provider, &resource).await;
-    assert!(matches!(result, Err(ProviderError::NotFound { .. })));
+    assert_eq!(result, Ok(None));
 }
 
 #[tokio::test]
@@ -219,19 +220,38 @@ async fn task_search_filters_by_text() {
 }
 
 #[tokio::test]
-async fn mutations_are_explicitly_unavailable_until_scrum_108() {
-    let (_temp, workspace_id, provider) = seeded_vault();
-    let create = cortex_application::KnowledgeCreate::new(
-        workspace_id,
-        cortex_domain::OperationId::new(),
-        "t",
-        "b",
+async fn atomic_create_writes_a_parseable_document_in_a_dedicated_directory() {
+    let directory = TempDir::new().expect("temp dir");
+    let workspace_id = WorkspaceId::new();
+    let provider = provider_for(directory.path(), workspace_id);
+    let created = KnowledgeProvider::create(
+        &provider,
+        cortex_application::KnowledgeCreate::new(
+            workspace_id,
+            cortex_domain::OperationId::new(),
+            "Atlas Plan",
+            "created body",
+        )
+        .expect("valid create"),
     )
-    .expect("valid create");
-    assert!(matches!(
-        KnowledgeProvider::create(&provider, create).await,
-        Err(ProviderError::Unavailable)
-    ));
+    .await
+    .expect("create succeeds");
+    let resource = created.resource();
+    assert!(
+        resource
+            .resource_id()
+            .as_str()
+            .starts_with("path:Documents/")
+    );
+
+    let read = KnowledgeProvider::get(&provider, resource)
+        .await
+        .expect("get succeeds")
+        .expect("created document found");
+    assert_eq!(read.item().title(), "Atlas Plan");
+    assert_eq!(read.item().body(), "
+created body
+");
 }
 
 #[test]
