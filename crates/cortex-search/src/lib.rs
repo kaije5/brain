@@ -1,12 +1,17 @@
 #![forbid(unsafe_code)]
 
 mod embedding;
+mod index;
 mod rank;
 mod service;
 mod vector;
 
 pub use cortex_application::{EntityKind, IndexedVector, SearchCandidate, SearchIndex};
 pub use embedding::{Embedding, EmbeddingProvider};
+pub use index::{
+    ChunkProvenance, ChunkReference, DerivedVaultIndex, DocumentIndexEntry, IndexedChunk,
+    MAX_CHUNK_CHARS, MAX_CHUNKS_PER_DOCUMENT, chunk_body,
+};
 pub use rank::{RankedEntity, reciprocal_rank_fusion};
 pub use service::{HybridSearchService, SearchHit, SearchRequest};
 pub use vector::{SemanticCandidate, VectorRecord, cosine_candidates};
