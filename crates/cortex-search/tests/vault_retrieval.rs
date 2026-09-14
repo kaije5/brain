@@ -123,7 +123,10 @@ fn lexical_hits_carry_chunk_references_and_bounded_snippets() {
     assert_eq!(hit.reference.resource.resource_id().as_str(), "atlas");
     assert!(hit.snippet.len() <= 240);
     assert_eq!(hit.lexical_rank, None, "ranks are assigned by fusion only");
-    assert!(hit.fused_score.abs() < f64::EPSILON, "pre-fusion score is zero");
+    assert!(
+        hit.fused_score.abs() < f64::EPSILON,
+        "pre-fusion score is zero"
+    );
 }
 
 #[test]
