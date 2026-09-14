@@ -220,6 +220,18 @@ impl DerivedVaultIndex {
         self.documents.keys()
     }
 
+    /// Iterator over every indexed chunk.
+    pub fn chunks(&self) -> impl Iterator<Item = (&ChunkReference, &IndexedChunk)> {
+        self.chunks.iter()
+    }
+
+    /// Iterator over every indexed document entry with its resource.
+    pub fn document_entries(
+        &self,
+    ) -> impl Iterator<Item = (&ProviderResourceRef, &DocumentIndexEntry)> {
+        self.documents.iter()
+    }
+
     #[must_use]
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()

@@ -4,6 +4,7 @@ mod embedding;
 mod index;
 mod rank;
 mod service;
+mod vault_retrieval;
 mod vector;
 
 pub use cortex_application::{EntityKind, IndexedVector, SearchCandidate, SearchIndex};
@@ -14,4 +15,5 @@ pub use index::{
 };
 pub use rank::{RankedEntity, reciprocal_rank_fusion};
 pub use service::{HybridSearchService, SearchHit, SearchRequest};
+pub use vault_retrieval::{RetrievalOutcome, VaultHit, hybrid, index_document, lexical, semantic};
 pub use vector::{SemanticCandidate, VectorRecord, cosine_candidates};

@@ -723,6 +723,8 @@ dependencies = [
  "cortex-application",
  "cortex-domain",
  "cortex-storage",
+ "cortex-vault",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "uuid",
