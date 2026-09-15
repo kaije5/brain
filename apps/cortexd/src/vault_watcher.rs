@@ -9,7 +9,7 @@
 //! mechanism attaches to [`EventQueue::push`] later; the reconciliation scan
 //! that recovers missed events is SCRUM-114.
 
-use cortex_domain::{ProviderResourceId, ProviderResourceKind};
+use cortex_domain::{ProviderResourceId, ProviderResourceKind, ProviderResourceRef};
 use cortex_search::{ChunkProvenance, DerivedVaultIndex};
 use sha2::Sha256;
 use std::{collections::BTreeSet, io::Read, num::NonZeroU64};
@@ -175,23 +175,46 @@ pub struct ReconciliationReport {
     pub skipped: usize,
 }
 
+/// Payload-free reconciliation failures. Existing derived state is retained
+/// whenever a complete, unambiguous authoritative scan cannot be proven.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ReconciliationError {
+    #[error("vault scan incomplete")]
+    ScanIncomplete,
+    #[error("duplicate vault resource identity")]
+    DuplicateResource,
+}
+
+struct ScanSnapshot {
+    candidates: Vec<(String, ProviderResourceRef)>,
+    live: BTreeSet<ProviderResourceRef>,
+    skipped: usize,
+}
+
 /// Scans the authoritative vault and converges provider-owned derived state.
 /// Live paths are applied in deterministic lexical order; indexed resources
 /// absent from the scan are removed. State owned by another workspace or
 /// provider is left untouched.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`ReconciliationError::ScanIncomplete`] if the vault cannot be
+/// read completely, or [`ReconciliationError::DuplicateResource`] if two
+/// paths claim the same stable resource identity. The index is not mutated
+/// unless preflight succeeds.
 pub fn reconcile_vault(
     provider: &MarkdownVaultProvider,
     index: &mut DerivedVaultIndex,
-) -> ReconciliationReport {
+) -> Result<ReconciliationReport, ReconciliationError> {
     let mut report = ReconciliationReport::default();
-    let mut live = BTreeSet::new();
-    for relative in provider.indexable_paths() {
-        let Some(resource) = resource_for_relative(provider, &relative) else {
-            report.skipped += 1;
-            continue;
-        };
-        live.insert(resource);
+    let ScanSnapshot {
+        candidates,
+        live,
+        skipped,
+    } = scan_indexable_resources(provider)?;
+    report.skipped = skipped;
+
+    for (relative, _) in candidates {
         let outcome = apply_event(
             provider,
             index,
@@ -225,7 +248,7 @@ pub fn reconcile_vault(
             report.removed += 1;
         }
     }
-    report
+    Ok(report)
 }
 
 /// Deterministic periodic reconciliation coordinator. The caller owns the
@@ -248,36 +271,45 @@ impl VaultReconciler {
 
     /// Reconciles immediately on the first call and thereafter only when the
     /// configured interval has elapsed from the last completed invocation.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ReconciliationError`] when a due reconciliation cannot
+    /// prove a complete, unambiguous vault snapshot. A failed run does not
+    /// advance the periodic watermark.
     pub fn reconcile_if_due(
         &mut self,
         provider: &MarkdownVaultProvider,
         index: &mut DerivedVaultIndex,
         now_millis: u64,
-    ) -> Option<ReconciliationReport> {
+    ) -> Result<Option<ReconciliationReport>, ReconciliationError> {
         let due = self.last_run_at.is_none_or(|last_run_at| {
             now_millis.saturating_sub(last_run_at) >= self.interval_millis.get()
         });
         if !due {
-            return None;
+            return Ok(None);
         }
-        let report = reconcile_vault(provider, index);
+        let report = reconcile_vault(provider, index)?;
         self.last_run_at = Some(now_millis);
-        Some(report)
+        Ok(Some(report))
     }
 }
 
 /// Reconstructs all derived vault state from authoritative Markdown and
 /// replaces the caller-owned index only after the complete scan finishes.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns a [`ReconciliationError`] if the replacement cannot be built from
+/// a complete, unambiguous vault snapshot. The existing index is retained.
 pub fn rebuild_vault(
     provider: &MarkdownVaultProvider,
     index: &mut DerivedVaultIndex,
-) -> ReconciliationReport {
+) -> Result<ReconciliationReport, ReconciliationError> {
     let mut replacement = DerivedVaultIndex::new();
-    let report = reconcile_vault(provider, &mut replacement);
+    let report = reconcile_vault(provider, &mut replacement)?;
     *index = replacement;
-    report
+    Ok(report)
 }
 
 /// Applies one coalesced event to the derived index idempotently: upserts
@@ -326,10 +358,7 @@ fn apply_index_current(
     let Ok(text) = std::str::from_utf8(&bytes) else {
         return AppliedEvent::Skipped;
     };
-    if cortex_vault::parse_document(text).is_err() {
-        return AppliedEvent::Skipped;
-    }
-    let Some(resource) = resource_for_relative(provider, confined.relative()) else {
+    let Some(resource) = resource_from_text(provider, confined.relative(), text) else {
         return AppliedEvent::Skipped;
     };
     let provenance = ChunkProvenance::new(content_hash_of(&bytes), revision_of(&bytes));
@@ -392,6 +421,9 @@ fn apply_removed(
     let Ok(confined) = provider.confine(relative, kind) else {
         return AppliedEvent::Skipped;
     };
+    if kind == ProviderResourceKind::Task {
+        return remove_stale_task_resources(provider, index);
+    }
     let Some(resource) = resource_for_relative(provider, confined.relative()) else {
         return AppliedEvent::Skipped;
     };
@@ -419,6 +451,32 @@ fn document_resource_id(relative: &str) -> Option<ProviderResourceId> {
     ProviderResourceId::new(format!("path:{relative}")).ok()
 }
 
+fn remove_stale_task_resources(
+    provider: &MarkdownVaultProvider,
+    index: &mut DerivedVaultIndex,
+) -> AppliedEvent {
+    let Ok(ScanSnapshot { live, .. }) = scan_indexable_resources(provider) else {
+        return AppliedEvent::Skipped;
+    };
+    let stale: Vec<_> = index
+        .documents()
+        .filter(|resource| {
+            resource.workspace_id() == provider.workspace_id()
+                && resource.provider_id() == provider.provider_reference_id()
+                && resource.kind() == ProviderResourceKind::Task
+                && !live.contains(*resource)
+        })
+        .cloned()
+        .collect();
+    if stale.is_empty() {
+        return AppliedEvent::Unchanged;
+    }
+    for resource in stale {
+        index.remove_resource(&resource);
+    }
+    AppliedEvent::Removed
+}
+
 fn resource_for_relative(
     provider: &MarkdownVaultProvider,
     relative: &str,
@@ -428,6 +486,75 @@ fn resource_for_relative(
         provider.provider_reference_id().clone(),
         document_resource_id(relative)?,
         kind_for(relative),
+    ))
+}
+
+fn read_indexable_resource(
+    provider: &MarkdownVaultProvider,
+    relative: &str,
+) -> Result<Option<ProviderResourceRef>, ReconciliationError> {
+    let kind = kind_for(relative);
+    let confined = provider
+        .confine(relative, kind)
+        .map_err(|_| ReconciliationError::ScanIncomplete)?;
+    let bytes = match read_bounded(confined.absolute()) {
+        Ok(BoundedRead::Bytes(bytes)) => bytes,
+        Ok(BoundedRead::Oversized) => return Ok(None),
+        Ok(BoundedRead::Missing) | Err(_) => return Err(ReconciliationError::ScanIncomplete),
+    };
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(None);
+    };
+    Ok(resource_from_text(provider, confined.relative(), text))
+}
+
+fn scan_indexable_resources(
+    provider: &MarkdownVaultProvider,
+) -> Result<ScanSnapshot, ReconciliationError> {
+    let mut live = BTreeSet::new();
+    let mut candidates = Vec::new();
+    let mut skipped = 0;
+    let paths = provider
+        .indexable_paths()
+        .map_err(|_| ReconciliationError::ScanIncomplete)?;
+    for relative in paths {
+        let Some(resource) = read_indexable_resource(provider, &relative)? else {
+            skipped += 1;
+            continue;
+        };
+        if !live.insert(resource.clone()) {
+            return Err(ReconciliationError::DuplicateResource);
+        }
+        candidates.push((relative, resource));
+    }
+    Ok(ScanSnapshot {
+        candidates,
+        live,
+        skipped,
+    })
+}
+
+fn resource_from_text(
+    provider: &MarkdownVaultProvider,
+    relative: &str,
+    text: &str,
+) -> Option<ProviderResourceRef> {
+    let kind = kind_for(relative);
+    let parsed = cortex_vault::parse_document(text).ok()?;
+    let resource_id = if kind == ProviderResourceKind::Task {
+        let stem = std::path::Path::new(relative)
+            .file_stem()
+            .and_then(|stem| stem.to_str())?;
+        let task = cortex_vault::parse_task(&parsed, stem).ok()?;
+        ProviderResourceId::new(task.brain_id()).ok()?
+    } else {
+        document_resource_id(relative)?
+    };
+    Some(ProviderResourceRef::new(
+        provider.workspace_id(),
+        provider.provider_reference_id().clone(),
+        resource_id,
+        kind,
     ))
 }
 

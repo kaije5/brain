@@ -65,6 +65,14 @@ pub enum VaultPathError {
     TargetExists,
 }
 
+/// Payload-free failure reported when a vault scan cannot prove that its
+/// result is complete. Callers must retain existing derived state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum VaultScanError {
+    #[error("vault scan incomplete")]
+    Incomplete,
+}
+
 impl From<VaultConfigError> for VaultPathError {
     fn from(error: VaultConfigError) -> Self {
         match error {
@@ -338,17 +346,65 @@ impl MarkdownVaultProvider {
     /// Enumerates every confined Markdown path eligible for derived indexing.
     /// Paths are normalized, deduplicated, and returned in lexical order so
     /// reconciliation and rebuilds are deterministic across filesystems.
-    #[must_use]
-    pub fn indexable_paths(&self) -> Vec<String> {
-        let mut paths = self.enumerate_paths(ProviderResourceKind::Knowledge, MAX_ENUMERATED_LIMIT);
-        paths.extend(
-            self.enumerate_paths(ProviderResourceKind::Task, MAX_ENUMERATED_LIMIT)
-                .into_iter()
-                .filter(|relative| relative.starts_with("Tasks/")),
-        );
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VaultScanError::Incomplete`] when traversal cannot prove a
+    /// complete bounded snapshot of the vault.
+    pub fn indexable_paths(&self) -> Result<Vec<String>, VaultScanError> {
+        let mut paths = Vec::new();
+        let mut stack = vec![self.canonical_root.clone()];
+        let mut visited = 0_usize;
+        while let Some(directory) = stack.pop() {
+            let entries = std::fs::read_dir(&directory).map_err(|_| VaultScanError::Incomplete)?;
+            let mut entries: Vec<_> = entries
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| VaultScanError::Incomplete)?;
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
+                visited += 1;
+                if visited > MAX_ENUMERATED_FILES {
+                    return Err(VaultScanError::Incomplete);
+                }
+                let path = entry.path();
+                let relative = path
+                    .strip_prefix(&self.canonical_root)
+                    .map_err(|_| VaultScanError::Incomplete)?;
+                let relative = relative.to_str().ok_or(VaultScanError::Incomplete)?;
+                let normalized = relative.replace('\\', "/");
+                if self.excluded(&normalized) {
+                    continue;
+                }
+                let file_type = entry.file_type().map_err(|_| VaultScanError::Incomplete)?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !file_type.is_file()
+                    || path.extension().is_none_or(|extension| extension != "md")
+                    || path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.contains(".tmp-"))
+                {
+                    continue;
+                }
+                let kind = if normalized.starts_with("Tasks/") {
+                    ProviderResourceKind::Task
+                } else {
+                    ProviderResourceKind::Knowledge
+                };
+                if self.confine(&normalized, kind).is_ok() {
+                    paths.push(normalized);
+                }
+            }
+        }
         paths.sort();
         paths.dedup();
-        paths
+        Ok(paths)
     }
 
     /// Reads a confined file and observes its revision and content hash in

@@ -4,7 +4,7 @@
 
 **Goal:** Recover missed vault filesystem events through deterministic periodic reconciliation and provide an explicit full rebuild that reconstructs equivalent searchable derived state from authoritative Markdown.
 
-**Architecture:** Extend the existing pure vault-watcher layer with a `VaultReconciler` whose clock input is caller-supplied milliseconds. A provider-owned deterministic scan returns confined Markdown paths in stable order; reconciliation feeds each live path through the existing bounded/hash-gated event application and removes indexed resources no longer present, while full rebuild constructs a replacement `DerivedVaultIndex` off to the side before swapping it into use.
+**Architecture:** Extend the existing pure vault-watcher layer with a `VaultReconciler` whose clock input is caller-supplied milliseconds. A provider-owned deterministic scan returns confined Markdown paths in stable order; reconciliation validates the complete scan and stable task identities before mutation, feeds each live path through the existing bounded/hash-gated event application, and removes indexed resources no longer present. Full rebuild constructs a replacement `DerivedVaultIndex` off to the side and swaps it into use only after a complete, unambiguous scan.
 
 **Tech Stack:** Rust, `cortexd`, `cortex-search`, `cortex-vault`, `tempfile`, Cargo Nextest
 
@@ -31,7 +31,7 @@
 
 **Interfaces:**
 - Consumes: `MarkdownVaultProvider::enumerate_paths`, `VaultProviderConfig::allows_kind`, and the existing confinement/exclusion rules.
-- Produces: `MarkdownVaultProvider::indexable_paths(&self) -> Vec<String>`, returning normalized `.md` paths in lexical order with task paths included once and excluded/unconfined paths omitted.
+- Produces: `MarkdownVaultProvider::indexable_paths(&self) -> Result<Vec<String>, VaultScanError>`, returning normalized `.md` paths in lexical order with task paths included once and excluded/unconfined paths omitted, or an incomplete-scan error without a partial result.
 
 - [ ] **Step 1: Write the failing deterministic-scan test**
 
@@ -58,7 +58,7 @@
 
 **Interfaces:**
 - Consumes: `MarkdownVaultProvider::indexable_paths`, `apply_event`, and `DerivedVaultIndex::{documents,remove_resource}`.
-- Produces: `ReconciliationReport { indexed, unchanged, removed, skipped }` and `reconcile_vault(provider: &MarkdownVaultProvider, index: &mut DerivedVaultIndex) -> ReconciliationReport`.
+- Produces: `ReconciliationReport { indexed, unchanged, removed, skipped }` and `reconcile_vault(provider: &MarkdownVaultProvider, index: &mut DerivedVaultIndex) -> Result<ReconciliationReport, ReconciliationError>`.
 
 - [ ] **Step 1: Write failing convergence tests**
 
@@ -70,7 +70,7 @@
 
 - [ ] **Step 3: Implement minimal reconciliation**
 
-  Build the live owned-resource set while applying a synthetic `Updated` event to each sorted path. Then snapshot only indexed resources owned by the provider's workspace/provider identity and remove those absent from the live set. Count outcomes in the report; do not remove foreign derived state.
+  Preflight the complete live owned-resource set, validating task schema and deriving task identity from `brain_id`; reject duplicate identities or incomplete reads before mutation. Then apply a synthetic `Updated` event to each sorted path and remove provider-owned resources absent from the live set. Count outcomes in the report; do not remove foreign derived state.
 
 - [ ] **Step 4: Run the reconciliation tests and verify GREEN**
 
@@ -85,7 +85,7 @@
 
 **Interfaces:**
 - Consumes: `reconcile_vault` and `DerivedVaultIndex` ownership.
-- Produces: `VaultReconciler::new(interval_millis: NonZeroU64)`, `VaultReconciler::reconcile_if_due(provider, index, now_millis) -> Option<ReconciliationReport>`, and `rebuild_vault(provider, index) -> ReconciliationReport`.
+- Produces: `VaultReconciler::new(interval_millis: NonZeroU64)`, fallible `VaultReconciler::reconcile_if_due`, and fallible `rebuild_vault` APIs that preserve the existing index when the authoritative scan is incomplete or ambiguous.
 
 - [ ] **Step 1: Write failing schedule and rebuild tests**
 
