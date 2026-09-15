@@ -22,7 +22,10 @@ use rmcp::{
         CallToolRequestParams, CallToolResult, ListToolsResult, ServerCapabilities, ServerInfo,
         Tool, ToolAnnotations, object,
     },
-    transport::{StreamableHttpServerConfig, StreamableHttpService},
+    transport::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        streamable_http_server::session::never::NeverSessionManager,
+    },
 };
 use serde_json::{Value, json};
 use tokio::time::timeout;
@@ -172,16 +175,15 @@ impl HttpSecurityConfig {
 }
 
 /// Produces the RMCP Streamable HTTP configuration used by the Task 12 loopback server.
-/// Version 0.16 delegates host/origin/body checks to the surrounding HTTP layer, while RMCP
-/// owns session lifecycle and cancellation.
+/// The surrounding HTTP layer owns host, origin, and body checks, while RMCP
+/// owns protocol parsing and cancellation.
 #[must_use]
 fn rmcp_streamable_http_config(config: &HttpSecurityConfig) -> StreamableHttpServerConfig {
-    StreamableHttpServerConfig {
-        cancellation_token: config.cancellation_token.clone(),
-        sse_keep_alive: None,
-        sse_retry: None,
-        stateful_mode: false,
-    }
+    StreamableHttpServerConfig::default()
+        .with_cancellation_token(config.cancellation_token.clone())
+        .with_sse_keep_alive(None)
+        .with_sse_retry(None)
+        .with_stateful_mode(false)
 }
 
 /// The only public Streamable HTTP construction path. It validates the HTTP authority and origin,
@@ -192,7 +194,7 @@ pub fn streamable_http_service(security: &HttpSecurityConfig) -> SecureStreamabl
     SecureStreamableHttpService {
         inner: StreamableHttpService::new(
             || Ok(McpServer::new()),
-            std::sync::Arc::default(),
+            std::sync::Arc::new(NeverSessionManager::default()),
             configuration,
         ),
         security: security.clone(),
@@ -202,7 +204,7 @@ pub fn streamable_http_service(security: &HttpSecurityConfig) -> SecureStreamabl
 /// A transport-enforcing wrapper around RMCP's stateless Streamable HTTP service.
 #[derive(Clone)]
 pub struct SecureStreamableHttpService {
-    inner: StreamableHttpService<McpServer>,
+    inner: StreamableHttpService<McpServer, NeverSessionManager>,
     security: HttpSecurityConfig,
 }
 
@@ -330,11 +332,8 @@ fn transport_error(status: StatusCode, code: &'static str) -> Response<BoxBody<B
 
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some("Cortex v0.1 local knowledge tools.".to_owned()),
-            ..ServerInfo::default()
-        }
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Cortex v0.1 local knowledge tools.")
     }
 
     async fn list_tools(
