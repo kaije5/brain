@@ -140,6 +140,12 @@ impl MarkdownVaultProvider {
         &self.config
     }
 
+    /// The provider identity every constructed reference carries.
+    #[must_use]
+    pub const fn provider_reference_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
     /// The workspace every constructed resource reference is scoped to.
     #[must_use]
     pub const fn workspace_id(&self) -> WorkspaceId {

@@ -8,6 +8,7 @@ mod platform_secret_store;
 mod settings;
 mod vault;
 mod vault_provider;
+mod vault_watcher;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod windows_security;
@@ -31,3 +32,6 @@ pub use vault::{
     VaultProviderMode, VaultScope,
 };
 pub use vault_provider::{ConfinedPath, MarkdownVaultProvider, VaultPathError};
+pub use vault_watcher::{
+    AppliedEvent, CoalescedEvent, DEFAULT_DEBOUNCE_MILLIS, EventQueue, VaultEvent, apply_event,
+};
