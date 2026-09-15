@@ -1,4 +1,14 @@
 .worktrees/
 .superpowers/
-target/
+
+# Rust and Cargo build outputs
+/target/
+**/target/
+
+# Coverage and mutation-testing reports
 lcov.info
+*.profraw
+mutants.out/
+
+# Local workspace tooling
+.zcode/
