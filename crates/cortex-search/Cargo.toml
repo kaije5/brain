@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 cortex-application = { path = "../cortex-application" }
 cortex-domain = { path = "../cortex-domain" }
+cortex-vault = { path = "../cortex-vault" }
+sha2 = "0.10"
 tokio = { version = "1.47", features = ["time"] }
 
 [dev-dependencies]
@@ -18,3 +20,4 @@ cortex-storage = { path = "../cortex-storage" }
 tempfile = "3.23"
 tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1.24", features = ["v7"] }
+sha2 = "0.10"
