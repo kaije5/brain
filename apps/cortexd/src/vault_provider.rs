@@ -291,7 +291,9 @@ impl MarkdownVaultProvider {
             let Ok(entries) = std::fs::read_dir(&directory) else {
                 continue;
             };
-            for entry in entries.flatten() {
+            let mut entries: Vec<_> = entries.flatten().collect();
+            entries.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in entries {
                 visited += 1;
                 if visited > MAX_ENUMERATED_FILES || relatives.len() >= limit.get() {
                     return relatives;
@@ -331,6 +333,22 @@ impl MarkdownVaultProvider {
             }
         }
         relatives
+    }
+
+    /// Enumerates every confined Markdown path eligible for derived indexing.
+    /// Paths are normalized, deduplicated, and returned in lexical order so
+    /// reconciliation and rebuilds are deterministic across filesystems.
+    #[must_use]
+    pub fn indexable_paths(&self) -> Vec<String> {
+        let mut paths = self.enumerate_paths(ProviderResourceKind::Knowledge, MAX_ENUMERATED_LIMIT);
+        paths.extend(
+            self.enumerate_paths(ProviderResourceKind::Task, MAX_ENUMERATED_LIMIT)
+                .into_iter()
+                .filter(|relative| relative.starts_with("Tasks/")),
+        );
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     /// Reads a confined file and observes its revision and content hash in

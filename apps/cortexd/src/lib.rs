@@ -33,5 +33,6 @@ pub use vault::{
 };
 pub use vault_provider::{ConfinedPath, MarkdownVaultProvider, VaultPathError};
 pub use vault_watcher::{
-    AppliedEvent, CoalescedEvent, DEFAULT_DEBOUNCE_MILLIS, EventQueue, VaultEvent, apply_event,
+    AppliedEvent, CoalescedEvent, DEFAULT_DEBOUNCE_MILLIS, EventQueue, ReconciliationReport,
+    VaultEvent, VaultReconciler, apply_event, rebuild_vault, reconcile_vault,
 };

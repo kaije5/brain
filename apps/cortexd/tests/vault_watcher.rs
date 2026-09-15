@@ -1,13 +1,17 @@
 //! Debounced idempotent vault watching (SCRUM-113).
 
 use std::collections::BTreeSet;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 
-use cortex_domain::WorkspaceId;
-use cortex_search::DerivedVaultIndex;
+use cortex_domain::{
+    ContentHash, ObservedRevision, ProviderId, ProviderResourceId, ProviderResourceKind,
+    ProviderResourceRef, WorkspaceId,
+};
+use cortex_search::{ChunkProvenance, DerivedVaultIndex};
 use cortexd::{
-    AppliedEvent, CoalescedEvent, EventQueue, MarkdownVaultProvider, VaultEvent,
-    VaultProviderConfig, VaultProviderMode, VaultScope, apply_event,
+    AppliedEvent, CoalescedEvent, EventQueue, MarkdownVaultProvider, VaultEvent, VaultExclusion,
+    VaultProviderConfig, VaultProviderMode, VaultReconciler, VaultScope, apply_event,
+    rebuild_vault, reconcile_vault,
 };
 use tempfile::TempDir;
 
@@ -28,6 +32,267 @@ fn all_scopes() -> BTreeSet<VaultScope> {
     set.insert(VaultScope::new("knowledge").expect("valid"));
     set.insert(VaultScope::new("task").expect("valid"));
     set
+}
+
+#[test]
+fn deterministic_scan_lists_each_confined_markdown_path_once_in_lexical_order() {
+    let directory = TempDir::new().expect("temp dir");
+    std::fs::create_dir_all(directory.path().join("Tasks")).expect("tasks directory");
+    std::fs::create_dir_all(directory.path().join("Private")).expect("private directory");
+    std::fs::write(directory.path().join("z.md"), "zeta\n").expect("z note");
+    std::fs::write(directory.path().join("a.md"), "alpha\n").expect("a note");
+    std::fs::write(
+        directory.path().join("Tasks/01926c8f-88f9-7d33-9a1b-2c7d33bd0a12.md"),
+        "---\ntype: task\nbrain_id: 01926c8f-88f9-7d33-9a1b-2c7d33bd0a12\nstatus: todo\npriority: high\n---\n\nTask\n",
+    )
+    .expect("task");
+    std::fs::write(directory.path().join("ignored.txt"), "ignored\n").expect("text file");
+    std::fs::write(directory.path().join("Private/secret.md"), "secret\n").expect("excluded note");
+
+    let mut exclusions = BTreeSet::new();
+    exclusions.insert(VaultExclusion::new("Private").expect("valid exclusion"));
+    let config = VaultProviderConfig::new(
+        "markdown-vault",
+        directory.path().to_path_buf(),
+        VaultProviderMode::ReadWrite,
+        all_scopes(),
+        exclusions,
+    )
+    .expect("valid config");
+    let provider = MarkdownVaultProvider::open(config, WorkspaceId::new()).expect("vault opens");
+
+    assert_eq!(
+        provider.indexable_paths(),
+        vec![
+            "Tasks/01926c8f-88f9-7d33-9a1b-2c7d33bd0a12.md".to_owned(),
+            "a.md".to_owned(),
+            "z.md".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn reconciliation_recovers_missed_additions_updates_and_unchanged_files() {
+    let directory = TempDir::new().expect("temp dir");
+    let provider = provider_for(directory.path(), WorkspaceId::new());
+    let mut index = DerivedVaultIndex::new();
+    std::fs::write(directory.path().join("note.md"), "first token\n").expect("seed note");
+
+    let added = reconcile_vault(&provider, &mut index);
+    assert_eq!(
+        (added.indexed, added.unchanged, added.removed, added.skipped),
+        (1, 0, 0, 0)
+    );
+    assert_eq!(index.document_count(), 1);
+
+    let unchanged = reconcile_vault(&provider, &mut index);
+    assert_eq!(
+        (
+            unchanged.indexed,
+            unchanged.unchanged,
+            unchanged.removed,
+            unchanged.skipped,
+        ),
+        (0, 1, 0, 0)
+    );
+
+    std::fs::write(directory.path().join("note.md"), "second token\n").expect("update note");
+    let updated = reconcile_vault(&provider, &mut index);
+    assert_eq!(
+        (
+            updated.indexed,
+            updated.unchanged,
+            updated.removed,
+            updated.skipped
+        ),
+        (1, 0, 0, 0)
+    );
+    assert!(
+        cortex_search::lexical(
+            &index,
+            "first token",
+            NonZeroUsize::new(10).expect("non-zero")
+        )
+        .expect("search")
+        .is_empty()
+    );
+    assert_eq!(
+        cortex_search::lexical(
+            &index,
+            "second token",
+            NonZeroUsize::new(10).expect("non-zero")
+        )
+        .expect("search")
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn reconciliation_recovers_missed_delete_and_move() {
+    let directory = TempDir::new().expect("temp dir");
+    let provider = provider_for(directory.path(), WorkspaceId::new());
+    let mut index = DerivedVaultIndex::new();
+    std::fs::write(directory.path().join("old.md"), "move token\n").expect("seed note");
+    let _ = reconcile_vault(&provider, &mut index);
+
+    std::fs::rename(
+        directory.path().join("old.md"),
+        directory.path().join("new.md"),
+    )
+    .expect("move note without watcher event");
+    let moved = reconcile_vault(&provider, &mut index);
+
+    assert_eq!(
+        (moved.indexed, moved.unchanged, moved.removed, moved.skipped),
+        (1, 0, 1, 0)
+    );
+    let resources: Vec<&str> = index
+        .documents()
+        .map(|resource| resource.resource_id().as_str())
+        .collect();
+    assert_eq!(resources, vec!["path:new.md"]);
+
+    std::fs::remove_file(directory.path().join("new.md")).expect("delete note");
+    let deleted = reconcile_vault(&provider, &mut index);
+    assert_eq!(
+        (
+            deleted.indexed,
+            deleted.unchanged,
+            deleted.removed,
+            deleted.skipped
+        ),
+        (0, 0, 1, 0)
+    );
+    assert_eq!(index.document_count(), 0);
+}
+
+#[test]
+fn reconciliation_preserves_unrelated_provider_state() {
+    let directory = TempDir::new().expect("temp dir");
+    let provider = provider_for(directory.path(), WorkspaceId::new());
+    let foreign = ProviderResourceRef::new(
+        WorkspaceId::new(),
+        ProviderId::new("other-provider").expect("provider id"),
+        ProviderResourceId::new("foreign-document").expect("resource id"),
+        ProviderResourceKind::Knowledge,
+    );
+    let provenance = ChunkProvenance::new(
+        ContentHash::new([7; 32]),
+        ObservedRevision::new("rev-foreign").expect("revision"),
+    );
+    let mut index = DerivedVaultIndex::new();
+    cortex_search::index_document(&mut index, &foreign, "foreign token\n", &provenance)
+        .expect("index foreign resource");
+
+    let report = reconcile_vault(&provider, &mut index);
+
+    assert_eq!(
+        (
+            report.indexed,
+            report.unchanged,
+            report.removed,
+            report.skipped
+        ),
+        (0, 0, 0, 0)
+    );
+    assert!(index.document(&foreign).is_some());
+}
+
+#[test]
+fn periodic_reconciliation_runs_immediately_then_only_when_due() {
+    let directory = TempDir::new().expect("temp dir");
+    let provider = provider_for(directory.path(), WorkspaceId::new());
+    std::fs::write(directory.path().join("note.md"), "periodic token\n").expect("seed note");
+    let mut index = DerivedVaultIndex::new();
+    let mut reconciler = VaultReconciler::new(NonZeroU64::new(1_000).expect("non-zero"));
+
+    let first = reconciler
+        .reconcile_if_due(&provider, &mut index, 100)
+        .expect("first call runs");
+    assert_eq!((first.indexed, first.unchanged), (1, 0));
+    assert!(
+        reconciler
+            .reconcile_if_due(&provider, &mut index, 1_099)
+            .is_none()
+    );
+    let boundary = reconciler
+        .reconcile_if_due(&provider, &mut index, 1_100)
+        .expect("interval boundary runs");
+    assert_eq!((boundary.indexed, boundary.unchanged), (0, 1));
+}
+
+#[test]
+fn rebuild_replaces_all_derived_state_with_deterministic_vault_state() {
+    let directory = TempDir::new().expect("temp dir");
+    let workspace_id = WorkspaceId::new();
+    let provider = provider_for(directory.path(), workspace_id);
+    std::fs::write(directory.path().join("b.md"), "bravo token\n").expect("b note");
+    std::fs::write(directory.path().join("a.md"), "alpha token\n").expect("a note");
+
+    let mut expected = DerivedVaultIndex::new();
+    let expected_report = rebuild_vault(&provider, &mut expected);
+    assert_eq!(
+        (
+            expected_report.indexed,
+            expected_report.unchanged,
+            expected_report.removed,
+            expected_report.skipped,
+        ),
+        (2, 0, 0, 0)
+    );
+
+    let mut actual = DerivedVaultIndex::new();
+    std::fs::write(directory.path().join("stale.md"), "stale token\n").expect("stale note");
+    let _ = reconcile_vault(&provider, &mut actual);
+    std::fs::remove_file(directory.path().join("stale.md")).expect("remove stale authority");
+    let foreign = ProviderResourceRef::new(
+        WorkspaceId::new(),
+        ProviderId::new("other-provider").expect("provider id"),
+        ProviderResourceId::new("foreign-document").expect("resource id"),
+        ProviderResourceKind::Knowledge,
+    );
+    cortex_search::index_document(
+        &mut actual,
+        &foreign,
+        "foreign token\n",
+        &ChunkProvenance::new(
+            ContentHash::new([9; 32]),
+            ObservedRevision::new("rev-foreign").expect("revision"),
+        ),
+    )
+    .expect("index foreign resource");
+
+    let report = rebuild_vault(&provider, &mut actual);
+
+    assert_eq!(
+        (
+            report.indexed,
+            report.unchanged,
+            report.removed,
+            report.skipped
+        ),
+        (2, 0, 0, 0)
+    );
+    let expected_documents: Vec<_> = expected
+        .document_entries()
+        .map(|(resource, entry)| (resource.clone(), entry.clone()))
+        .collect();
+    let actual_documents: Vec<_> = actual
+        .document_entries()
+        .map(|(resource, entry)| (resource.clone(), entry.clone()))
+        .collect();
+    assert_eq!(actual_documents, expected_documents);
+    let expected_chunks: Vec<_> = expected
+        .chunks()
+        .map(|(reference, chunk)| (reference.clone(), chunk.clone()))
+        .collect();
+    let actual_chunks: Vec<_> = actual
+        .chunks()
+        .map(|(reference, chunk)| (reference.clone(), chunk.clone()))
+        .collect();
+    assert_eq!(actual_chunks, expected_chunks);
+    assert!(actual.document(&foreign).is_none());
 }
 
 #[test]

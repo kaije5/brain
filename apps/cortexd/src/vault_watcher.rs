@@ -12,7 +12,7 @@
 use cortex_domain::{ProviderResourceId, ProviderResourceKind};
 use cortex_search::{ChunkProvenance, DerivedVaultIndex};
 use sha2::Sha256;
-use std::io::Read;
+use std::{collections::BTreeSet, io::Read, num::NonZeroU64};
 
 use crate::vault_provider::MarkdownVaultProvider;
 
@@ -166,6 +166,120 @@ pub enum AppliedEvent {
     Skipped,
 }
 
+/// Counts the convergent effects of one vault reconciliation or rebuild.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReconciliationReport {
+    pub indexed: usize,
+    pub unchanged: usize,
+    pub removed: usize,
+    pub skipped: usize,
+}
+
+/// Scans the authoritative vault and converges provider-owned derived state.
+/// Live paths are applied in deterministic lexical order; indexed resources
+/// absent from the scan are removed. State owned by another workspace or
+/// provider is left untouched.
+#[must_use]
+pub fn reconcile_vault(
+    provider: &MarkdownVaultProvider,
+    index: &mut DerivedVaultIndex,
+) -> ReconciliationReport {
+    let mut report = ReconciliationReport::default();
+    let mut live = BTreeSet::new();
+    for relative in provider.indexable_paths() {
+        let Some(resource) = resource_for_relative(provider, &relative) else {
+            report.skipped += 1;
+            continue;
+        };
+        live.insert(resource);
+        let outcome = apply_event(
+            provider,
+            index,
+            &CoalescedEvent {
+                event: VaultEvent::Updated { relative },
+                observed_at: 0,
+            },
+        );
+        match outcome {
+            AppliedEvent::Indexed => report.indexed += 1,
+            AppliedEvent::Unchanged => report.unchanged += 1,
+            AppliedEvent::Removed => report.removed += 1,
+            AppliedEvent::Skipped => report.skipped += 1,
+        }
+    }
+
+    let indexed: BTreeSet<_> = index
+        .documents()
+        .cloned()
+        .chain(
+            index
+                .chunks()
+                .map(|(reference, _)| reference.resource.clone()),
+        )
+        .collect();
+    for resource in indexed {
+        let owned = resource.workspace_id() == provider.workspace_id()
+            && resource.provider_id() == provider.provider_reference_id();
+        if owned && !live.contains(&resource) {
+            index.remove_resource(&resource);
+            report.removed += 1;
+        }
+    }
+    report
+}
+
+/// Deterministic periodic reconciliation coordinator. The caller owns the
+/// clock and invokes this from its runtime loop; no sleeping or background
+/// thread is hidden inside the index boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VaultReconciler {
+    interval_millis: NonZeroU64,
+    last_run_at: Option<u64>,
+}
+
+impl VaultReconciler {
+    #[must_use]
+    pub const fn new(interval_millis: NonZeroU64) -> Self {
+        Self {
+            interval_millis,
+            last_run_at: None,
+        }
+    }
+
+    /// Reconciles immediately on the first call and thereafter only when the
+    /// configured interval has elapsed from the last completed invocation.
+    #[must_use]
+    pub fn reconcile_if_due(
+        &mut self,
+        provider: &MarkdownVaultProvider,
+        index: &mut DerivedVaultIndex,
+        now_millis: u64,
+    ) -> Option<ReconciliationReport> {
+        let due = self.last_run_at.is_none_or(|last_run_at| {
+            now_millis.saturating_sub(last_run_at) >= self.interval_millis.get()
+        });
+        if !due {
+            return None;
+        }
+        let report = reconcile_vault(provider, index);
+        self.last_run_at = Some(now_millis);
+        Some(report)
+    }
+}
+
+/// Reconstructs all derived vault state from authoritative Markdown and
+/// replaces the caller-owned index only after the complete scan finishes.
+#[must_use]
+pub fn rebuild_vault(
+    provider: &MarkdownVaultProvider,
+    index: &mut DerivedVaultIndex,
+) -> ReconciliationReport {
+    let mut replacement = DerivedVaultIndex::new();
+    let report = reconcile_vault(provider, &mut replacement);
+    *index = replacement;
+    report
+}
+
 /// Applies one coalesced event to the derived index idempotently: upserts
 /// are hash-gated (unchanged content → `Unchanged`), deletes only remove
 /// what exists, and only confined paths within the resource scopes are ever
@@ -215,15 +329,9 @@ fn apply_index_current(
     if cortex_vault::parse_document(text).is_err() {
         return AppliedEvent::Skipped;
     }
-    let Some(resource_id) = document_resource_id(confined.relative()) else {
+    let Some(resource) = resource_for_relative(provider, confined.relative()) else {
         return AppliedEvent::Skipped;
     };
-    let resource = cortex_domain::ProviderResourceRef::new(
-        provider.workspace_id(),
-        provider.provider_reference_id().clone(),
-        resource_id,
-        kind,
-    );
     let provenance = ChunkProvenance::new(content_hash_of(&bytes), revision_of(&bytes));
 
     // Idempotency gate: if every indexed chunk for this resource is fresh
@@ -284,15 +392,9 @@ fn apply_removed(
     let Ok(confined) = provider.confine(relative, kind) else {
         return AppliedEvent::Skipped;
     };
-    let Some(resource_id) = document_resource_id(confined.relative()) else {
+    let Some(resource) = resource_for_relative(provider, confined.relative()) else {
         return AppliedEvent::Skipped;
     };
-    let resource = cortex_domain::ProviderResourceRef::new(
-        provider.workspace_id(),
-        provider.provider_reference_id().clone(),
-        resource_id,
-        kind,
-    );
     // Deleting something never indexed is a no-op (idempotent).
     if index.document(&resource).is_none() && index.chunks_for_resource(&resource).is_empty() {
         return AppliedEvent::Unchanged;
@@ -315,6 +417,18 @@ fn kind_for(relative: &str) -> ProviderResourceKind {
 
 fn document_resource_id(relative: &str) -> Option<ProviderResourceId> {
     ProviderResourceId::new(format!("path:{relative}")).ok()
+}
+
+fn resource_for_relative(
+    provider: &MarkdownVaultProvider,
+    relative: &str,
+) -> Option<cortex_domain::ProviderResourceRef> {
+    Some(cortex_domain::ProviderResourceRef::new(
+        provider.workspace_id(),
+        provider.provider_reference_id().clone(),
+        document_resource_id(relative)?,
+        kind_for(relative),
+    ))
 }
 
 enum BoundedRead {
