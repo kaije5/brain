@@ -1,0 +1,33 @@
+name: Nightly QA
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  full-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-features
+
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup update stable
+      - run: cargo install cargo-mutants --locked
+      - run: cargo mutants --workspace
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz run fuzz_target_1 -- -max_total_time=600
