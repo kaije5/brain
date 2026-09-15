@@ -546,7 +546,7 @@ fn resource_from_text(
             .file_stem()
             .and_then(|stem| stem.to_str())?;
         let task = cortex_vault::parse_task(&parsed, stem).ok()?;
-        ProviderResourceId::new(task.brain_id()).ok()?
+        task.resource_id().clone()
     } else {
         document_resource_id(relative)?
     };

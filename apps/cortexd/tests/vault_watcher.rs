@@ -260,9 +260,10 @@ fn reconciliation_rejects_duplicate_task_identity_before_mutating_index() {
     let provider = provider_for(directory.path(), WorkspaceId::new());
     let mut index = DerivedVaultIndex::new();
     let _ = reconcile_vault(&provider, &mut index).expect("complete reconciliation");
-    let duplicate = "---\ntype: task\nbrain_id: 01926c8f-88f9-7d33-9a1b-2c7d33bd0a12\nstatus: todo\npriority: high\n---\n\nDuplicate task\n";
-    std::fs::write(directory.path().join("Tasks/one.md"), duplicate).expect("first task");
-    std::fs::write(directory.path().join("Tasks/two.md"), duplicate).expect("second task");
+    let hyphenated = "---\ntype: task\nbrain_id: 01926c8f-88f9-7d33-9a1b-2c7d33bd0a12\nstatus: todo\npriority: high\n---\n\nDuplicate task\n";
+    let compact = "---\ntype: task\nbrain_id: 01926c8f88f97d339a1b2c7d33bd0a12\nstatus: todo\npriority: high\n---\n\nDuplicate task\n";
+    std::fs::write(directory.path().join("Tasks/one.md"), hyphenated).expect("first task");
+    std::fs::write(directory.path().join("Tasks/two.md"), compact).expect("second task");
 
     let error = reconcile_vault(&provider, &mut index).expect_err("duplicate identity rejected");
 
