@@ -12,16 +12,16 @@ jobs:
   full-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: rustup update stable
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@2ab4414e29d1e7bb31565858e4b05de5d3713b61
       - run: cargo nextest run --workspace --all-features
 
   mutants:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: rustup update stable
       - run: cargo install cargo-mutants --locked
       - run: cargo mutants --workspace
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: rustup toolchain install nightly
       - run: cargo install cargo-fuzz --locked
       - run: cargo +nightly fuzz run fuzz_target_1 -- -max_total_time=600
