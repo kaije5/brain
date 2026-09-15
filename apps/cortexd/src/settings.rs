@@ -434,8 +434,7 @@ fn default_data_directory() -> std::path::PathBuf {
         let base = match std::env::var_os("XDG_DATA_HOME") {
             Some(value) => std::path::PathBuf::from(value),
             None => std::env::home_dir()
-                .map(|home| home.join(".local").join("share"))
-                .unwrap_or_else(std::env::temp_dir),
+                .map_or_else(std::env::temp_dir, |home| home.join(".local").join("share")),
         };
         base.join("cortex")
     }
