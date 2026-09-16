@@ -104,11 +104,13 @@ pub struct SearchArgs {
     pub limit: usize,
 }
 
+/// A provider resource address plus the opaque observed revision to mutate.
 #[derive(Clone, Debug, Args)]
 pub struct EntityArgs {
-    pub entity_id: Uuid,
+    /// The stable provider resource id (for tasks the `brain_id`).
+    pub resource_id: String,
     #[arg(long)]
-    pub revision: u64,
+    pub revision: String,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -165,7 +167,7 @@ pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
         Command::Task(TaskCommand::List { limit }) => task_list(*limit)?,
         Command::Task(TaskCommand::Complete(input)) => (
             "cortex_task_complete",
-            json!({"entity_id": input.entity_id, "expected_revision": input.revision}),
+            json!({"resource_id": input.resource_id, "expected_revision": input.revision}),
             true,
         ),
         Command::Remember(input) => (

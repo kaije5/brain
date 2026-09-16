@@ -64,7 +64,8 @@ async fn tui_renders_real_daemon_state_and_degrades_without_a_model() {
 
     let mut app = App::new();
     if let cortexd::WireResult::Success { value } = listed.result {
-        let rows = value
+        // v2 lists are freshness-tagged envelopes of typed task rows.
+        let rows = value["tasks"]
             .as_array()
             .expect("task list array")
             .iter()

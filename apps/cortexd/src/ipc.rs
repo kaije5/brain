@@ -2,15 +2,15 @@ use std::{collections::BTreeSet, io, path::PathBuf, sync::Arc, time::Duration};
 
 use cortex_application::{
     ApplicationError, ApplicationService, AuditPort, Capability, CapabilityCatalog,
-    CapabilityGrant, CommandContext, GrantPolicy, KnowledgeCreate, MemoryCorrectInput,
-    MemoryCreateInput, ProviderAuthority, ProviderMutationOutcome, ProviderTask, SecretStore,
-    TaskComplete, TaskCreate, TaskDelete, TaskProvider, TaskQuery, TaskSchedulingMetadata,
-    TaskUpdate,
+    CapabilityGrant, CommandContext, GrantPolicy, KnowledgeCreate, KnowledgeDelete,
+    KnowledgeUpdate, MemoryCorrectInput, MemoryCreateInput, ProviderAuthority,
+    ProviderMutationOutcome, ProviderTask, SecretStore, TaskComplete, TaskCreate, TaskDelete,
+    TaskProvider, TaskQuery, TaskSchedulingMetadata, TaskUpdate,
 };
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, ObservedRevision, OperationId, PolicyDecision,
-    PolicyDeny, PrincipalId, ProviderResourceId, ProviderResourceKind, ProviderResourceRef,
-    Revision, SourceRef, TaskId, WorkspaceId,
+    PolicyDeny, PrincipalId, ProviderResourceKind, ProviderResourceRef, Revision, SourceRef,
+    TaskId, WorkspaceId,
 };
 use cortex_inference::{
     AgentLimits, AgentRunner, AuthorizedCapabilities, OpenAiCompatibleProvider,
@@ -32,8 +32,10 @@ use uuid::{Uuid, Version};
 
 use crate::{DaemonConfig, MarkdownVaultProvider, config::MAX_REMOTE_CLIENTS};
 
-/// The only supported local IPC protocol version for Cortex v0.1.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// The only supported local IPC protocol version. v2 carries provider
+/// resource identity and opaque observed revisions for user content; no
+/// earlier version is accepted (SCRUM-117).
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_RESULTS: usize = 32;
 const MAX_SEARCH_SNIPPET_BYTES: usize = 1024;
@@ -87,6 +89,8 @@ pub enum DaemonError {
     InvalidRequest,
     UnsupportedCapability,
     PermissionDenied,
+    Conflict,
+    NotFound,
     InvalidConfiguration,
     StartupFailed,
     TransportUnavailable,
@@ -102,6 +106,8 @@ impl std::fmt::Display for DaemonError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Unauthenticated => "local client is not authenticated",
+            Self::Conflict => "the resource changed since the caller last observed it",
+            Self::NotFound => "the addressed resource does not exist",
             Self::InvalidRequest => "invalid local IPC request",
             Self::UnsupportedCapability => "unsupported daemon capability",
             Self::PermissionDenied => "daemon capability is not granted",
@@ -271,6 +277,8 @@ impl cortex_application::AgentCapabilityExecutor for DaemonAgentExecutor {
 fn application_error_from_daemon(error: &DaemonError) -> ApplicationError {
     match error {
         DaemonError::PermissionDenied => ApplicationError::PermissionDenied,
+        DaemonError::Conflict => ApplicationError::Conflict { entity: "resource" },
+        DaemonError::NotFound => ApplicationError::NotFound { entity: "resource" },
         DaemonError::InvalidRequest | DaemonError::InvalidInferenceRequest => {
             ApplicationError::Validation { field: "payload" }
         }
@@ -764,30 +772,38 @@ impl LocalDaemon {
         Ok(provider_mutation_response(request.request_id, &outcome))
     }
 
-    /// Resolves a wire task entity (the stable `brain_id`) to its provider
-    /// resource and current observed revision. The resolution read is
-    /// internal state recovery; policy is enforced on the mutation itself.
-    async fn resolve_task(
+    /// The provider resource reference for a wire resource id of the given
+    /// kind: the daemon's configured vault is the only first-party provider.
+    fn resource_for(
         &self,
-        entity_id: Uuid,
-    ) -> Result<(ProviderResourceRef, ObservedRevision, ProviderTask), DaemonError> {
+        kind: ProviderResourceKind,
+        resource_id: &cortex_domain::ProviderResourceId,
+    ) -> Result<ProviderResourceRef, DaemonError> {
         let vault = self
             .vault
             .as_ref()
             .ok_or(DaemonError::InvalidConfiguration)?;
-        let resource = ProviderResourceRef::new(
+        Ok(ProviderResourceRef::new(
             self.workspace_id,
             vault.provider_reference_id().clone(),
-            ProviderResourceId::new(entity_id.to_string())
-                .map_err(|_| DaemonError::InvalidRequest)?,
-            ProviderResourceKind::Task,
-        );
-        let read = TaskProvider::get(vault.as_ref(), &resource)
+            resource_id.clone(),
+            kind,
+        ))
+    }
+
+    /// Reads the current task content for a restore, which must rewrite the
+    /// whole task record. Policy is enforced on the mutation itself.
+    async fn read_task(&self, resource: &ProviderResourceRef) -> Result<ProviderTask, DaemonError> {
+        let vault = self
+            .vault
+            .as_ref()
+            .ok_or(DaemonError::InvalidConfiguration)?;
+        Ok(TaskProvider::get(vault.as_ref(), resource)
             .await
-            .map_err(|_error| DaemonError::from(ApplicationError::Internal))
-            .and_then(|read| read.ok_or(DaemonError::InvalidRequest))?;
-        let revision = read.item().provenance().observed_revision().clone();
-        Ok((resource, revision, read.into_item()))
+            .map_err(|_error| DaemonError::from(ApplicationError::Internal))?
+            .filter(|read| read.freshness() == cortex_application::ProviderFreshness::Current)
+            .ok_or(DaemonError::NotFound)?
+            .into_item())
     }
 
     #[allow(clippy::too_many_lines)] // Exhaustive, typed catalog-to-service mapping stays auditable in one place.
@@ -801,14 +817,58 @@ impl LocalDaemon {
         }
         let context = self.command_context(principal_id, request)?;
         let result: MutationOutcome = match request.capability.as_str() {
-            // Notes are path-addressed in the vault provider; legacy
-            // UUID-addressed note mutations have no provider target until the
-            // versioned provider protocol (SCRUM-117) introduces one.
-            "cortex_note_update" | "cortex_note_delete" | "cortex_note_restore" => {
-                Err(ApplicationError::NotFound {
-                    entity: "knowledge_document",
-                })
+            "cortex_note_update" => {
+                let input: WireNoteUpdate = decode_payload(&request.payload)?;
+                let (resource_id, expected_revision) = input.resource()?;
+                let authority = self
+                    .authority
+                    .as_ref()
+                    .ok_or(DaemonError::InvalidConfiguration)?;
+                let update = KnowledgeUpdate::new(
+                    self.resource_for(ProviderResourceKind::Knowledge, &resource_id)?,
+                    context.operation_id,
+                    expected_revision,
+                    input.title,
+                    input.content,
+                )
+                .map_err(|_| DaemonError::InvalidRequest)?;
+                authority
+                    .update_knowledge(
+                        &context,
+                        Capability::from_mcp_name(&request.capability)
+                            .ok_or(DaemonError::UnsupportedCapability)?,
+                        update,
+                    )
+                    .await
+                    .map(MutationOutcome::Provider)
             }
+            "cortex_note_delete" => {
+                let input: WireResourceCommand = decode_payload(&request.payload)?;
+                let authority = self
+                    .authority
+                    .as_ref()
+                    .ok_or(DaemonError::InvalidConfiguration)?;
+                let delete = KnowledgeDelete::new(
+                    self.resource_for(ProviderResourceKind::Knowledge, &input.resource_id()?)?,
+                    context.operation_id,
+                    input.expected_revision()?,
+                )
+                .map_err(|_| DaemonError::InvalidRequest)?;
+                authority
+                    .delete_knowledge(
+                        &context,
+                        Capability::from_mcp_name(&request.capability)
+                            .ok_or(DaemonError::UnsupportedCapability)?,
+                        delete,
+                    )
+                    .await
+                    .map(MutationOutcome::Provider)
+            }
+            // The vault format has no undelete: a deleted document cannot be
+            // restored, so the legacy restore capability is a typed rejection.
+            "cortex_note_restore" => Err(ApplicationError::NotFound {
+                entity: "knowledge_document",
+            }),
             "cortex_task_create" => {
                 let input: WireTaskCreate = decode_payload(&request.payload)?;
                 let due_at = input.due_at()?;
@@ -847,29 +907,28 @@ impl LocalDaemon {
             }
             "cortex_task_update" => {
                 let input: WireTaskUpdate = decode_payload(&request.payload)?;
-                let entity = input.entity_id;
                 let due_at = input.due_at()?;
-                let (resource, revision, current) = self.resolve_task(entity).await?;
+                let (resource_id, expected_revision) = input.resource()?;
                 let authority = self
                     .authority
                     .as_ref()
                     .ok_or(DaemonError::InvalidConfiguration)?;
                 let update = TaskUpdate::new(
-                    resource,
+                    self.resource_for(ProviderResourceKind::Task, &resource_id)?,
                     context.operation_id,
-                    revision,
+                    expected_revision,
                     input.title,
-                    current.body().to_owned(),
-                    current.status(),
-                    current.priority(),
+                    String::new(),
+                    cortex_application::ProviderTaskStatus::Todo,
+                    cortex_application::ProviderTaskPriority::Normal,
                     TaskSchedulingMetadata::new(
                         due_at,
-                        current.scheduling().deadline_at(),
-                        current.scheduling().duration_minutes(),
-                        current.scheduling().earliest_start(),
-                        current.scheduling().split(),
-                        current.scheduling().project(),
-                        current.scheduling().context(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None::<String>,
+                        None::<String>,
                     )
                     .map_err(|_| DaemonError::InvalidRequest)?,
                 )
@@ -885,14 +944,17 @@ impl LocalDaemon {
                     .map(MutationOutcome::Provider)
             }
             "cortex_task_complete" => {
-                let input: WireEntityCommand = decode_payload(&request.payload)?;
-                let (resource, revision, _current) = self.resolve_task(input.entity_id).await?;
+                let input: WireResourceCommand = decode_payload(&request.payload)?;
                 let authority = self
                     .authority
                     .as_ref()
                     .ok_or(DaemonError::InvalidConfiguration)?;
-                let complete = TaskComplete::new(resource, context.operation_id, revision)
-                    .map_err(|_| DaemonError::InvalidRequest)?;
+                let complete = TaskComplete::new(
+                    self.resource_for(ProviderResourceKind::Task, &input.resource_id()?)?,
+                    context.operation_id,
+                    input.expected_revision()?,
+                )
+                .map_err(|_| DaemonError::InvalidRequest)?;
                 authority
                     .complete_task(
                         &context,
@@ -904,14 +966,17 @@ impl LocalDaemon {
                     .map(MutationOutcome::Provider)
             }
             "cortex_task_delete" => {
-                let input: WireEntityCommand = decode_payload(&request.payload)?;
-                let (resource, revision, _current) = self.resolve_task(input.entity_id).await?;
+                let input: WireResourceCommand = decode_payload(&request.payload)?;
                 let authority = self
                     .authority
                     .as_ref()
                     .ok_or(DaemonError::InvalidConfiguration)?;
-                let delete = TaskDelete::new(resource, context.operation_id, revision)
-                    .map_err(|_| DaemonError::InvalidRequest)?;
+                let delete = TaskDelete::new(
+                    self.resource_for(ProviderResourceKind::Task, &input.resource_id()?)?,
+                    context.operation_id,
+                    input.expected_revision()?,
+                )
+                .map_err(|_| DaemonError::InvalidRequest)?;
                 authority
                     .delete_task(
                         &context,
@@ -923,16 +988,20 @@ impl LocalDaemon {
                     .map(MutationOutcome::Provider)
             }
             "cortex_task_restore" => {
-                let input: WireEntityCommand = decode_payload(&request.payload)?;
-                let (resource, revision, current) = self.resolve_task(input.entity_id).await?;
+                let input: WireResourceCommand = decode_payload(&request.payload)?;
                 let authority = self
                     .authority
                     .as_ref()
                     .ok_or(DaemonError::InvalidConfiguration)?;
+                let resource =
+                    self.resource_for(ProviderResourceKind::Task, &input.resource_id()?)?;
+                // A restore rewrites the whole record: the current content is
+                // read, while the caller's revision governs the write.
+                let current = self.read_task(&resource).await?;
                 let restore = TaskUpdate::new(
                     resource,
                     context.operation_id,
-                    revision,
+                    input.expected_revision()?,
                     current.title().to_owned(),
                     current.body().to_owned(),
                     cortex_application::ProviderTaskStatus::Todo,
@@ -1058,24 +1127,32 @@ impl LocalDaemon {
             .list_tasks(&context, query)
             .await
             .map_err(DaemonError::from)?;
+        let rows: Vec<Value> = page
+            .items()
+            .iter()
+            .map(|task| {
+                json!({
+                    "task_id": Uuid::from(task.task_id()).to_string(),
+                    "resource_id": task.provenance().resource().resource_id().as_str(),
+                    "title": task.title(),
+                    "due_at": task.scheduling().due_at().map(|due| due.to_rfc3339()),
+                    "status": format!("{:?}", task.status()).to_ascii_lowercase(),
+                    "priority": format!("{:?}", task.priority()).to_ascii_lowercase(),
+                    "revision": task.provenance().observed_revision().as_str(),
+                })
+            })
+            .collect();
         Ok(DaemonResponse {
             protocol_version: PROTOCOL_VERSION,
             request_id: request.request_id,
             result: WireResult::Success {
-                value: Value::Array(
-                    page.into_items()
-                        .into_iter()
-                        .map(|task| {
-                            json!({
-                                "entity_id": Uuid::from(task.task_id()).to_string(),
-                                "title": task.title(),
-                                "due_at": task.scheduling().due_at().map(|due| due.to_rfc3339()),
-                                "status": format!("{:?}", task.status()).to_ascii_lowercase(),
-                                "revision": task.provenance().observed_revision().as_str(),
-                            })
-                        })
-                        .collect(),
-                ),
+                value: json!({
+                    "freshness": match page.freshness() {
+                        cortex_application::ProviderFreshness::Current => "current",
+                        cortex_application::ProviderFreshness::Stale => "stale",
+                    },
+                    "tasks": rows,
+                }),
             },
         })
     }
@@ -1414,6 +1491,50 @@ struct WireNoteCreate {
     content: String,
 }
 
+/// A provider resource address plus the opaque observed revision the caller
+/// based its mutation on. Bounds are enforced by the domain constructors.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireResourceCommand {
+    resource_id: String,
+    expected_revision: String,
+}
+
+impl WireResourceCommand {
+    fn resource_id(&self) -> Result<cortex_domain::ProviderResourceId, DaemonError> {
+        cortex_domain::ProviderResourceId::new(self.resource_id.clone())
+            .map_err(|_| DaemonError::InvalidRequest)
+    }
+    fn expected_revision(&self) -> Result<ObservedRevision, DaemonError> {
+        ObservedRevision::new(self.expected_revision.clone())
+            .map_err(|_| DaemonError::InvalidRequest)
+    }
+}
+
+/// A provider note mutation carrying content plus the opaque observed
+/// revision the caller based the write on.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNoteUpdate {
+    resource_id: String,
+    expected_revision: String,
+    title: String,
+    content: String,
+}
+
+impl WireNoteUpdate {
+    fn resource(
+        &self,
+    ) -> Result<(cortex_domain::ProviderResourceId, ObservedRevision), DaemonError> {
+        Ok((
+            cortex_domain::ProviderResourceId::new(self.resource_id.clone())
+                .map_err(|_| DaemonError::InvalidRequest)?,
+            ObservedRevision::new(self.expected_revision.clone())
+                .map_err(|_| DaemonError::InvalidRequest)?,
+        ))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireEntityCommand {
@@ -1453,17 +1574,24 @@ impl WireTaskCreate {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireTaskUpdate {
-    entity_id: Uuid,
-    /// Accepted for wire compatibility; the provider observed revision from
-    /// the authoritative file governs optimistic concurrency until the
-    /// versioned provider protocol carries opaque revisions (SCRUM-117).
-    #[allow(dead_code)]
-    expected_revision: u64,
+    resource_id: String,
+    expected_revision: String,
     title: String,
     due_at: Option<String>,
 }
 
 impl WireTaskUpdate {
+    fn resource(
+        &self,
+    ) -> Result<(cortex_domain::ProviderResourceId, ObservedRevision), DaemonError> {
+        Ok((
+            cortex_domain::ProviderResourceId::new(self.resource_id.clone())
+                .map_err(|_| DaemonError::InvalidRequest)?,
+            ObservedRevision::new(self.expected_revision.clone())
+                .map_err(|_| DaemonError::InvalidRequest)?,
+        ))
+    }
+
     fn due_at(&self) -> Result<Option<chrono::DateTime<chrono::Utc>>, DaemonError> {
         self.due_at
             .as_deref()
@@ -1890,10 +2018,11 @@ impl From<ApplicationError> for DaemonError {
             ApplicationError::PolicyDenied(_) | ApplicationError::PermissionDenied => {
                 Self::PermissionDenied
             }
-            ApplicationError::Validation { .. }
-            | ApplicationError::NotFound { .. }
-            | ApplicationError::Conflict { .. }
-            | ApplicationError::InvalidInferenceRequest => Self::InvalidRequest,
+            ApplicationError::Validation { .. } | ApplicationError::InvalidInferenceRequest => {
+                Self::InvalidRequest
+            }
+            ApplicationError::NotFound { .. } => Self::NotFound,
+            ApplicationError::Conflict { .. } => Self::Conflict,
             ApplicationError::InferenceUnavailable | ApplicationError::InferenceTimeout => {
                 Self::TransportUnavailable
             }
@@ -1917,6 +2046,8 @@ impl DaemonError {
             Self::InvalidRequest => "invalid_request",
             Self::UnsupportedCapability => "unsupported_capability",
             Self::PermissionDenied => "permission_denied",
+            Self::Conflict => "conflict",
+            Self::NotFound => "not_found",
             Self::InvalidConfiguration | Self::StartupFailed => "unavailable",
             Self::TransportUnavailable => "transport_unavailable",
             Self::SecretStoreUnavailable => "secret_store_unavailable",

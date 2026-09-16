@@ -740,15 +740,18 @@ async fn task_list_is_authorized_audited_and_returns_only_active_workspace_tasks
     let WireResult::Success { value } = response.result else {
         panic!("list succeeds");
     };
+    // The v2 list is a freshness-tagged envelope of typed task rows.
+    assert_eq!(value["freshness"], "current");
     // The vault task title is derived from the file stem, which embeds the
     // stable brain_id prefix; the human title substring is preserved.
     assert!(
-        value[0]["title"]
+        value["tasks"][0]["title"]
             .as_str()
             .expect("title is a string")
             .contains("listed")
     );
-    assert!(value[0]["revision"].as_str().is_some());
+    assert!(value["tasks"][0]["revision"].as_str().is_some());
+    assert_eq!(value["tasks"][0]["status"], "todo");
 }
 
 #[tokio::test]
