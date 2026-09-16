@@ -53,11 +53,9 @@ pub struct ProviderPreset {
     pub key_hint: &'static str,
 }
 
-/// Official provider presets. NVIDIA NIM's hosted catalog is `OpenAI`
-/// compatible (`GET /v1/models`, `POST /v1/chat/completions`) at
-/// `integrate.api.nvidia.com/v1`, authenticating with a `nvapi-...` bearer
-/// key issued by build.nvidia.com — the contract the `NimDiscovery` adapter
-/// already implements.
+/// Official provider presets. The NVIDIA hosted catalog uses the same
+/// OpenAI-compatible connector as every other profile: `GET /models` and
+/// `POST /chat/completions` are derived from its configured API base.
 pub const OFFICIAL_PROVIDERS: [ProviderPreset; 1] = [ProviderPreset {
     id: "nim",
     label: "NVIDIA NIM",
