@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod authority;
+mod automation;
 mod capability;
 mod command;
 mod error;
@@ -17,6 +18,10 @@ mod task_provider;
 pub use authority::{
     AuthorityPolicy, ProviderAuthority, ProviderMutationOutcome, ProviderOperationLog,
     ProviderOperationRecord,
+};
+pub use automation::{
+    AutomationEngine, AutomationOutcome, AutomationRunLog, AutomationRunRecord, VaultChangeHandler,
+    VaultChangeKind, VaultChangeTrigger,
 };
 pub use capability::{
     AuditClassification, Capability, CapabilityCatalog, CapabilityMetadata, ContractDescriptor,

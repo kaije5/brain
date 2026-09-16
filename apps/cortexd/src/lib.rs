@@ -33,6 +33,7 @@ pub use vault::{
     VaultProviderMode, VaultScope,
 };
 pub use vault_provider::{ConfinedPath, MarkdownVaultProvider, VaultPathError, VaultScanError};
+pub mod automation_bridge;
 pub use vault_watcher::{
     AppliedEvent, CoalescedEvent, DEFAULT_DEBOUNCE_MILLIS, EventQueue, ReconciliationError,
     ReconciliationReport, VaultEvent, VaultReconciler, apply_event, rebuild_vault, reconcile_vault,
