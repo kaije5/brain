@@ -5,6 +5,7 @@ mod capability;
 mod command;
 mod error;
 mod knowledge;
+mod planning;
 mod provider;
 mod query;
 mod search;
@@ -29,6 +30,10 @@ pub use error::{ApplicationError, RecoveryHint};
 pub use knowledge::{
     KnowledgeCreate, KnowledgeDelete, KnowledgeDocument, KnowledgeProvider, KnowledgeQuery,
     KnowledgeUpdate,
+};
+pub use planning::{
+    DEFAULT_WORK_BLOCK_MINUTES, PlannedWorkBlock, PlanningService, PlanningWindow, WorkBlockIntent,
+    WorkBlockLedger, WorkBlockLinkage, plan_schedule, work_block_intent,
 };
 pub use provider::{
     MAX_PROVIDER_RESULTS, ProviderError, ProviderFreshness, ProviderMutation, ProviderPage,

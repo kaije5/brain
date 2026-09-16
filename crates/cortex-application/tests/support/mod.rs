@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod task_provider;
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
