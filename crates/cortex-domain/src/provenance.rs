@@ -1,5 +1,6 @@
 use crate::EntityId;
-use crate::{DomainError, Lifecycle, Revision, WorkspaceId, note::validate_text};
+use crate::text::validate_text;
+use crate::{DomainError, Lifecycle, Revision, WorkspaceId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SourceRef {
