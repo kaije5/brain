@@ -106,9 +106,16 @@ fn models_page(ids: &[&str]) -> Vec<u8> {
     .into_bytes()
 }
 
-fn chat_response(content: &str) -> Vec<u8> {
+fn chat_response(_content: &str) -> Vec<u8> {
     json!({
-        "choices": [{"message": {"role": "assistant", "content": content}}]
+        "choices": [{"message": {
+            "role": "assistant",
+            "content": "{}",
+            "tool_calls": [{"function": {
+                "name": "cortex_probe",
+                "arguments": "{}"
+            }}]
+        }}]
     })
     .to_string()
     .into_bytes()

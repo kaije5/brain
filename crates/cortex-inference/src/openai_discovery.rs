@@ -181,7 +181,11 @@ impl<T: OpenAiTransport> OpenAiModelDiscovery<T> {
             )
             .await
         {
-            Ok(_) => Ok(true),
+            Ok(response) => Ok(if extra.is_null() {
+                demonstrates_tool_calling(&response)
+            } else {
+                demonstrates_structured_output(&response)
+            }),
             // A rejected or over-budget probe means this model did not
             // demonstrate the capability; one slow model must not degrade
             // the whole catalog refresh. Credential and billing failures are
@@ -247,4 +251,29 @@ impl<T: OpenAiTransport> OpenAiModelDiscovery<T> {
         }
         Ok(ModelCatalog::new(probed))
     }
+}
+
+fn demonstrates_tool_calling(response: &[u8]) -> bool {
+    let Ok(value): Result<Value, _> = serde_json::from_slice(response) else {
+        return false;
+    };
+    value["choices"][0]["message"]["tool_calls"]
+        .as_array()
+        .is_some_and(|calls| {
+            calls.iter().any(|call| {
+                call["function"]["name"] == "cortex_probe"
+                    && call["function"]["arguments"]
+                        .as_str()
+                        .is_some_and(|arguments| serde_json::from_str::<Value>(arguments).is_ok())
+            })
+        })
+}
+
+fn demonstrates_structured_output(response: &[u8]) -> bool {
+    let Ok(value): Result<Value, _> = serde_json::from_slice(response) else {
+        return false;
+    };
+    value["choices"][0]["message"]["content"]
+        .as_str()
+        .is_some_and(|content| serde_json::from_str::<Value>(content).is_ok())
 }
