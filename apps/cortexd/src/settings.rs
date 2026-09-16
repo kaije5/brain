@@ -3,9 +3,10 @@ use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use chrono::Utc;
 use cortex_application::{ApplicationError, SecretRef};
 use cortex_inference::{
-    ApiMode, AuthStrategy, DiscoveredModel, ModelCatalog, ModelId, ModelRouter, NimConfig,
-    NimDiscovery, NimTransport, OpenAiCompatibleConfig, ProfileTimeouts, ProviderLimits,
-    ProviderProfile, ProviderProfileId, ProviderQuirks, RoleRoutingPolicy, RoutedModel,
+    ApiMode, AuthStrategy, DiscoveredModel, ModelCatalog, ModelId, ModelRouter,
+    OpenAiCompatibleConfig, OpenAiDiscoveryConfig, OpenAiModelDiscovery, OpenAiTransport,
+    ProfileTimeouts, ProviderLimits, ProviderProfile, ProviderProfileId, ProviderQuirks,
+    RoleRoutingPolicy, RoutedModel,
 };
 use serde::Deserialize;
 
@@ -457,6 +458,8 @@ pub enum ModelResolution {
         route: RoutedModel,
         /// Every model id discovered on the profile, for client selection.
         models: Vec<String>,
+        /// Resolved credential for the routed profile only.
+        bearer: Option<String>,
     },
     /// A configured profile could not produce an eligible model. The daemon
     /// starts and reports the degraded state; it never falls back silently.
@@ -484,7 +487,7 @@ fn profile_and_secret(profiles: &[ProviderProfile], profile_id: &str) -> Option<
 }
 
 /// Resolves the settings' default model profile through the SCRUM-41 runtime
-/// router: fresh NIM discovery on every enabled profile builds the capability
+/// router: fresh OpenAI-compatible discovery on every enabled profile builds the capability
 /// catalog (each with its own declared endpoint, auth strategy, and timeouts),
 /// then the deterministic agent-role policy selects the
 /// `{profile_id, model_id}` route. The bearer credential is resolved once by
@@ -495,11 +498,30 @@ fn profile_and_secret(profiles: &[ProviderProfile], profile_id: &str) -> Option<
 /// Discovery and probes talk to the configured endpoints; failures surface as
 /// [`ModelResolution::Degraded`] rather than blocking deterministic operation.
 /// There is no fallback: the routed selection is the typed decision.
-pub async fn resolve_default_model<T: NimTransport + Clone>(
+pub async fn resolve_default_model<T: OpenAiTransport + Clone>(
     settings: Option<&LocalSettings>,
     transport: T,
     bearer: Option<&str>,
 ) -> ModelResolution {
+    resolve_default_model_with_lookup(settings, transport, |reference| {
+        let _ = reference;
+        bearer.map(str::to_owned)
+    })
+    .await
+}
+
+/// Resolves model routing with a credential lookup scoped to each profile's
+/// opaque secret reference.
+#[allow(clippy::too_many_lines)] // Each early degraded return is a distinct typed routing boundary.
+pub async fn resolve_default_model_with_lookup<T, F>(
+    settings: Option<&LocalSettings>,
+    transport: T,
+    lookup: F,
+) -> ModelResolution
+where
+    T: OpenAiTransport + Clone,
+    F: Fn(&SecretRef) -> Option<String>,
+{
     let Some(settings) = settings else {
         return ModelResolution::Disabled;
     };
@@ -527,7 +549,7 @@ pub async fn resolve_default_model<T: NimTransport + Clone>(
         &profiles,
         default_profile.id(),
         &transport,
-        bearer,
+        &lookup,
     )
     .await;
     let Some(discovered) = discovery else {
@@ -566,6 +588,16 @@ pub async fn resolve_default_model<T: NimTransport + Clone>(
         };
     };
     let routed_secret = routed_profile.secret_reference().cloned();
+    let routed_bearer = match routed_profile.auth_strategy() {
+        AuthStrategy::SecretRef => routed_secret.as_ref().and_then(&lookup),
+        AuthStrategy::None => None,
+    };
+    if routed_profile.auth_strategy() == AuthStrategy::SecretRef && routed_bearer.is_none() {
+        return ModelResolution::Degraded {
+            reason: "routed_profile_credential_unavailable",
+            secret: routed_secret,
+        };
+    }
     let Ok(limits) = ProviderLimits::new(
         MODEL_RESPONSE_BYTES,
         MODEL_EMBEDDING_INPUT_BYTES,
@@ -590,6 +622,7 @@ pub async fn resolve_default_model<T: NimTransport + Clone>(
             config,
             route,
             models,
+            bearer: routed_bearer,
         },
         Err(_) => ModelResolution::Degraded {
             reason: "invalid_model_config",
@@ -604,17 +637,17 @@ pub async fn resolve_default_model<T: NimTransport + Clone>(
 /// profile's evidence. Returns `None` when the default profile's discovery
 /// fails; other profiles degrade best-effort so one unreachable endpoint
 /// cannot hide an eligible alternative.
-async fn discover_enabled_profiles<T: NimTransport + Clone>(
+async fn discover_enabled_profiles<T: OpenAiTransport + Clone>(
     settings: &LocalSettings,
     profiles: &[ProviderProfile],
     default_profile_id: &ProviderProfileId,
     transport: &T,
-    bearer: Option<&str>,
+    lookup: &impl Fn(&SecretRef) -> Option<String>,
 ) -> Option<Vec<DiscoveredModel>> {
     let mut discovered = Vec::new();
     for profile in profiles.iter().filter(|profile| profile.enabled()) {
         let base_url = settings.endpoint_for(profile.id().as_str())?;
-        let Ok(discovery_config) = NimConfig::new(
+        let Ok(discovery_config) = OpenAiDiscoveryConfig::new(
             base_url,
             profile.secret_reference().cloned(),
             profile.timeouts().request(),
@@ -627,11 +660,15 @@ async fn discover_enabled_profiles<T: NimTransport + Clone>(
         // Credentials cross the transport boundary only for profiles whose
         // typed auth strategy references secret material.
         let profile_bearer = match profile.auth_strategy() {
-            AuthStrategy::SecretRef => bearer,
+            AuthStrategy::SecretRef => match profile.secret_reference().and_then(lookup) {
+                Some(bearer) => Some(bearer),
+                None if profile.id() == default_profile_id => return None,
+                None => continue,
+            },
             AuthStrategy::None => None,
         };
-        match NimDiscovery::new(discovery_config, transport.clone())
-            .refresh(profile_bearer)
+        match OpenAiModelDiscovery::new(discovery_config, transport.clone())
+            .refresh(profile_bearer.as_deref())
             .await
         {
             Ok(catalog) => discovered.extend(
