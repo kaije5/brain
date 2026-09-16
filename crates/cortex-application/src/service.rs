@@ -2,15 +2,14 @@ use std::collections::BTreeSet;
 
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion,
-    MemoryAssertionInput, MemoryStatus, PolicyDecision, PolicyDeny, PrincipalId,
-    ResourceTarget, Revision, WorkspaceId,
+    MemoryAssertionInput, MemoryStatus, PolicyDecision, PolicyDeny, PrincipalId, ResourceTarget,
+    Revision, WorkspaceId,
 };
 
 use crate::{
     AggregateChange, ApplicationError, AtomicMutation, AtomicMutationPort, Capability,
     CommandContext, MemoryCorrectInput, MemoryCreateInput, MemoryRepository, MutationResult,
-OperationResultRepository, SourceRepository,
-
+    OperationResultRepository, SourceRepository,
 };
 
 /// A workspace-scoped capability grant issued by Cortex-owned configuration.

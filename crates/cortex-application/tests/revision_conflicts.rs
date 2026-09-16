@@ -55,9 +55,7 @@ async fn stale_delete_is_rejected_and_leaves_newer_memory_active() -> Result<(),
 
     assert!(matches!(
         result,
-        Err(ApplicationError::Conflict {
-            entity: "memory"
-        })
+        Err(ApplicationError::Conflict { entity: "memory" })
     ));
     let successor =
         MemoryRepository::find_history(&fixture.state, fixture.workspace_id, updated.entity_id)
@@ -142,10 +140,11 @@ async fn repeated_operation_still_requires_the_current_capability() -> Result<()
         .await;
 
     assert!(matches!(replay, Err(ApplicationError::PolicyDenied(_))));
-    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, first.entity_id)
-        .await
-        .map_err(debug_error)?
-        .ok_or("memory missing")?;
+    let persisted =
+        MemoryRepository::find_history(&fixture.state, fixture.workspace_id, first.entity_id)
+            .await
+            .map_err(debug_error)?
+            .ok_or("memory missing")?;
     assert_eq!(persisted.statement(), "Original");
     Ok(())
 }
@@ -193,9 +192,10 @@ async fn repeated_operation_rejects_a_different_granted_principal() -> Result<()
             entity: "operation"
         })
     );
-    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, first.entity_id)
-        .await
-        .map_err(debug_error)?;
+    let persisted =
+        MemoryRepository::find_history(&fixture.state, fixture.workspace_id, first.entity_id)
+            .await
+            .map_err(debug_error)?;
     assert!(persisted.is_some());
     Ok(())
 }
@@ -213,7 +213,11 @@ async fn repeated_operation_rejects_a_different_allowed_capability() -> Result<(
 
     let replay = fixture
         .service
-        .delete_memory(fixture.context_for(operation_id), memory.entity_id, memory.revision)
+        .delete_memory(
+            fixture.context_for(operation_id),
+            memory.entity_id,
+            memory.revision,
+        )
         .await;
 
     assert_eq!(
@@ -222,10 +226,11 @@ async fn repeated_operation_rejects_a_different_allowed_capability() -> Result<(
             entity: "operation"
         })
     );
-    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, memory.entity_id)
-        .await
-        .map_err(debug_error)?
-        .ok_or("memory missing")?;
+    let persisted =
+        MemoryRepository::find_history(&fixture.state, fixture.workspace_id, memory.entity_id)
+            .await
+            .map_err(debug_error)?
+            .ok_or("memory missing")?;
     assert_eq!(persisted.lifecycle(), Lifecycle::Active);
     Ok(())
 }
@@ -275,10 +280,14 @@ async fn repeated_operation_rejects_a_different_target() -> Result<(), String> {
             entity: "operation"
         })
     );
-    let second = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, second_memory.entity_id)
-        .await
-        .map_err(debug_error)?
-        .ok_or("second memory missing")?;
+    let second = MemoryRepository::find_history(
+        &fixture.state,
+        fixture.workspace_id,
+        second_memory.entity_id,
+    )
+    .await
+    .map_err(debug_error)?
+    .ok_or("second memory missing")?;
     assert_eq!(second.statement(), "Original");
     Ok(())
 }

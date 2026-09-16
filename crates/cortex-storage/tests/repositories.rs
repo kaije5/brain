@@ -1,11 +1,11 @@
 use cortex_application::{
     AggregateChange, AtomicMutation, AtomicMutationPort, Capability, CommandContext,
-    MemoryRepository, MutationResult, NoteRepository, SourceRepository, TaskRepository,
+    MemoryRepository, MutationResult, SourceRepository,
 };
 use cortex_domain::{
-    AuditEvent, AuditEventId, AuditResult, Lifecycle, MemoryAssertion, MemoryAssertionInput, Note,
-    NoteInput, OperationId, PolicyDecision, PrincipalId, ResourceTarget, Source, SourceInput,
-    SourceRef, Task, TaskInput, WorkspaceId,
+    AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion,
+    MemoryAssertionInput, OperationId, PolicyDecision, PrincipalId, ResourceTarget, Revision,
+    Source, SourceInput, SourceRef, WorkspaceId,
 };
 use cortex_storage::{SqliteDatabase, SqliteRepositories};
 use tempfile::TempDir;
@@ -22,28 +22,16 @@ async fn repositories_round_trip_each_aggregate_without_crossing_workspaces() ->
     let operations = database.operation_store();
     let (workspace_id, other_workspace_id, principal_id) = setup(&repositories).await?;
 
-    let note = Note::create(NoteInput {
-        workspace_id,
-        title: "Cortex".to_owned(),
-        content: "Local knowledge".to_owned(),
-    })
-    .map_err(debug_error)?;
-    let task = Task::create(TaskInput {
-        workspace_id,
-        title: "Verify persistence".to_owned(),
-        due_at: None,
-    })
-    .map_err(debug_error)?;
     let source = Source::create(SourceInput {
         workspace_id,
-        reference: "note:cortex".to_owned(),
+        reference: "memory:cortex".to_owned(),
     })
     .map_err(debug_error)?;
     let deleted_source = Source::rehydrate(
-        cortex_domain::EntityId::new(),
+        EntityId::new(),
         workspace_id,
         "deleted evidence".to_owned(),
-        cortex_domain::Revision::initial(),
+        Revision::initial(),
         Lifecycle::Deleted,
     )
     .map_err(debug_error)?;
@@ -59,20 +47,18 @@ async fn repositories_round_trip_each_aggregate_without_crossing_workspaces() ->
     })
     .map_err(debug_error)?;
     let create_context = context(workspace_id, principal_id);
-    let create_audit = audit(&create_context, note.id(), "cortex_note_create");
+    let create_audit = audit(&create_context, memory.id(), "cortex_memory_create");
     let result = MutationResult {
-        entity_id: note.id(),
-        revision: note.revision(),
-        lifecycle: note.lifecycle(),
+        entity_id: memory.id(),
+        revision: memory.revision(),
+        lifecycle: memory.lifecycle(),
         audit_correlation_id: create_context.correlation_id,
     };
     let mutation = AtomicMutation::new(
         create_context,
-        Capability::NoteCreate,
+        Capability::MemoryCreate,
         None,
         vec![
-            AggregateChange::InsertNote(note.clone()),
-            AggregateChange::InsertTask(task.clone()),
             AggregateChange::InsertSource(source.clone()),
             AggregateChange::InsertSource(deleted_source.clone()),
             AggregateChange::InsertMemory(memory.clone()),
@@ -86,33 +72,21 @@ async fn repositories_round_trip_each_aggregate_without_crossing_workspaces() ->
         .await
         .map_err(debug_error)?;
 
-    assert_eq!(
-        NoteRepository::find(&repositories, workspace_id, note.id())
-            .await
-            .map_err(debug_error)?,
-        Some(note.clone())
-    );
-    assert_eq!(
-        TaskRepository::find(&repositories, workspace_id, task.id())
-            .await
-            .map_err(debug_error)?,
-        Some(task)
-    );
     assert_source_visibility(&repositories, workspace_id, source, deleted_source).await?;
-    assert_memory_visible(&repositories, workspace_id, memory).await?;
+    assert_memory_visible(&repositories, workspace_id, memory.clone()).await?;
     assert_eq!(
-        NoteRepository::find(&repositories, other_workspace_id, note.id())
+        MemoryRepository::find(&repositories, other_workspace_id, memory.id())
             .await
             .map_err(debug_error)?,
         None
     );
 
-    assert_note_tombstone_visibility(
+    assert_memory_tombstone_visibility(
         &operations,
         &repositories,
         workspace_id,
         principal_id,
-        &note,
+        &memory,
     )
     .await?;
     Ok(())
@@ -153,44 +127,44 @@ async fn assert_memory_visible(
     Ok(())
 }
 
-async fn assert_note_tombstone_visibility(
+async fn assert_memory_tombstone_visibility(
     operations: &impl AtomicMutationPort,
     repositories: &SqliteRepositories,
     workspace_id: WorkspaceId,
     principal_id: PrincipalId,
-    note: &Note,
+    memory: &MemoryAssertion,
 ) -> Result<(), String> {
     let delete_context = context(workspace_id, principal_id);
-    let delete_revision = note.revision().next().map_err(debug_error)?;
+    let delete_revision = memory.revision().next().map_err(debug_error)?;
     let delete_result = MutationResult {
-        entity_id: note.id(),
+        entity_id: memory.id(),
         revision: delete_revision,
         lifecycle: Lifecycle::Deleted,
         audit_correlation_id: delete_context.correlation_id,
     };
     let delete = AtomicMutation::new(
         delete_context,
-        Capability::NoteDelete,
-        Some(ResourceTarget::CortexEntity(note.id())),
-        vec![AggregateChange::DeleteNote {
-            entity_id: note.id(),
-            expected_revision: note.revision(),
+        Capability::MemoryDelete,
+        Some(ResourceTarget::CortexEntity(memory.id())),
+        vec![AggregateChange::DeleteMemory {
+            entity_id: memory.id(),
+            expected_revision: memory.revision(),
         }],
         delete_result,
-        audit(&delete_context, note.id(), "cortex_note_delete"),
+        audit(&delete_context, memory.id(), "cortex_memory_delete"),
     )
     .map_err(debug_error)?;
     operations.execute_once(delete).await.map_err(debug_error)?;
     assert_eq!(
-        NoteRepository::find(repositories, workspace_id, note.id())
+        MemoryRepository::find(repositories, workspace_id, memory.id())
             .await
             .map_err(debug_error)?,
         None
     );
-    let tombstone = NoteRepository::find_history(repositories, workspace_id, note.id())
+    let tombstone = MemoryRepository::find_history(repositories, workspace_id, memory.id())
         .await
         .map_err(debug_error)?
-        .ok_or("note tombstone missing")?;
+        .ok_or("memory tombstone missing")?;
     assert_eq!(tombstone.lifecycle(), Lifecycle::Deleted);
     assert_eq!(tombstone.revision(), delete_revision);
     Ok(())
@@ -226,11 +200,7 @@ fn context(workspace_id: WorkspaceId, principal_id: PrincipalId) -> CommandConte
     )
 }
 
-fn audit(
-    context: &CommandContext,
-    target_id: cortex_domain::EntityId,
-    capability: &'static str,
-) -> AuditEvent {
+fn audit(context: &CommandContext, target_id: EntityId, capability: &'static str) -> AuditEvent {
     AuditEvent {
         id: AuditEventId::new(),
         workspace_id: context.workspace_id,

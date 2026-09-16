@@ -1,6 +1,6 @@
 use cortex_domain::{
-    DomainError, EntityId, Lifecycle, MemoryAssertion, MemoryStatus, Revision, Source,
-    SourceRef, WorkspaceId,
+    DomainError, EntityId, Lifecycle, MemoryAssertion, MemoryStatus, Revision, Source, SourceRef,
+    WorkspaceId,
 };
 use uuid::Uuid;
 

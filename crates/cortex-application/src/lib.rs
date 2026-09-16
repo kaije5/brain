@@ -27,9 +27,7 @@ pub use capability::{
     AuditClassification, Capability, CapabilityCatalog, CapabilityMetadata, ContractDescriptor,
     Idempotency,
 };
-pub use command::{
-    CommandContext, MemoryCorrectInput, MemoryCreateInput, MutationResult,
-};
+pub use command::{CommandContext, MemoryCorrectInput, MemoryCreateInput, MutationResult};
 pub use cortex_domain::{PolicyDecision, PolicyDeny};
 pub use error::{ApplicationError, RecoveryHint};
 pub use knowledge::{

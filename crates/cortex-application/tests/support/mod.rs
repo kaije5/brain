@@ -133,7 +133,6 @@ impl FakeState {
     pub fn memory_count(&self) -> Result<usize, String> {
         Ok(self.lock()?.memories.len())
     }
-
 }
 
 impl MemoryRepository for FakeState {

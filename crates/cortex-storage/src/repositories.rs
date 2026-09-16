@@ -1,11 +1,10 @@
-use chrono::{DateTime, Utc};
 use cortex_application::{
     ApplicationError, Capability, Embedding, EntityKind, IndexedVector, MemoryRepository,
-    NoteRepository, SearchCandidate, SearchIndex, SourceRepository, TaskRepository,
+    SearchCandidate, SearchIndex, SourceRepository,
 };
 use cortex_domain::{
-    EntityId, Lifecycle, MemoryAssertion, MemoryStatus, Note, PrincipalId, Revision, Source,
-    SourceRef, Task, TaskStatus, WorkspaceId,
+    EntityId, Lifecycle, MemoryAssertion, MemoryStatus, PrincipalId, Revision, Source, SourceRef,
+    WorkspaceId,
 };
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
@@ -333,13 +332,7 @@ impl SqliteRepositories {
              AND EXISTS (SELECT 1 FROM capability_grant AS grant_row \
                  WHERE grant_row.workspace_id = d.workspace_id \
                  AND grant_row.principal_id = ? AND grant_row.capability = ?) \
-             AND ((d.entity_kind = 'note' AND EXISTS (SELECT 1 FROM note AS n \
-                     WHERE n.workspace_id = d.workspace_id AND n.id = d.entity_id \
-                     AND n.lifecycle = 'active')) \
-                 OR (d.entity_kind = 'task' AND EXISTS (SELECT 1 FROM task AS t \
-                     WHERE t.workspace_id = d.workspace_id AND t.id = d.entity_id \
-                     AND t.lifecycle = 'active')) \
-                 OR (d.entity_kind = 'memory' AND EXISTS (SELECT 1 FROM memory_assertion AS m \
+             AND ((d.entity_kind = 'memory' AND EXISTS (SELECT 1 FROM memory_assertion AS m \
                      WHERE m.workspace_id = d.workspace_id AND m.id = d.entity_id \
                      AND m.lifecycle = 'active' AND m.status = 'active') \
                      AND EXISTS (SELECT 1 FROM memory_source AS ms \
@@ -449,13 +442,7 @@ impl SqliteRepositories {
              AND EXISTS (SELECT 1 FROM capability_grant AS grant_row \
                  WHERE grant_row.workspace_id = d.workspace_id \
                  AND grant_row.principal_id = ? AND grant_row.capability = ?) \
-             AND ((d.entity_kind = 'note' AND EXISTS (SELECT 1 FROM note AS n \
-                     WHERE n.workspace_id = d.workspace_id AND n.id = d.entity_id \
-                     AND n.lifecycle = 'active')) \
-                 OR (d.entity_kind = 'task' AND EXISTS (SELECT 1 FROM task AS t \
-                     WHERE t.workspace_id = d.workspace_id AND t.id = d.entity_id \
-                     AND t.lifecycle = 'active')) \
-                 OR (d.entity_kind = 'memory' AND EXISTS (SELECT 1 FROM memory_assertion AS m \
+             AND ((d.entity_kind = 'memory' AND EXISTS (SELECT 1 FROM memory_assertion AS m \
                      WHERE m.workspace_id = d.workspace_id AND m.id = d.entity_id \
                      AND m.lifecycle = 'active' AND m.status = 'active') \
                      AND EXISTS (SELECT 1 FROM memory_source AS ms \
@@ -518,12 +505,6 @@ impl SqliteRepositories {
         kind: EntityKind,
     ) -> Result<bool, ApplicationError> {
         let statement = match kind {
-            EntityKind::Note => {
-                "SELECT EXISTS(SELECT 1 FROM note WHERE workspace_id = ? AND id = ?)"
-            }
-            EntityKind::Task => {
-                "SELECT EXISTS(SELECT 1 FROM task WHERE workspace_id = ? AND id = ?)"
-            }
             EntityKind::Memory => {
                 "SELECT EXISTS(SELECT 1 FROM memory_assertion WHERE workspace_id = ? AND id = ?)"
             }
@@ -565,7 +546,6 @@ impl SqliteRepositories {
             EntityKind::Source => Ok(vec![SourceRef {
                 source_id: entity_id,
             }]),
-            EntityKind::Note | EntityKind::Task => Ok(Vec::new()),
         }
     }
 }
@@ -626,97 +606,6 @@ fn search_content_hash(snippet: &str) -> [u8; 32] {
     let mut hash = [0_u8; 32];
     hash.copy_from_slice(&digest);
     hash
-}
-
-impl NoteRepository for SqliteRepositories {
-    async fn find(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Note>, ApplicationError> {
-        let row = sqlx::query(
-            "SELECT id, workspace_id, title, content, revision, lifecycle \
-              FROM note WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'",
-        )
-        .bind(id_text(workspace_id))
-        .bind(id_text(entity_id))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|_| storage_error("note lookup failed"))?;
-        row.map(|row| decode_note(&row)).transpose()
-    }
-
-    async fn find_history(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Note>, ApplicationError> {
-        let row = sqlx::query(
-            "SELECT id, workspace_id, title, content, revision, lifecycle \
-             FROM note WHERE workspace_id = ? AND id = ?",
-        )
-        .bind(id_text(workspace_id))
-        .bind(id_text(entity_id))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|_| storage_error("note history lookup failed"))?;
-        row.map(|row| decode_note(&row)).transpose()
-    }
-}
-
-impl TaskRepository for SqliteRepositories {
-    async fn list_active(
-        &self,
-        workspace_id: WorkspaceId,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<Task>, ApplicationError> {
-        let limit = i64::try_from(limit.get()).map_err(|_| storage_error("task list failed"))?;
-        let rows = sqlx::query(
-            "SELECT id, workspace_id, title, due_at, status, revision, lifecycle \
-             FROM task WHERE workspace_id = ? AND lifecycle = 'active' \
-             ORDER BY due_at IS NULL, due_at, id LIMIT ?",
-        )
-        .bind(id_text(workspace_id))
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| storage_error("task list failed"))?;
-        rows.iter().map(decode_task).collect()
-    }
-
-    async fn find(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Task>, ApplicationError> {
-        let row = sqlx::query(
-            "SELECT id, workspace_id, title, due_at, status, revision, lifecycle \
-             FROM task WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'",
-        )
-        .bind(id_text(workspace_id))
-        .bind(id_text(entity_id))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|_| storage_error("task lookup failed"))?;
-        row.map(|row| decode_task(&row)).transpose()
-    }
-
-    async fn find_history(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Task>, ApplicationError> {
-        let row = sqlx::query(
-            "SELECT id, workspace_id, title, due_at, status, revision, lifecycle \
-             FROM task WHERE workspace_id = ? AND id = ?",
-        )
-        .bind(id_text(workspace_id))
-        .bind(id_text(entity_id))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|_| storage_error("task history lookup failed"))?;
-        row.map(|row| decode_task(&row)).transpose()
-    }
 }
 
 impl SourceRepository for SqliteRepositories {
@@ -817,41 +706,6 @@ async fn load_memory_sources(
         .collect()
 }
 
-fn decode_note(row: &sqlx::sqlite::SqliteRow) -> Result<Note, ApplicationError> {
-    Note::rehydrate(
-        row_id(row, "id")?,
-        row_id(row, "workspace_id")?,
-        row_text(row, "title")?,
-        row_text(row, "content")?,
-        row_revision(row)?,
-        decode_lifecycle(&row_text(row, "lifecycle")?)?,
-    )
-    .map_err(ApplicationError::from)
-}
-
-fn decode_task(row: &sqlx::sqlite::SqliteRow) -> Result<Task, ApplicationError> {
-    let due_at: Option<String> = row
-        .try_get("due_at")
-        .map_err(|_| storage_error("invalid task row"))?;
-    let due_at = due_at
-        .map(|value| {
-            DateTime::parse_from_rfc3339(&value)
-                .map(|value| value.with_timezone(&Utc))
-                .map_err(|_| storage_error("invalid task due date"))
-        })
-        .transpose()?;
-    Task::rehydrate(
-        row_id(row, "id")?,
-        row_id(row, "workspace_id")?,
-        row_text(row, "title")?,
-        due_at,
-        decode_task_status(&row_text(row, "status")?)?,
-        row_revision(row)?,
-        decode_lifecycle(&row_text(row, "lifecycle")?)?,
-    )
-    .map_err(ApplicationError::from)
-}
-
 fn decode_source(row: &sqlx::sqlite::SqliteRow) -> Result<Source, ApplicationError> {
     Source::rehydrate(
         row_id(row, "id")?,
@@ -940,21 +794,6 @@ pub(crate) fn decode_lifecycle(value: &str) -> Result<Lifecycle, ApplicationErro
         "active" => Ok(Lifecycle::Active),
         "deleted" => Ok(Lifecycle::Deleted),
         _ => Err(storage_error("invalid lifecycle")),
-    }
-}
-
-pub(crate) const fn encode_task_status(value: TaskStatus) -> &'static str {
-    match value {
-        TaskStatus::Open => "open",
-        TaskStatus::Completed => "completed",
-    }
-}
-
-fn decode_task_status(value: &str) -> Result<TaskStatus, ApplicationError> {
-    match value {
-        "open" => Ok(TaskStatus::Open),
-        "completed" => Ok(TaskStatus::Completed),
-        _ => Err(storage_error("invalid task status")),
     }
 }
 
