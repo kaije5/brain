@@ -16,7 +16,10 @@ use cortex_inference::{
     AgentLimits, AgentRunner, AuthorizedCapabilities, OpenAiCompatibleProvider,
     ReqwestOpenAiTransport, SystemPrompt,
 };
-use cortex_search::{HybridSearchService, SearchRequest};
+use cortex_search::{
+    DerivedVaultIndex, FusedLeg, HybridSearchService, RetrievalOutcome, SearchHit, SearchRequest,
+    fuse_with_memories, hybrid as vault_hybrid,
+};
 use cortex_storage::{
     OperationStore, ProviderOperationStore, RemoteEnrollmentRequest, SqliteAuditPort,
     SqliteDatabase, SqliteRepositories,
@@ -145,6 +148,8 @@ pub struct LocalDaemon {
     audit: SqliteAuditPort,
     authority: Option<Arc<DaemonAuthority>>,
     vault: Option<Arc<MarkdownVaultProvider>>,
+    /// Derived, rebuildable vault index backing fused knowledge retrieval.
+    vault_index: Arc<std::sync::RwLock<DerivedVaultIndex>>,
 }
 
 #[derive(Clone)]
@@ -460,7 +465,7 @@ impl LocalDaemon {
             database.audit_port(),
         ));
         let audit = database.audit_port();
-        let (authority, vault) = match vault_config {
+        let (authority, vault, vault_index) = match vault_config {
             Some(vault_config) => {
                 let opened = MarkdownVaultProvider::open(vault_config.clone(), config.workspace_id)
                     .map_err(|_| DaemonError::StartupFailed)?;
@@ -472,10 +477,14 @@ impl LocalDaemon {
                     database.provider_operation_store(),
                     database.audit_port(),
                 ));
-                (Some(authority), Some(vault))
+                let mut index = DerivedVaultIndex::new();
+                crate::vault_watcher::rebuild_vault(&vault, &mut index)
+                    .map_err(|_| DaemonError::StartupFailed)?;
+                (Some(authority), Some(vault), index)
             }
-            None => (None, None),
+            None => (None, None, DerivedVaultIndex::new()),
         };
+        let vault_index = Arc::new(std::sync::RwLock::new(vault_index));
         Ok(Self {
             database,
             database_path,
@@ -496,7 +505,22 @@ impl LocalDaemon {
             audit,
             authority,
             vault,
+            vault_index,
         })
+    }
+
+    /// Rebuilds the derived vault index from current vault content. Called
+    /// after vault mutations and by the watcher so fused retrieval stays
+    /// current; fully rebuildable, so failure never corrupts state.
+    pub fn refresh_vault_index(&self) -> bool {
+        let Some(vault) = &self.vault else {
+            return false;
+        };
+        let mut index = self
+            .vault_index
+            .write()
+            .expect("vault index mutex poisoned");
+        crate::vault_watcher::rebuild_vault(vault, &mut index).is_ok()
     }
 
     /// Installs the resolved model provider and discovered catalog after
@@ -1092,17 +1116,42 @@ impl LocalDaemon {
         let payload: SearchPayload = decode_payload(&request.payload)?;
         let limit = std::num::NonZeroUsize::new(payload.limit.unwrap_or(20).min(100))
             .ok_or(DaemonError::InvalidRequest)?;
-        let hits = self
+        // Cortex-owned AI memories come from the SQLite-backed hybrid search;
+        // user-authored knowledge comes from provenance-bearing vault chunks.
+        let memory_hits = self
             .search
             .search(SearchRequest {
                 workspace_id: self.workspace_id,
                 principal_id,
-                query: payload.query,
+                query: payload.query.clone(),
                 limit,
             })
             .await
-            .map_err(DaemonError::from)?;
-        Ok(search_response(request.request_id, hits))
+            .map_err(DaemonError::from)?
+            .into_iter()
+            .filter(|hit| hit.kind == cortex_search::EntityKind::Memory)
+            .collect::<Vec<SearchHit>>();
+        let vault_outcome = self.vault_retrieval(&payload.query, limit).await;
+        let fused = fuse_with_memories(vault_outcome, memory_hits, limit);
+        Ok(fused_search_response(request.request_id, fused))
+    }
+
+    /// Lexical/semantic retrieval over the derived vault index. Embedding
+    /// unavailability degrades to lexical-only instead of failing the search.
+    async fn vault_retrieval(
+        &self,
+        query: &str,
+        limit: std::num::NonZeroUsize,
+    ) -> RetrievalOutcome {
+        let query_embedding =
+            cortex_application::EmbeddingProvider::embed(&self.embedding_provider, query)
+                .await
+                .ok();
+        let index = self.vault_index.read().expect("vault index mutex poisoned");
+        vault_hybrid(&index, query, query_embedding.as_ref(), limit).unwrap_or(RetrievalOutcome {
+            hits: Vec::new(),
+            semantic_degraded: true,
+        })
     }
 
     async fn list_tasks(
@@ -1741,18 +1790,33 @@ fn provider_mutation_response(
     }
 }
 
-fn search_response(request_id: Uuid, hits: Vec<cortex_search::SearchHit>) -> DaemonResponse {
+/// Fused retrieval response: vault chunk hits carry their provider resource
+/// reference and chunk ordinal (provenance), memory hits keep the legacy
+/// entity shape.
+fn fused_search_response(request_id: Uuid, hits: Vec<cortex_search::FusedHit>) -> DaemonResponse {
     let values: Vec<_> = hits
         .into_iter()
         .take(MAX_SEARCH_RESULTS)
-        .map(|hit| {
-            json!({
+        .map(|hit| match hit.leg {
+            FusedLeg::VaultChunk(chunk) => json!({
+                "kind": "vault_chunk",
+                "provider": chunk.reference.resource.provider_id().as_str(),
+                "resource_id": chunk.reference.resource.resource_id().as_str(),
+                "resource_kind": match chunk.reference.resource.kind() {
+                    cortex_domain::ProviderResourceKind::Knowledge => "knowledge",
+                    cortex_domain::ProviderResourceKind::Task => "task",
+                },
+                "chunk": chunk.reference.chunk.get(),
+                "snippet": truncate_utf8(&chunk.snippet, MAX_SEARCH_SNIPPET_BYTES),
+                "semantic_degraded": chunk.semantic_rank.is_none(),
+            }),
+            FusedLeg::Memory(hit) => json!({
                 "entity_id": Uuid::from(hit.entity_id).to_string(),
                 "kind": hit.kind.as_str(),
                 "snippet": truncate_utf8(&hit.snippet, MAX_SEARCH_SNIPPET_BYTES),
                 "sources": hit.sources.into_iter().map(|source| Uuid::from(source.source_id).to_string()).collect::<Vec<_>>(),
                 "semantic_degraded": hit.semantic_degraded,
-            })
+            }),
         })
         .collect();
     DaemonResponse {
@@ -2457,17 +2521,20 @@ mod tests {
     #[test]
     fn search_wire_response_preserves_bounded_source_citations() {
         let source = cortex_domain::EntityId::new();
-        let response = super::search_response(
+        let response = super::fused_search_response(
             Uuid::now_v7(),
-            vec![cortex_search::SearchHit {
-                entity_id: cortex_domain::EntityId::new(),
-                kind: cortex_application::EntityKind::Memory,
-                snippet: "cited statement".to_owned(),
-                lexical_rank: Some(1),
-                semantic_rank: None,
+            vec![cortex_search::FusedHit {
+                leg: cortex_search::FusedLeg::Memory(cortex_search::SearchHit {
+                    entity_id: cortex_domain::EntityId::new(),
+                    kind: cortex_application::EntityKind::Memory,
+                    snippet: "cited statement".to_owned(),
+                    lexical_rank: Some(1),
+                    semantic_rank: None,
+                    fused_score: 1.0,
+                    sources: vec![cortex_domain::SourceRef { source_id: source }],
+                    semantic_degraded: false,
+                }),
                 fused_score: 1.0,
-                sources: vec![cortex_domain::SourceRef { source_id: source }],
-                semantic_degraded: false,
             }],
         );
         let WireResult::Success { value } = response.result else {
