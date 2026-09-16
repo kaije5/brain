@@ -11,6 +11,10 @@ use cortexd::{LocalSettings, data_directory};
 /// Async daemon effects applied back onto the state machine by the loop.
 enum Effect {
     Tasks(Result<Vec<(String, String)>, String>),
+    /// Freshness tag of the last vault task list (`current`/`stale`).
+    VaultFreshness(Option<String>),
+    /// Provider id of the daemon's configured vault, when present.
+    VaultProvider(Option<String>),
     Notes(Result<Vec<String>, String>),
     AgentChunk(String),
     Agent(Result<String, String>),
@@ -29,6 +33,7 @@ pub async fn run_interactive() -> Result<(), String> {
     let (sender, receiver) = mpsc::channel::<Effect>();
     let mut app = App::new();
     request_tasks(&client, sender.clone());
+    request_vault_status(&client, sender.clone());
     request_settings(&mut app);
 
     loop {
@@ -222,7 +227,20 @@ fn apply_effect(app: &mut App, effect: Effect, client: &DaemonClient) {
             app.set_status_line(format!("{} tasks loaded", rows.len()));
             app.set_tasks(rows);
         }
-        Effect::Tasks(Err(code)) => app.set_status_line(format!("tasks unavailable: {code}")),
+        Effect::Tasks(Err(code)) => {
+            // Typed provider errors surface with actionable recovery text;
+            // the raw code stays machine-parseable in parentheses.
+            let recovery = match code.as_str() {
+                "conflict" => "vault changed; refreshing",
+                "not_found" => "a task vanished; refreshing",
+                "permission_denied" => "this principal lacks the task.list grant",
+                _ => "check the daemon and vault configuration",
+            };
+            app.set_status_line(format!("tasks unavailable: {code} ({recovery})"));
+            app.set_tasks(Vec::new());
+        }
+        Effect::VaultFreshness(freshness) => app.set_task_freshness(freshness),
+        Effect::VaultProvider(provider) => app.set_vault_provider(provider),
         Effect::Notes(Ok(rows)) => {
             app.set_status_line(format!("{} notes found", rows.len()));
             app.set_note_results(rows);
@@ -244,11 +262,19 @@ fn request_tasks(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
             serde_json::json!({ "limit": 50 }),
         )
         .await;
+        let mut freshness = None;
         let rows = result.map(|values| {
-            // v2 lists are freshness-tagged envelopes of typed task rows.
+            // v2 lists are freshness-tagged envelopes of typed task rows; the
+            // tag drives the degraded-state banner in the Tasks tab.
             values
                 .iter()
-                .filter_map(|value| value.get("tasks")?.as_array())
+                .filter_map(|value| {
+                    freshness = value
+                        .get("freshness")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned);
+                    value.get("tasks")?.as_array()
+                })
                 .flatten()
                 .filter_map(|task| {
                     Some((
@@ -261,7 +287,25 @@ fn request_tasks(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
                 })
                 .collect()
         });
+        let _ = sender.send(Effect::VaultFreshness(freshness));
         let _ = sender.send(Effect::Tasks(rows));
+    });
+}
+
+/// Fetches the daemon's configured vault identity for the Settings tab.
+fn request_vault_status(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        let result = send_capability(&client, "cortex_daemon_status", serde_json::json!({})).await;
+        let provider = result.ok().and_then(|values| {
+            values.first().and_then(|status| {
+                status["vault"]["configured"]
+                    .as_bool()
+                    .filter(|configured| *configured)
+                    .and_then(|_| status["vault"]["provider_id"].as_str().map(str::to_owned))
+            })
+        });
+        let _ = sender.send(Effect::VaultProvider(provider));
     });
 }
 
