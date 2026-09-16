@@ -276,3 +276,87 @@ base_url = "http://127.0.0.1:8000/v1"
     // Historical default timeout is preserved for legacy configurations.
     assert_eq!(nim.timeouts().request().as_secs(), 5);
 }
+
+#[test]
+fn brain_prompt_inline_and_file_sources_are_parsed() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_settings(
+        directory.path(),
+        r#"
+[brain]
+prompt = "Always answer concisely."
+"#,
+    );
+    let settings = LocalSettings::load(&path)
+        .expect("loads")
+        .expect("settings present");
+    let source = settings.brain_prompt().expect("valid brain prompt");
+    match source {
+        Some(cortexd::BrainPromptSource::Inline(prompt)) => {
+            assert_eq!(prompt, "Always answer concisely.");
+        }
+        other => panic!("expected inline source, got {other:?}"),
+    }
+
+    let path = write_settings(
+        directory.path(),
+        r#"
+[brain]
+prompt_file = "brain-prompt.md"
+"#,
+    );
+    let settings = LocalSettings::load(&path)
+        .expect("loads")
+        .expect("settings present");
+    assert!(matches!(
+        settings.brain_prompt().expect("valid"),
+        Some(cortexd::BrainPromptSource::File(_))
+    ));
+}
+
+#[test]
+fn brain_prompt_rejects_inline_and_file_declared_together() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_settings(
+        directory.path(),
+        r#"
+[brain]
+prompt = "inline"
+prompt_file = "brain-prompt.md"
+"#,
+    );
+    let settings = LocalSettings::load(&path)
+        .expect("loads")
+        .expect("settings present");
+    assert!(settings.brain_prompt().is_err(), "both sources declared");
+}
+
+#[test]
+fn profile_prompts_are_parsed_per_profile_id() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_settings(
+        directory.path(),
+        r#"
+[models]
+default_profile = "nim"
+
+[models.profiles.nim]
+base_url = "https://nim.example/v1/"
+prompt = "Prefer concise technical answers."
+"#,
+    );
+    let settings = LocalSettings::load(&path)
+        .expect("loads")
+        .expect("settings present");
+    assert_eq!(
+        settings.profile_prompt("nim"),
+        Some("Prefer concise technical answers.")
+    );
+    assert_eq!(settings.profile_prompt("other"), None);
+    let config = settings.prompt_config().expect("prompt config");
+    assert!(config.global_inline.is_none());
+    assert_eq!(
+        config.profiles.get("nim").map(String::as_str),
+        Some("Prefer concise technical answers.")
+    );
+}

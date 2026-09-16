@@ -162,3 +162,29 @@ async fn agent_created_memories_are_visible_across_cli_and_mcp_search() {
 
     harness.shutdown().await;
 }
+
+#[tokio::test]
+async fn configured_global_brain_prompt_reaches_the_model_as_the_system_message() {
+    let harness = Harness::start().await;
+
+    // Drive one agent turn so the model is contacted.
+    harness
+        .agent_remember("The configured prompt guards this turn.")
+        .await
+        .assert_success();
+
+    // The harness settings fixture configures a persistent global Brain
+    // prompt; the model must receive it as the opening system message.
+    let system = harness.last_system_message().await.expect("system message");
+    assert!(
+        system.contains("E2E global Brain instructions are active."),
+        "the configured global prompt is in the system message: {system}"
+    );
+    // Cortex's protected instructions stay first and cannot be displaced by
+    // the configured layer.
+    assert!(
+        system.starts_with("You are Cortex, a local-first personal knowledge agent."),
+        "protected instructions remain first: {system}"
+    );
+    harness.shutdown().await;
+}

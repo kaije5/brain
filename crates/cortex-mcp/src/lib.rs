@@ -9,4 +9,4 @@ pub use server::{
     HttpSecurityConfig, McpPrincipal, McpServer, SecureStreamableHttpService,
     streamable_http_service,
 };
-pub use tools::{ToolSchema, tool_schema, tool_schemas};
+pub use tools::{ToolSchema, decode_arguments, tool_schema, tool_schemas, wire_capability};

@@ -1,6 +1,6 @@
 use cortex_application::ApplicationError;
 
-const MAX_SYSTEM_SECTION_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_SYSTEM_SECTION_BYTES: usize = 16 * 1024;
 
 /// Three-tier system prompt (SCRUM-79), modeled on hermes-agent's
 /// `agent/system_prompt.py`. The tiers exist to keep the serialized request
@@ -109,6 +109,176 @@ mod tests {
         assert!(
             prompt
                 .with_volatile("x".repeat(MAX_SYSTEM_SECTION_BYTES + 1))
+                .is_err()
+        );
+    }
+}
+
+/// Ordered Stable-tier prompt sources (SCRUM-147).
+///
+/// The effective Stable tier composes deterministically from, in order:
+/// Cortex's protected instructions (mandatory, never user-removable), the
+/// operator's global Brain prompt, and the resolved profile's instructions.
+/// Composition is a pure function of the configuration: an unchanged
+/// configuration renders a byte-identical Stable prefix (SCRUM-79), and
+/// nothing outside this configuration — vault text, memories, tool results,
+/// other provider content — can enter the tier.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PromptLayers {
+    cortex_protected: String,
+    user_global: Option<String>,
+    profile: Option<String>,
+}
+
+impl PromptLayers {
+    /// Builds the layers over Cortex's protected instructions.
+    ///
+    /// # Errors
+    /// Returns a validation error when the protected section is invalid.
+    pub fn new(cortex_protected: impl Into<String>) -> Result<Self, ApplicationError> {
+        Ok(Self {
+            cortex_protected: validate_section(cortex_protected, "system_prompt_protected")?,
+            user_global: None,
+            profile: None,
+        })
+    }
+
+    /// Sets the operator's global Brain instruction block.
+    ///
+    /// # Errors
+    /// Returns a validation error when the section is non-empty but invalid
+    /// (blank or oversized). `None` and empty strings keep the layer absent.
+    pub fn with_user_global(
+        mut self,
+        user_global: Option<impl Into<String>>,
+    ) -> Result<Self, ApplicationError> {
+        self.user_global = optional_section(user_global, "system_prompt_user_global")?;
+        Ok(self)
+    }
+
+    /// Sets the resolved profile's instruction block.
+    ///
+    /// # Errors
+    /// Returns a validation error when the section is non-empty but invalid.
+    pub fn with_profile(
+        mut self,
+        profile: Option<impl Into<String>>,
+    ) -> Result<Self, ApplicationError> {
+        self.profile = optional_section(profile, "system_prompt_profile")?;
+        Ok(self)
+    }
+
+    /// Composes the deterministic Stable tier: protected instructions first,
+    /// then the global Brain prompt, then profile instructions. Blank layers
+    /// are omitted, so a configuration without custom prompts composes to
+    /// exactly the protected text.
+    #[must_use]
+    pub fn compose_stable(&self) -> String {
+        let mut composed = String::new();
+        let layers: [Option<&str>; 3] = [
+            Some(self.cortex_protected.as_str()),
+            self.user_global.as_deref(),
+            self.profile.as_deref(),
+        ];
+        for layer in layers.into_iter().flatten() {
+            if !composed.is_empty() {
+                composed.push_str("\n\n");
+            }
+            composed.push_str(layer);
+        }
+        composed
+    }
+
+    /// Builds the system prompt with this Stable tier.
+    ///
+    /// # Errors
+    /// Returns a validation error when composition fails validation.
+    pub fn into_system_prompt(&self) -> Result<SystemPrompt, ApplicationError> {
+        SystemPrompt::new(self.compose_stable())
+    }
+}
+
+fn optional_section(
+    section: Option<impl Into<String>>,
+    field: &'static str,
+) -> Result<Option<String>, ApplicationError> {
+    match section {
+        None => Ok(None),
+        Some(value) => {
+            let value = value.into();
+            if value.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(validate_section(value, field)?))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod layered_tests {
+    use super::*;
+
+    #[test]
+    fn composes_protected_then_global_then_profile_in_order() {
+        let layers = PromptLayers::new("protected policy")
+            .expect("protected is valid")
+            .with_user_global(Some("global brain instructions"))
+            .expect("global is valid")
+            .with_profile(Some("profile instructions"))
+            .expect("profile is valid");
+        let prompt = layers.into_system_prompt().expect("composes");
+        assert_eq!(
+            prompt.stable_prefix(),
+            "protected policy\n\nglobal brain instructions\n\nprofile instructions"
+        );
+    }
+
+    #[test]
+    fn protected_instructions_are_always_present_and_first() {
+        let layers = PromptLayers::new("protected policy")
+            .expect("protected is valid")
+            .with_user_global(Some("user text"))
+            .expect("global is valid")
+            .with_profile(Some("profile text"))
+            .expect("profile is valid");
+        assert!(layers.compose_stable().starts_with("protected policy"));
+        let bare = PromptLayers::new("protected policy").expect("protected is valid");
+        assert_eq!(bare.compose_stable(), "protected policy");
+    }
+
+    #[test]
+    fn blank_layers_are_omitted_so_legacy_configurations_are_behavior_equivalent() {
+        let layers = PromptLayers::new("protected policy")
+            .expect("protected is valid")
+            .with_user_global(Some(String::new()))
+            .expect("blank is absent")
+            .with_profile(None::<String>)
+            .expect("none is absent");
+        assert_eq!(layers.compose_stable(), "protected policy");
+    }
+
+    #[test]
+    fn unchanged_configuration_composes_a_byte_identical_stable_prefix() {
+        let compose = || {
+            PromptLayers::new("protected policy")
+                .expect("protected is valid")
+                .with_user_global(Some("global"))
+                .expect("global is valid")
+                .with_profile(Some("profile"))
+                .expect("profile is valid")
+                .compose_stable()
+        };
+        assert_eq!(compose(), compose());
+    }
+
+    #[test]
+    fn oversized_layers_are_rejected() {
+        let oversized = "x".repeat(MAX_SYSTEM_SECTION_BYTES + 1);
+        assert!(
+            PromptLayers::new("protected")
+                .expect("protected is valid")
+                .with_user_global(Some(oversized))
                 .is_err()
         );
     }

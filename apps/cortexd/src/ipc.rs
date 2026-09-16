@@ -13,8 +13,8 @@ use cortex_domain::{
     TaskId, WorkspaceId,
 };
 use cortex_inference::{
-    AgentLimits, AgentRunner, AuthorizedCapabilities, OpenAiCompatibleProvider,
-    ReqwestOpenAiTransport, SystemPrompt,
+    AgentLimits, AgentRunner, AuthorizedCapabilities, OpenAiCompatibleProvider, PromptLayers,
+    ReqwestOpenAiTransport,
 };
 use cortex_search::{HybridSearchService, SearchRequest};
 use cortex_storage::{
@@ -30,12 +30,22 @@ use tokio::{
 };
 use uuid::{Uuid, Version};
 
-use crate::{DaemonConfig, MarkdownVaultProvider, config::MAX_REMOTE_CLIENTS};
+use crate::{
+    DaemonConfig, MarkdownVaultProvider, config::MAX_REMOTE_CLIENTS, config::ResolvedPromptConfig,
+};
 
 /// The only supported local IPC protocol version. v2 carries provider
 /// resource identity and opaque observed revisions for user content; no
 /// earlier version is accepted (SCRUM-117).
 pub const PROTOCOL_VERSION: u16 = 2;
+
+/// Cortex's protected Stable-tier instructions: mandatory security, policy
+/// and runtime guidance that operator configuration can extend but never
+/// remove or replace (SCRUM-147).
+pub const PROTECTED_CORTEX_PROMPT: &str = "You are Cortex, a local-first personal knowledge agent. \
+You can read and change the user's notes, tasks, and memories \
+through the provided tools. Prefer a tool over guessing, never \
+fabricate entity identifiers, and keep answers concise.";
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const MAX_SEARCH_RESULTS: usize = 32;
 const MAX_SEARCH_SNIPPET_BYTES: usize = 1024;
@@ -145,6 +155,11 @@ pub struct LocalDaemon {
     audit: SqliteAuditPort,
     authority: Option<Arc<DaemonAuthority>>,
     vault: Option<Arc<MarkdownVaultProvider>>,
+    /// Resolved Brain prompt configuration: immutable for the process
+    /// lifetime, so configuration changes apply only at the next daemon
+    /// start and never mutate in-flight requests (SCRUM-147).
+    prompt: ResolvedPromptConfig,
+    resolved_profile: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -460,6 +475,11 @@ impl LocalDaemon {
             database.audit_port(),
         ));
         let audit = database.audit_port();
+        let prompt = config
+            .prompt
+            .clone()
+            .resolve()
+            .map_err(|_| DaemonError::InvalidConfiguration)?;
         let (authority, vault) = match vault_config {
             Some(vault_config) => {
                 let opened = MarkdownVaultProvider::open(vault_config.clone(), config.workspace_id)
@@ -496,6 +516,8 @@ impl LocalDaemon {
             audit,
             authority,
             vault,
+            prompt,
+            resolved_profile: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -507,6 +529,7 @@ impl LocalDaemon {
         config: cortex_inference::OpenAiCompatibleConfig,
         bearer: Option<String>,
         models: Vec<String>,
+        profile_id: &str,
     ) {
         self.embedding_provider
             .install(DaemonEmbeddingProvider::Configured(Arc::new(
@@ -515,6 +538,23 @@ impl LocalDaemon {
         if let Ok(mut catalog) = self.discovered_models.write() {
             *catalog = models;
         }
+        if let Ok(mut resolved) = self.resolved_profile.write() {
+            *resolved = Some(profile_id.to_owned());
+        }
+    }
+
+    /// The composed Stable prompt tier for one resolved profile: Cortex's
+    /// protected instructions, then the operator's global Brain prompt, then
+    /// the profile instructions — deterministically ordered (SCRUM-147).
+    #[must_use]
+    pub fn composed_stable_prompt(&self, profile_id: Option<&str>) -> String {
+        let compose = || -> Result<String, cortex_application::ApplicationError> {
+            Ok(PromptLayers::new(PROTECTED_CORTEX_PROMPT)?
+                .with_user_global(self.prompt.global.clone())?
+                .with_profile(profile_id.and_then(|id| self.prompt.profiles.get(id).cloned()))?
+                .compose_stable())
+        };
+        compose().unwrap_or_else(|_| PROTECTED_CORTEX_PROMPT.to_owned())
     }
 
     /// Persists the durable routing decision `{profile_id, model_id}` so
@@ -1222,16 +1262,30 @@ impl LocalDaemon {
         let context = self.command_context(principal_id, request)?;
         let limits = AgentLimits::new(4, Duration::from_secs(30), 1, 32 * 1024, 128 * 1024)
             .map_err(DaemonError::from)?;
-        // SCRUM-79: the stable tier is the prompt-cache boundary and must stay
-        // byte-identical across sessions; per-session/turn tiers attach here
-        // once the daemon tracks that state.
-        let system_prompt = SystemPrompt::new(
-            "You are Cortex, a local-first personal knowledge agent. \
-             You can read and change the user's notes, tasks, and memories \
-             through the provided tools. Prefer a tool over guessing, never \
-             fabricate entity identifiers, and keep answers concise.",
-        )
-        .map_err(DaemonError::from)?;
+        // SCRUM-79 + SCRUM-147: the Stable tier composes deterministically
+        // from Cortex's protected instructions plus the configured Brain
+        // prompt layers for the resolved profile. It is a pure function of
+        // the process-lifetime prompt configuration, so it stays
+        // byte-identical across the turns of a session; configuration
+        // changes apply at the next daemon start. Retrieved memories, vault
+        // content and tool results remain contextual data in the volatile
+        // tiers and cannot elevate into this Stable tier.
+        let resolved_profile = self
+            .resolved_profile
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let layers = PromptLayers::new(PROTECTED_CORTEX_PROMPT)
+            .map_err(DaemonError::from)?
+            .with_user_global(self.prompt.global.clone())
+            .map_err(DaemonError::from)?
+            .with_profile(
+                resolved_profile
+                    .as_deref()
+                    .and_then(|id| self.prompt.profiles.get(id).cloned()),
+            )
+            .map_err(DaemonError::from)?;
+        let system_prompt = layers.into_system_prompt().map_err(DaemonError::from)?;
         let agent = AgentRunner::new(
             Arc::new(self.embedding_provider.clone()),
             Arc::new(DaemonAgentExecutor {

@@ -40,8 +40,21 @@ impl From<ApplicationError> for SettingsError {
 #[serde(deny_unknown_fields)]
 struct SettingsFile {
     daemon: Option<DaemonSection>,
+    brain: Option<BrainSection>,
     models: Option<ModelsSection>,
     vault: Option<VaultSection>,
+}
+
+/// The `[brain]` section: the operator's persistent global Brain prompt.
+/// Either an inline value or a file reference — never both, and never a
+/// credential (unknown keys are rejected at parse time).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrainSection {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    prompt_file: Option<String>,
 }
 
 /// The `[vault]` section: the daemon-owned, non-secret declaration of the
@@ -133,6 +146,10 @@ struct ModelProfileEntry {
     models: Vec<String>,
     #[serde(default)]
     quirks: ConfigQuirks,
+    /// Optional profile-specific Brain instructions (SCRUM-147), applied
+    /// only beneath Cortex's protected prompt layer.
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 fn enabled_by_default() -> bool {
@@ -175,6 +192,7 @@ fn profile_timeouts(entry: &ModelProfileEntry) -> Result<ProfileTimeouts, Settin
 #[derive(Clone, Debug)]
 pub struct LocalSettings {
     daemon: DaemonSection,
+    brain: Option<BrainSection>,
     models: ModelsSection,
     vault: Option<VaultSection>,
 }
@@ -199,6 +217,7 @@ impl LocalSettings {
                 database: None,
                 endpoint: None,
             }),
+            brain: file.brain,
             models: file.models.unwrap_or(ModelsSection {
                 default_profile: None,
                 profiles: None,
@@ -222,6 +241,15 @@ impl LocalSettings {
 # Local IPC endpoint name. Default: generated per workspace.
 #endpoint = "cortexd-local"
 
+[brain]
+# Persistent global Brain instructions (SCRUM-147). These join Cortex's
+# protected instructions in the Stable system-prompt tier and apply to new
+# agent sessions after a daemon restart. Declare either an inline prompt or
+# a prompt_file reference — never both. The file is read once at startup and
+# must be valid UTF-8; secrets never belong in prompt configuration.
+#prompt = "Always answer in the user's language."
+#prompt_file = "brain-prompt.md"
+
 [models]
 # Provider profile used for agent/chat inference. Resolved at runtime through
 # the capability-aware model router; a missing or ineligible profile leaves
@@ -240,6 +268,9 @@ impl LocalSettings {
 #secret_ref = "keyring:cortexd/nim"
 #auth_type = "secret_ref"
 #request_timeout_ms = 5000
+# Optional profile-specific Brain instructions, applied beneath Cortex's
+# protected instructions for sessions resolved to this profile.
+#prompt = "Prefer concise technical answers."
 
 #[vault]
 # The authoritative local Markdown vault provider (v0.2). Declares exactly
@@ -265,6 +296,76 @@ impl LocalSettings {
     #[must_use]
     pub fn database_override(&self) -> Option<&str> {
         self.daemon.database.as_deref()
+    }
+
+    /// The operator's global Brain prompt source from `[brain]`, or `None`
+    /// when no global prompt is configured. An inline `prompt` and a
+    /// `prompt_file` reference are mutually exclusive; a declared file is
+    /// read once at daemon composition (SCRUM-147).
+    ///
+    /// # Errors
+    /// Returns [`SettingsError::Invalid`] when both sources are declared or
+    /// a declared value fails validation.
+    pub fn brain_prompt(&self) -> Result<Option<BrainPromptSource>, SettingsError> {
+        let Some(section) = self.brain.as_ref() else {
+            return Ok(None);
+        };
+        match (section.prompt.as_deref(), section.prompt_file.as_deref()) {
+            (None, None) => Ok(None),
+            (Some(inline), None) => Ok(Some(BrainPromptSource::Inline(inline.to_owned()))),
+            (None, Some(file)) => Ok(Some(BrainPromptSource::File(std::path::PathBuf::from(
+                file,
+            )))),
+            (Some(_), Some(_)) => Err(SettingsError::Invalid { field: "prompt" }),
+        }
+    }
+
+    /// Builds the operator prompt configuration (SCRUM-147): the global
+    /// Brain prompt source plus every declared profile-specific prompt.
+    ///
+    /// # Errors
+    /// Returns [`SettingsError::Invalid`] when the global prompt declares
+    /// both an inline value and a file reference.
+    pub fn prompt_config(&self) -> Result<crate::config::PromptConfig, SettingsError> {
+        let global = self.brain_prompt()?;
+        let (global_inline, global_file) = match global {
+            None => (None, None),
+            Some(BrainPromptSource::Inline(inline)) => (Some(inline), None),
+            Some(BrainPromptSource::File(file)) => (None, Some(file)),
+        };
+        Ok(crate::config::PromptConfig {
+            global_inline,
+            global_file,
+            profiles: self.profile_prompts(),
+        })
+    }
+
+    /// Every declared profile-specific Brain prompt, keyed by profile id.
+    #[must_use]
+    pub fn profile_prompts(&self) -> std::collections::BTreeMap<String, String> {
+        self.models
+            .profiles
+            .iter()
+            .flatten()
+            .filter_map(|(id, entry)| {
+                entry
+                    .prompt
+                    .as_ref()
+                    .map(|prompt| (id.clone(), prompt.clone()))
+            })
+            .collect()
+    }
+
+    /// The optional profile-specific Brain prompt declared on one provider
+    /// profile (SCRUM-147). Applied only beneath Cortex's protected layer.
+    #[must_use]
+    pub fn profile_prompt(&self, profile_id: &str) -> Option<&str> {
+        self.models
+            .profiles
+            .as_ref()?
+            .get(profile_id)?
+            .prompt
+            .as_deref()
     }
 
     /// Default provider profile id from `[models] default_profile`.
@@ -384,6 +485,16 @@ impl LocalSettings {
             .get(profile_id)
             .map(|entry| entry.base_url.as_str())
     }
+}
+
+/// Where the operator's global Brain prompt comes from.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrainPromptSource {
+    /// An inline prompt value from `[brain] prompt`.
+    Inline(String),
+    /// A file reference from `[brain] prompt_file`, resolved and read once
+    /// at daemon composition.
+    File(std::path::PathBuf),
 }
 
 /// Data directory holding `cortex.db` and `cortexd.toml`. `CORTEX_DATABASE`
