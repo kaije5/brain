@@ -37,6 +37,18 @@ impl McpError {
         }
     }
 
+    /// The resource changed since the caller last observed it; the write was
+    /// rejected without overwriting anything.
+    #[must_use]
+    pub fn conflict() -> Self {
+        Self {
+            code: "cortex_conflict".to_owned(),
+            message: "The resource changed since the revision you supplied was observed."
+                .to_owned(),
+            correlation_id: None,
+        }
+    }
+
     #[must_use]
     pub(crate) const fn with_correlation(mut self, correlation_id: Uuid) -> Self {
         self.correlation_id = Some(correlation_id);

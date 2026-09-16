@@ -995,6 +995,20 @@ impl LocalDaemon {
                     .ok_or(DaemonError::InvalidConfiguration)?;
                 let resource =
                     self.resource_for(ProviderResourceKind::Task, &input.resource_id()?)?;
+                // Policy is evaluated before any provider content is read: a
+                // restore must not observe vault state it may not rewrite.
+                let capability = Capability::from_mcp_name(&request.capability)
+                    .ok_or(DaemonError::UnsupportedCapability)?;
+                if let Some(authority) = self.authority.as_ref() {
+                    authority
+                        .authorize(
+                            &context,
+                            capability,
+                            cortex_domain::ResourceTarget::ProviderResource(resource.clone()),
+                        )
+                        .await
+                        .map_err(DaemonError::from)?;
+                }
                 // A restore rewrites the whole record: the current content is
                 // read, while the caller's revision governs the write.
                 let current = self.read_task(&resource).await?;
