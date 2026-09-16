@@ -13,7 +13,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
     routing::post,
@@ -763,7 +763,49 @@ async fn fake_embedding(State(state): State<FakeModelState>) -> Response {
     Json(json!({"data": [{"embedding": [1.0, 0.0, 0.0]}]})).into_response()
 }
 
+/// Builds an SSE response streaming `content` in three deltas.
+fn sse_content_response(content: &str, tool_calls: &Value) -> Response {
+    use std::fmt::Write as _;
+    let chars: Vec<char> = content.chars().collect();
+    let third = chars.len().div_ceil(3);
+    let mut frames = String::new();
+    for delta in [
+        chars[..third.min(chars.len())].iter().collect::<String>(),
+        chars[third.min(chars.len())..third.saturating_mul(2).min(chars.len())]
+            .iter()
+            .collect::<String>(),
+        chars[third.saturating_mul(2).min(chars.len())..]
+            .iter()
+            .collect::<String>(),
+    ]
+    .into_iter()
+    .filter(|delta| !delta.is_empty())
+    {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            frames,
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{delta}\"}}}}]}}
+"
+        );
+    }
+    if tool_calls.as_array().is_some_and(|calls| !calls.is_empty()) {
+        let _ = writeln!(
+            frames,
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":{tool_calls}}}}}]}}
+"
+        );
+    }
+    frames.push_str(
+        "data: [DONE]
+
+",
+    );
+    ([(header::CONTENT_TYPE, "text/event-stream")], frames).into_response()
+}
+
+#[allow(clippy::too_many_lines)] // The scripted streaming/tool-call behaviors stay inspectable.
 async fn fake_chat(State(state): State<FakeModelState>, Json(body): Json<Value>) -> Response {
+    eprintln!("fake_chat received stream={:?}", body.get("stream"));
     if !state.available.load(Ordering::SeqCst) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -803,6 +845,12 @@ async fn fake_chat(State(state): State<FakeModelState>, Json(body): Json<Value>)
     } else {
         let statement = state.statement.lock().await.clone();
         if statement.is_empty() {
+            // SCRUM-80: streaming requests must get an SSE body even for
+            // plain replies, so this branch falls through to the common
+            // emitter instead of returning bare JSON.
+            if body.get("stream").and_then(Value::as_bool) == Some(true) {
+                return sse_content_response("No mutation requested.", &json!([]));
+            }
             return Json(json!({
                 "choices": [{"message": {"content": "No mutation requested.", "tool_calls": []}}]
             }))
@@ -830,6 +878,46 @@ async fn fake_chat(State(state): State<FakeModelState>, Json(body): Json<Value>)
             }]
         })
     };
+    // SCRUM-80: streaming requests get true Server-Sent Events with
+    // incremental content deltas and a [DONE] terminator.
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        let content = message["content"].as_str().unwrap_or_default().to_owned();
+        let tool_calls = message["tool_calls"].clone();
+        let chars: Vec<char> = content.chars().collect();
+        let mut frames = String::new();
+        if !chars.is_empty() {
+            let third = chars.len().div_ceil(3);
+            for delta in [
+                chars[..third].iter().collect::<String>(),
+                chars[third..third * 2].iter().collect::<String>(),
+                chars[third * 2..].iter().collect::<String>(),
+            ]
+            .into_iter()
+            .filter(|delta| !delta.is_empty())
+            {
+                use std::fmt::Write as _;
+                let _ = writeln!(
+                    frames,
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{delta}\"}}}}]}}
+"
+                );
+            }
+        }
+        if !tool_calls.is_null() && tool_calls.as_array().is_some_and(|calls| !calls.is_empty()) {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                frames,
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":{tool_calls}}}}}]}}
+"
+            );
+        }
+        frames.push_str(
+            "data: [DONE]
+
+",
+        );
+        return ([(header::CONTENT_TYPE, "text/event-stream")], frames).into_response();
+    }
     Json(json!({"choices": [{"message": message}]})).into_response()
 }
 

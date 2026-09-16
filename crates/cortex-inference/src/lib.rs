@@ -7,6 +7,7 @@ mod openai_discovery;
 mod provider;
 mod retry;
 mod routing;
+mod sse;
 mod system_prompt;
 
 pub use agent::{AgentLimits, AgentRunner, AuthorizedCapabilities};

@@ -616,8 +616,11 @@ where
         routed_profile.timeouts().request(),
         limits,
     )
-    .map(|config| config.with_quirks(routed_profile.quirks()))
-    {
+    .map(|config| {
+        config
+            .with_stale_stream_timeout(routed_profile.timeouts().stale_stream())
+            .with_quirks(routed_profile.quirks())
+    }) {
         Ok(config) => ModelResolution::Configured {
             config,
             route,

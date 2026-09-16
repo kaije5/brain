@@ -259,6 +259,7 @@ where
         .await
     }
 
+    #[allow(clippy::too_many_lines)] // The typed loop body stays reviewable in one place.
     async fn run_inner(
         &self,
         context: CommandContext,
@@ -297,14 +298,34 @@ where
                 self.limits.max_request_bytes,
                 "agent request exceeded configured byte limit",
             )?;
-            let response = tokio::time::timeout_at(deadline, self.provider.complete(request))
+            // SCRUM-80: when partial output is requested, stream true SSE
+            // deltas from the provider as they arrive; the typed failure of
+            // the underlying stream applies. Without a chunk consumer the
+            // non-streaming path is used unchanged.
+            let mut streamed_this_iteration = false;
+            let response = if let Some(on_chunk) = on_chunk {
+                streamed_this_iteration = true;
+                tokio::time::timeout_at(
+                    deadline,
+                    self.provider.complete_streaming(request, on_chunk),
+                )
                 .await
-                .map_err(|_| ApplicationError::InferenceTimeout)??;
-            if let (Some(content), Some(on_chunk)) = (
+                .map_err(|_| ApplicationError::InferenceTimeout)??
+            } else {
+                tokio::time::timeout_at(deadline, self.provider.complete(request))
+                    .await
+                    .map_err(|_| ApplicationError::InferenceTimeout)??
+            };
+            // With a streaming provider the deltas were already forwarded
+            // during `complete_streaming`; replaying the full content here
+            // would duplicate output. Only the non-streaming path forwards
+            // its complete content once.
+            if let (Some(content), Some(on_chunk), false) = (
                 response.content.as_deref().filter(|content| {
                     !content.trim().is_empty() && content.len() <= MAX_TEXT_BYTES
                 }),
                 on_chunk,
+                streamed_this_iteration,
             ) {
                 on_chunk(content);
             }

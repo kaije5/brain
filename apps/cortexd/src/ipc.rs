@@ -206,6 +206,24 @@ impl cortex_inference::InferenceProvider for DaemonEmbeddingProvider {
             }
         }
     }
+
+    async fn complete_streaming(
+        &self,
+        request: cortex_inference::InferenceRequest,
+        on_delta: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<cortex_inference::InferenceResponse, ApplicationError> {
+        match self {
+            Self::Unavailable => Err(ApplicationError::InferenceUnavailable),
+            Self::Configured(provider) => {
+                cortex_inference::InferenceProvider::complete_streaming(
+                    provider.as_ref(),
+                    request,
+                    on_delta,
+                )
+                .await
+            }
+        }
+    }
 }
 
 /// Model provider shared between the search service and the agent loop.
@@ -232,6 +250,15 @@ impl cortex_application::EmbeddingProvider for SharedEmbeddingProvider {
 }
 
 impl cortex_inference::InferenceProvider for SharedEmbeddingProvider {
+    async fn complete_streaming(
+        &self,
+        request: cortex_inference::InferenceRequest,
+        on_delta: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<cortex_inference::InferenceResponse, ApplicationError> {
+        cortex_inference::InferenceProvider::complete_streaming(&self.current(), request, on_delta)
+            .await
+    }
+
     async fn complete(
         &self,
         request: cortex_inference::InferenceRequest,
