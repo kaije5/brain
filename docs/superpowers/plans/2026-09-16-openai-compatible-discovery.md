@@ -14,6 +14,8 @@
 
 - Keep existing `cortexd.toml` profile syntax and the NVIDIA NIM UI preset.
 - Normalize root and `/v1` bases to one `/v1` API root; document custom unversioned root endpoint migration.
+- Use strict `json_schema` response validation for `StructuredOutput`; `json_object` is JSON mode only.
+- Keep a typed per-profile probe token-limit field: default `max_tokens` for existing profiles, explicit `max_completion_tokens` for models that require it.
 - Retain the HTTPS requirement for remote endpoints; allow loopback HTTP.
 - Never send one profile's bearer to another profile's endpoint.
 - Never infer capability from an HTTP success status alone.
@@ -33,7 +35,7 @@
 6. `crates/cortex-inference/tests/discovery.rs`, `apps/cortexd/tests/local_model_resolution.rs`: behavioral and credential-isolation tests; remove `tests/nim.rs` after migration.
 7. `docs/operations/local-setup.md`, `docs/adr/ADR-022-nvidia-nim-first-provider.md`: current instructions and historical decision note.
 
-Do not modify knowledge/task provider traits or vault code. Assign a Jira story key before implementing this feature branch; the current `chore/plan-openai-compatible-discovery` branch contains documentation only.
+Do not modify knowledge/task provider traits or vault code. Assign a Jira story key before implementing this feature branch; the current `chore/plan-openai-compatible-discovery` branch contains documentation only. The official NVIDIA hosted references reviewed for this plan document chat completions but do not establish hosted `GET /v1/models`; verify that endpoint against a configured hosted profile before claiming the NIM preset works. Do not substitute the unrelated NGC catalog endpoint or invent model IDs.
 
 ### Task 1: Share OpenAI-compatible endpoints and transport
 
@@ -64,10 +66,10 @@ Do not modify knowledge/task provider traits or vault code. Assign a Jira story 
 
 **Files:** Create `crates/cortex-inference/src/discovery.rs`; modify `crates/cortex-inference/src/lib.rs`; migrate `crates/cortex-inference/tests/nim.rs` to `crates/cortex-inference/tests/discovery.rs`; delete `crates/cortex-inference/src/nim.rs` and `tests/nim.rs` after all callers move.
 
-**Interfaces:** Export `OpenAiCompatibleDiscovery<T: OpenAiTransport>` and a validated `OpenAiDiscoveryConfig` containing the shared endpoint helper, timeout, and `ProviderQuirks`. `discover(&self, bearer: Option<&str>) -> Result<Vec<DiscoveredModel>, ApplicationError>` and `refresh(&self, bearer: Option<&str>) -> Result<ModelCatalog, ApplicationError>` retain their present contracts.
+**Interfaces:** Export `OpenAiCompatibleDiscovery<T: OpenAiTransport>` and a validated `OpenAiDiscoveryConfig` containing the shared endpoint helper, timeout, and `ProviderQuirks`. Add a typed `ProbeTokenLimitField` (`MaxTokens` or `MaxCompletionTokens`) to profile quirks; default to `MaxTokens` for current profiles. `discover(&self, bearer: Option<&str>) -> Result<Vec<DiscoveredModel>, ApplicationError>` and `refresh(&self, bearer: Option<&str>) -> Result<ModelCatalog, ApplicationError>` retain their present contracts.
 
-- [ ] **Step 1: Port model-list tests to neutral hosts and names.** Assert `data[*].id` validation, no duplicate `/v1`, maximum 128 entries, bounded response bytes, keyless and bearer requests, and typed failures. Add a non-NVIDIA fixture beside the NIM-hosted fixture; both must use the same component.
-- [ ] **Step 2: Add failing probe-evidence tests.** A 200 response with `{}`, plain content, malformed tool arguments, or invalid structured JSON must not produce evidence. A valid tool call for the requested `cortex_probe` tool grants only `ToolCalling`; valid JSON matching the requested object constraint grants only `StructuredOutput`. A refused probe remains negative; authentication and billing errors abort that profile's refresh. Assert probe body is under 2 KiB, requests at most 128 output tokens, and `omit_tool_choice` is honored.
+- [ ] **Step 1: Port model-list tests to neutral hosts and names.** Assert `data[*].id` validation, no duplicate `/v1`, maximum 128 entries, bounded response bytes, keyless and bearer requests, and typed failures. Add a non-NVIDIA fixture beside the self-hosted NIM fixture; both must use the same component.
+- [ ] **Step 2: Add failing probe-evidence tests.** A 200 response with `{}`, plain content, malformed tool arguments, or invalid schema output must not produce evidence. A valid tool call for the requested `cortex_probe` tool grants only `ToolCalling`; a response to a separate strict `json_schema` request with no tools that matches the schema grants only `StructuredOutput`. A `json_object` response alone never proves schema adherence. `finish_reason = "length"` or `content_filter`, and HTTP 202 pending, grant no evidence. A refused probe remains negative; authentication and billing errors abort that profile's refresh. Assert probe body is under 2 KiB, requests at most 128 output tokens, and `omit_tool_choice` is honored.
 
   ```rust
   let empty_ok = br#"{}"#.to_vec();
@@ -82,17 +84,19 @@ Do not modify knowledge/task provider traits or vault code. Assign a Jira story 
 
   ```rust
   // Positive tool evidence requires a parseable cortex_probe call with object arguments.
-  // Positive structured evidence requires response content parseable as a JSON object.
-  // A 2xx response without the corresponding content returns Ok(false).
+  // Positive structured evidence requires a strict json_schema request and
+  // response content matching that schema; plain json_object is insufficient.
+  // HTTP 202, incomplete output, or 200 without matching content returns Ok(false).
   const MAX_DISCOVERED_MODELS: usize = 128;
   const PROBE_CONCURRENCY: usize = 8;
   const PROBE_MAX_TOKENS: u32 = 128;
   ```
-- [ ] **Step 5: Rerun the focused tests. Remove the old NIM module, tests, and exports only after all new tests pass; commit.**
+- [ ] **Step 5: Add tests for both token-limit field spellings.** `MaxTokens` emits `max_tokens`, `MaxCompletionTokens` emits `max_completion_tokens`, and neither request sends both. Confirm a rejected parameter makes that model ineligible without switching fields silently.
+- [ ] **Step 6: Rerun the focused tests. Remove the old NIM module, tests, and exports only after all new tests pass; commit.**
 
 ### Task 3: Resolve credentials per profile and carry the selected credential
 
-**Files:** Modify `apps/cortexd/src/settings.rs`, `apps/cortexd/src/main.rs`, `apps/cortexd/src/lib.rs`, `apps/cortexd/tests/local_model_resolution.rs`; inspect `apps/cortexd/src/platform_secret_store.rs` and `crates/cortex-application/src/secrets.rs` for the existing resolution API.
+**Files:** Modify `apps/cortexd/src/settings.rs`, `apps/cortexd/src/main.rs`, `apps/cortexd/src/lib.rs`, `apps/cortexd/tests/local_model_resolution.rs`, and `apps/cortexd/tests/local_settings.rs`; inspect `apps/cortexd/src/platform_secret_store.rs` and `crates/cortex-application/src/secrets.rs` for the existing resolution API.
 
 **Interfaces:** Replace the single `bearer: Option<&str>` input to `resolve_default_model` with a lookup scoped by `ProviderProfileId` (an injected closure or trait returning an owned, redacted credential result). Make `ModelResolution::Configured` carry the selected credential alongside `{config, route, models}` in a field that has redacted `Debug`; do not derive `Debug` for raw secret values. The daemon installs only this credential. The default profile's missing secret yields explicit degradation; another profile's failure excludes that profile without sending a request.
 
@@ -119,7 +123,7 @@ impl std::fmt::Debug for ResolvedBearer {
   assert_eq!(installed_inference_bearer, "beta-token");
   ```
 - [ ] **Step 2: Run `cargo nextest run -p cortexd --test local_model_resolution`; confirm the credential-isolation assertions fail.**
-- [ ] **Step 3: Resolve secrets in the daemon composition root per enabled profile.** Inject a fake credential lookup in tests, use `PlatformSecretStore` in production, and avoid storing or printing raw values in settings, logs, route records, or `Debug`. Pass each profile's credential only to its own generic discovery/probe instance. Carry the routed profile's credential into `install_resolved_model`.
+- [ ] **Step 3: Resolve secrets in the daemon composition root per enabled profile.** Inject a fake credential lookup in tests, use `PlatformSecretStore` in production, and avoid storing or printing raw values in settings, logs, route records, or `Debug`. Pass each profile's credential only to its own generic discovery/probe instance. Carry the routed profile's credential into `install_resolved_model`. Parse the optional `probe_token_limit_field = "max_completion_tokens"` as a typed profile quirk and reject unknown values.
 
   ```rust
   // In main.rs: pass the real lookup, instead of resolving only default_profile_secret.
@@ -135,7 +139,7 @@ impl std::fmt::Debug for ResolvedBearer {
 **Files:** Modify `apps/brain/src/tui/mod.rs`, `apps/brain/src/tui/view.rs` only where text describes a NIM-only adapter; modify `docs/operations/local-setup.md`, `docs/adr/ADR-022-nvidia-nim-first-provider.md`; check `apps/cortexd/src/settings.rs` template. Leave historical Sprint 1 design and threat-model text intact.
 
 - [ ] **Step 1: Search production source for `NimConfig|NimDiscovery|NimTransport|ReqwestNimTransport` and NIM-only discovery claims.** The type-name search must return no production matches after Tasks 1–3. Preserve `nim` as the preset/profile ID and its official endpoint.
-- [ ] **Step 2: Update current setup wording.** Describe generic OpenAI-compatible model discovery and probing for custom profiles and the NVIDIA preset. Add an ADR-022 note that its NIM-specific adapter description was superseded by this generic implementation, with a link to the design spec. Do not rewrite the historical decision as if it never happened.
+- [ ] **Step 2: Update current setup wording.** Describe generic OpenAI-compatible model discovery and probing for custom profiles and the NVIDIA preset, including the strict-schema eligibility requirement, typed token-limit field, and root URL migration. State that NVIDIA hosted `/v1/models` availability requires verification; do not claim hosted discovery from self-hosted docs. Add an ADR-022 note that its NIM-specific adapter description was superseded by this generic implementation, with a link to the design spec. Do not rewrite the historical decision as if it never happened.
 - [ ] **Step 3: Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked`, and `cargo nextest run --workspace`. Investigate and fix actual failures before a PR. Commit docs/cleanup and report the exact Git state and verification results.**
 
 ## Plan self-review
@@ -144,4 +148,5 @@ impl std::fmt::Debug for ResolvedBearer {
 - Credential routing is profile-scoped: Task 3 covers discovery, probes, and selected inference.
 - Existing profile syntax and NIM preset remain: Task 4 verifies them.
 - Model eligibility requires parsed evidence: Task 2 tests false positives and valid demonstrations.
+- Official-doc gaps have gates: Task 2 distinguishes JSON mode from schema adherence and token-limit fields; Task 4 records hosted discovery verification.
 - Provider-neutral production names and docs are cleaned: Tasks 2 and 4.
