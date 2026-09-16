@@ -31,7 +31,8 @@ pub use vault::{
     InMemoryVaultProvider, VaultConfigError, VaultExclusion, VaultProviderConfig,
     VaultProviderMode, VaultScope,
 };
-pub use vault_provider::{ConfinedPath, MarkdownVaultProvider, VaultPathError};
+pub use vault_provider::{ConfinedPath, MarkdownVaultProvider, VaultPathError, VaultScanError};
 pub use vault_watcher::{
-    AppliedEvent, CoalescedEvent, DEFAULT_DEBOUNCE_MILLIS, EventQueue, VaultEvent, apply_event,
+    AppliedEvent, CoalescedEvent, DEFAULT_DEBOUNCE_MILLIS, EventQueue, ReconciliationError,
+    ReconciliationReport, VaultEvent, VaultReconciler, apply_event, rebuild_vault, reconcile_vault,
 };
