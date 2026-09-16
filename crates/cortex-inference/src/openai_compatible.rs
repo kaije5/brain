@@ -63,12 +63,83 @@ impl ProviderLimits {
     }
 }
 
-/// Validated configuration for loopback OpenAI-compatible operation routes.
+/// Validated OpenAI-compatible API base and derived resource endpoints.
+///
+/// The configured URL is the complete API base. Its path is preserved exactly;
+/// this connector never adds or removes a version segment such as `/v1`.
 #[derive(Clone, Debug)]
-pub struct OpenAiCompatibleConfig {
+pub struct OpenAiApiBase {
     base_url: reqwest::Url,
+    models_endpoint: reqwest::Url,
     chat_endpoint: reqwest::Url,
     embedding_endpoint: reqwest::Url,
+}
+
+impl OpenAiApiBase {
+    /// Validates an API base and derives OpenAI-compatible resource endpoints.
+    ///
+    /// # Errors
+    /// Returns a safe validation error for malformed endpoints. Loopback may
+    /// use cleartext HTTP; any remote endpoint must use HTTPS.
+    pub fn new(base_url: impl AsRef<str>) -> Result<Self, ApplicationError> {
+        let mut base_url = reqwest::Url::parse(base_url.as_ref())
+            .map_err(|_| ApplicationError::Validation { field: "endpoint" })?;
+        let valid_scheme = matches!(base_url.scheme(), "http" | "https");
+        let valid_authority = base_url.username().is_empty() && base_url.password().is_none();
+        let loopback = base_url.host_str().is_some_and(is_loopback_host);
+        let remote_https = base_url.scheme() == "https";
+        if !valid_scheme
+            || !valid_authority
+            || !(loopback || remote_https)
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+        {
+            return Err(ApplicationError::Validation { field: "endpoint" });
+        }
+        if !base_url.path().ends_with('/') {
+            let mut path = base_url.path().to_owned();
+            path.push('/');
+            base_url.set_path(&path);
+        }
+
+        let endpoint = |path| {
+            base_url
+                .join(path)
+                .map_err(|_| ApplicationError::Validation { field: "endpoint" })
+        };
+        Ok(Self {
+            models_endpoint: endpoint("models")?,
+            chat_endpoint: endpoint("chat/completions")?,
+            embedding_endpoint: endpoint("embeddings")?,
+            base_url,
+        })
+    }
+
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        self.base_url.as_str()
+    }
+
+    #[must_use]
+    pub fn models_endpoint(&self) -> &str {
+        self.models_endpoint.as_str()
+    }
+
+    #[must_use]
+    pub fn chat_endpoint(&self) -> &str {
+        self.chat_endpoint.as_str()
+    }
+
+    #[must_use]
+    pub fn embedding_endpoint(&self) -> &str {
+        self.embedding_endpoint.as_str()
+    }
+}
+
+/// Validated configuration for an OpenAI-compatible provider.
+#[derive(Clone, Debug)]
+pub struct OpenAiCompatibleConfig {
+    api_base: OpenAiApiBase,
     model: String,
     secret_reference: Option<SecretRef>,
     timeout: Duration,
@@ -90,31 +161,7 @@ impl OpenAiCompatibleConfig {
         timeout: Duration,
         limits: ProviderLimits,
     ) -> Result<Self, ApplicationError> {
-        let mut base_url = reqwest::Url::parse(base_url.as_ref())
-            .map_err(|_| ApplicationError::Validation { field: "endpoint" })?;
-        let valid_scheme = matches!(base_url.scheme(), "http" | "https");
-        let valid_authority = base_url.username().is_empty() && base_url.password().is_none();
-        let loopback = base_url.host_str().is_some_and(is_loopback_host);
-        let remote_https = base_url.scheme() == "https";
-        if !valid_scheme
-            || !valid_authority
-            || !(loopback || remote_https)
-            || base_url.query().is_some()
-            || base_url.fragment().is_some()
-        {
-            return Err(ApplicationError::Validation { field: "endpoint" });
-        }
-        if !base_url.path().ends_with('/') {
-            let mut path = base_url.path().to_owned();
-            path.push('/');
-            base_url.set_path(&path);
-        }
-        let chat_endpoint = base_url
-            .join("chat/completions")
-            .map_err(|_| ApplicationError::Validation { field: "endpoint" })?;
-        let embedding_endpoint = base_url
-            .join("embeddings")
-            .map_err(|_| ApplicationError::Validation { field: "endpoint" })?;
+        let api_base = OpenAiApiBase::new(base_url)?;
 
         let model = model.into();
         if model.trim().is_empty()
@@ -128,9 +175,7 @@ impl OpenAiCompatibleConfig {
         }
 
         Ok(Self {
-            base_url,
-            chat_endpoint,
-            embedding_endpoint,
+            api_base,
             model,
             secret_reference,
             timeout,
@@ -153,17 +198,17 @@ impl OpenAiCompatibleConfig {
 
     #[must_use]
     pub fn base_url(&self) -> &str {
-        self.base_url.as_str()
+        self.api_base.base_url()
     }
 
     #[must_use]
     pub fn chat_endpoint(&self) -> &str {
-        self.chat_endpoint.as_str()
+        self.api_base.chat_endpoint()
     }
 
     #[must_use]
     pub fn embedding_endpoint(&self) -> &str {
-        self.embedding_endpoint.as_str()
+        self.api_base.embedding_endpoint()
     }
 
     #[must_use]
@@ -197,6 +242,14 @@ fn is_loopback_host(host: &str) -> bool {
 /// Injectable JSON transport boundary for deterministic adapter tests.
 #[allow(async_fn_in_trait)]
 pub trait OpenAiTransport: Send + Sync {
+    async fn get_json(
+        &self,
+        endpoint: &str,
+        bearer: Option<&str>,
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Vec<u8>, ProviderError>;
+
     async fn post_json(
         &self,
         endpoint: &str,
@@ -227,6 +280,39 @@ impl Default for ReqwestOpenAiTransport {
 }
 
 impl OpenAiTransport for ReqwestOpenAiTransport {
+    async fn get_json(
+        &self,
+        endpoint: &str,
+        bearer: Option<&str>,
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Vec<u8>, ProviderError> {
+        let mut request = self.client.get(endpoint).timeout(timeout);
+        if let Some(value) = bearer.and_then(|token| {
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).ok()
+        }) {
+            request = request.header(reqwest::header::AUTHORIZATION, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| classify_network_error(&error))?;
+        let status = response.status();
+        if status.is_client_error() || status.is_server_error() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .cloned();
+            let error_body = read_bounded_body(response, max_response_bytes).await?;
+            return Err(classify_http_response(
+                status.as_u16(),
+                retry_after.as_ref(),
+                &error_body,
+            ));
+        }
+        read_bounded_body(response, max_response_bytes).await
+    }
+
     async fn post_json(
         &self,
         endpoint: &str,
@@ -437,6 +523,42 @@ mod tests {
             redirect_targeted.is_err(),
             "redirect target must not receive the replayed request"
         );
+    }
+
+    #[tokio::test]
+    async fn get_json_sends_a_bearer_token_to_the_configured_models_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let address = listener.local_addr().expect("listener address");
+        let responder = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("transport connects");
+            let mut request = vec![0_u8; 4096];
+            let received = socket.read(&mut request).await.expect("request bytes");
+            request.truncate(received);
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}",
+                )
+                .await
+                .expect("response written");
+            String::from_utf8(request).expect("ASCII HTTP request")
+        });
+
+        let response = ReqwestOpenAiTransport::default()
+            .get_json(
+                &format!("http://{address}/v1/models"),
+                Some("provider-token"),
+                Duration::from_secs(5),
+                1024,
+            )
+            .await
+            .expect("models response accepted");
+
+        assert_eq!(response, br#"{"data":[]}"#);
+        let request = responder.await.expect("responder task");
+        assert!(request.starts_with("GET /v1/models HTTP/1.1\r\n"));
+        assert!(request.contains("authorization: Bearer provider-token"));
     }
 }
 

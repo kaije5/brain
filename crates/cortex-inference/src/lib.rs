@@ -15,8 +15,8 @@ pub use error::{
 };
 pub use nim::{NimConfig, NimDiscovery, NimTransport, ReqwestNimTransport};
 pub use openai_compatible::{
-    OpenAiCompatibleConfig, OpenAiCompatibleProvider, OpenAiTransport, ProviderLimits,
-    ReqwestOpenAiTransport,
+    OpenAiApiBase, OpenAiCompatibleConfig, OpenAiCompatibleProvider, OpenAiTransport,
+    ProviderLimits, ReqwestOpenAiTransport,
 };
 pub use provider::{
     InferenceMessage, InferenceProvider, InferenceRequest, InferenceResponse, InferenceTool,

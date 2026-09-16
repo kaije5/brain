@@ -5,9 +5,9 @@ use std::{
 
 use cortex_application::{ApplicationError, EmbeddingProvider, SecretRef};
 use cortex_inference::{
-    InferenceMessage, InferenceProvider, InferenceRequest, InferenceTool, OpenAiCompatibleConfig,
-    OpenAiCompatibleProvider, OpenAiTransport, ProviderError, ProviderFailureCategory,
-    ProviderLimits, ToolCall,
+    InferenceMessage, InferenceProvider, InferenceRequest, InferenceTool, OpenAiApiBase,
+    OpenAiCompatibleConfig, OpenAiCompatibleProvider, OpenAiTransport, ProviderError,
+    ProviderFailureCategory, ProviderLimits, ToolCall,
 };
 use serde_json::{Value, json};
 
@@ -74,6 +74,31 @@ impl FakeTransport {
 }
 
 impl OpenAiTransport for FakeTransport {
+    async fn get_json(
+        &self,
+        endpoint: &str,
+        bearer: Option<&str>,
+        timeout: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.requests
+            .lock()
+            .map_err(|_| ProviderError::from_category(ProviderFailureCategory::Unavailable))?
+            .push(RecordedRequest {
+                endpoint: endpoint.to_owned(),
+                bearer: bearer.map(str::to_owned),
+                _body: Value::Null,
+                _timeout: timeout,
+                _max_response_bytes: max_response_bytes,
+            });
+        match &self.response {
+            Ok(response) if response.len() > max_response_bytes => Err(
+                ProviderError::from_category(ProviderFailureCategory::MalformedResponse),
+            ),
+            response => response.clone(),
+        }
+    }
+
     async fn post_json(
         &self,
         endpoint: &str,
@@ -114,6 +139,26 @@ fn config() -> OpenAiCompatibleConfig {
             .unwrap_or_else(|error| panic!("test provider limits must be valid: {error:?}")),
     )
     .unwrap_or_else(|error| panic!("static provider config must be valid: {error:?}"))
+}
+
+#[test]
+fn api_base_preserves_an_explicit_path_when_deriving_openai_endpoints() {
+    let api_base = OpenAiApiBase::new("https://provider.example/custom/api")
+        .unwrap_or_else(|error| panic!("custom API base must be valid: {error:?}"));
+
+    assert_eq!(api_base.base_url(), "https://provider.example/custom/api/");
+    assert_eq!(
+        api_base.models_endpoint(),
+        "https://provider.example/custom/api/models"
+    );
+    assert_eq!(
+        api_base.chat_endpoint(),
+        "https://provider.example/custom/api/chat/completions"
+    );
+    assert_eq!(
+        api_base.embedding_endpoint(),
+        "https://provider.example/custom/api/embeddings"
+    );
 }
 
 fn request() -> InferenceRequest {
