@@ -1,8 +1,10 @@
+#![allow(clippy::missing_errors_doc, clippy::result_large_err)]
+
 //! Deterministic planning over provider-backed tasks (SCRUM-128/129).
 //!
 //! The planner consumes [`ProviderTask`]s read through [`TaskProvider`] — the
 //! Markdown vault is the task authority — and never assumes a canonical
-//! SQLite task row. Work-block intent and calendar linkage are Cortex-owned
+//! `SQLite` task row. Work-block intent and calendar linkage are Cortex-owned
 //! runtime state recorded through [`WorkBlockLedger`], keyed by the stable
 //! [`TaskId`] (`brain_id`), so vault renames and file moves never break an
 //! existing linkage.
@@ -80,6 +82,7 @@ impl PlannedWorkBlock {
 
 /// Cortex-owned record binding a work block to a calendar event. Keyed by
 /// the stable [`TaskId`]; task renames and moves never participate.
+#[allow(clippy::struct_field_names)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkBlockLinkage {
     workspace_id: WorkspaceId,
@@ -153,7 +156,7 @@ impl PlanningWindow {
 }
 
 /// Ranks a task for scheduling. Deterministic: hard deadlines before soft due
-/// dates before open-ended work; higher priority first; [`TaskId`] (UUIDv7)
+/// dates before open-ended work; higher priority first; [`TaskId`] (`UUIDv7`)
 /// as the final stable tiebreak.
 fn scheduling_rank(task: &ProviderTask) -> (chrono::DateTime<Utc>, u8, cortex_domain::TaskId) {
     let deadline = task
@@ -268,8 +271,12 @@ where
         window: PlanningWindow,
     ) -> Result<Vec<PlannedWorkBlock>, ApplicationError> {
         let query = TaskQuery::new(workspace_id, Option::<String>::None, self.plan_limit)
-            .map_err(provider_error)?;
-        let page = self.tasks.search(&query).await.map_err(provider_error)?;
+            .map_err(|error| provider_error(&error))?;
+        let page = self
+            .tasks
+            .search(&query)
+            .await
+            .map_err(|error| provider_error(&error))?;
         let blocks = plan_schedule(page.items(), window);
         self.ledger.clear(workspace_id).await?;
         for block in &blocks {
@@ -296,7 +303,7 @@ where
     }
 }
 
-fn provider_error(error: ProviderError) -> ApplicationError {
+fn provider_error(error: &ProviderError) -> ApplicationError {
     match error {
         ProviderError::Validation { field } => ApplicationError::Validation { field },
         ProviderError::Unauthorized => ApplicationError::PermissionDenied,

@@ -512,6 +512,10 @@ impl LocalDaemon {
     /// Rebuilds the derived vault index from current vault content. Called
     /// after vault mutations and by the watcher so fused retrieval stays
     /// current; fully rebuildable, so failure never corrupts state.
+    ///
+    /// # Panics
+    /// Panics if the derived index lock was poisoned by a prior panic.
+    #[must_use]
     pub fn refresh_vault_index(&self) -> bool {
         let Some(vault) = &self.vault else {
             return false;

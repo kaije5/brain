@@ -124,12 +124,12 @@ where
             return Ok(None);
         }
         let create = KnowledgeCreate::new(workspace_id, operation_id, title, body)
-            .map_err(provider_error)?;
+            .map_err(|error| provider_error(&error))?;
         let mutation = self
             .knowledge
             .create(create)
             .await
-            .map_err(provider_error)?;
+            .map_err(|error| provider_error(&error))?;
         self.log
             .record(ReviewRunRecord::new(
                 workspace_id,
@@ -171,8 +171,12 @@ where
             priority,
             scheduling,
         )
-        .map_err(provider_error)?;
-        let mutation = self.tasks.create(create).await.map_err(provider_error)?;
+        .map_err(|error| provider_error(&error))?;
+        let mutation = self
+            .tasks
+            .create(create)
+            .await
+            .map_err(|error| provider_error(&error))?;
         self.log
             .record(ReviewRunRecord::new(
                 workspace_id,
@@ -185,7 +189,7 @@ where
     }
 }
 
-fn provider_error(error: ProviderError) -> crate::ApplicationError {
+fn provider_error(error: &ProviderError) -> crate::ApplicationError {
     match error {
         ProviderError::Validation { field } => crate::ApplicationError::Validation { field },
         ProviderError::Unauthorized => crate::ApplicationError::PermissionDenied,

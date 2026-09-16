@@ -1,5 +1,5 @@
 //! In-memory [`TaskProvider`] fake shared by SCRUM-87 integration tests.
-#![allow(dead_code)]
+#![allow(clippy::result_large_err, dead_code)]
 
 use std::{
     collections::BTreeMap,
@@ -35,7 +35,7 @@ pub fn provenance(
             ProviderResourceKind::Task,
         ),
         ObservedRevision::new(format!("rev-{revision}")).expect("revision"),
-        ContentHash::new([revision as u8; 32]),
+        ContentHash::new([u8::try_from(revision).unwrap_or(u8::MAX); 32]),
     )
 }
 

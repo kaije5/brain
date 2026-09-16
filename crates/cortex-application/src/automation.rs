@@ -1,3 +1,5 @@
+#![allow(clippy::missing_errors_doc, clippy::result_large_err)]
+
 //! Idempotent automation triggered by normalized vault change events
 //! (SCRUM-132).
 //!
