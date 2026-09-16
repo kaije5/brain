@@ -12,6 +12,7 @@ workspace = true
 cortex-application = { path = "../cortex-application" }
 cortex-domain = { path = "../cortex-domain" }
 cortex-vault = { path = "../cortex-vault" }
+uuid = { version = "1.24", features = ["v7"] }
 sha2 = "0.11"
 tokio = { version = "1.47", features = ["time"] }
 

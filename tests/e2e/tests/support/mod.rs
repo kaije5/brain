@@ -236,7 +236,10 @@ impl Harness {
         #[cfg(not(windows))]
         let model_secret_reference: Option<String> = None;
         let mut settings = format!(
-            "[models]
+            "[brain]
+prompt = \"E2E global Brain instructions are active.\"
+
+[models]
 default_profile = \"e2e\"
 
 [models.profiles.e2e]
@@ -545,6 +548,11 @@ base_url = \"{model_base_url}\"
             .await
     }
 
+    /// The system message the fake model most recently received.
+    pub async fn last_system_message(&self) -> Option<String> {
+        self.fake_model.last_system_message.lock().await.clone()
+    }
+
     pub async fn cli_agent_tools(&self) -> Vec<String> {
         self.cli(&["brain", "ask", "List available tools without using them."])
             .await
@@ -707,6 +715,7 @@ struct FakeModelState {
     statement: Arc<Mutex<String>>,
     source_id: Arc<Mutex<Option<EntityId>>>,
     offered_tools: Arc<Mutex<Vec<String>>>,
+    last_system_message: Arc<Mutex<Option<String>>>,
 }
 
 impl FakeModelState {
@@ -716,6 +725,7 @@ impl FakeModelState {
             statement: Arc::new(Mutex::new(String::new())),
             source_id: Arc::new(Mutex::new(None)),
             offered_tools: Arc::new(Mutex::new(Vec::new())),
+            last_system_message: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -834,6 +844,14 @@ async fn fake_chat(State(state): State<FakeModelState>, Json(body): Json<Value>)
     let has_tool_result = body["messages"]
         .as_array()
         .is_some_and(|messages| messages.iter().any(|message| message["role"] == "tool"));
+    if let Some(system) = body["messages"]
+        .as_array()
+        .and_then(|messages| messages.first())
+        .filter(|message| message["role"] == "system")
+        .and_then(|message| message["content"].as_str())
+    {
+        *state.last_system_message.lock().await = Some(system.to_owned());
+    }
     *state.offered_tools.lock().await = body["tools"]
         .as_array()
         .into_iter()
