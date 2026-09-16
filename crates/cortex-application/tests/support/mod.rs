@@ -11,12 +11,11 @@ use std::{
 use cortex_application::{
     AggregateChange, ApplicationError, ApplicationService, AtomicMutation, AtomicMutationPort,
     AuditPort, Capability, CapabilityGrant, CommandContext, GrantPolicy, MemoryRepository,
-    MutationResult, NoteRepository, OperationResultRepository, RecordedOperation, SourceRepository,
-    TaskRepository,
+    MutationResult, OperationResultRepository, RecordedOperation, SourceRepository,
 };
 use cortex_domain::{
-    AuditEvent, EntityId, Lifecycle, MemoryAssertion, MemoryStatus, Note, OperationId, PrincipalId,
-    Revision, Source, SourceInput, Task, WorkspaceId,
+    AuditEvent, EntityId, Lifecycle, MemoryAssertion, MemoryStatus, OperationId, PrincipalId,
+    Revision, Source, SourceInput, WorkspaceId,
 };
 use uuid::Uuid;
 
@@ -29,8 +28,6 @@ pub struct FakeState {
 
 #[derive(Default)]
 struct State {
-    notes: BTreeMap<(WorkspaceId, EntityId), Note>,
-    tasks: BTreeMap<(WorkspaceId, EntityId), Task>,
     memories: BTreeMap<(WorkspaceId, EntityId), MemoryAssertion>,
     sources: BTreeMap<(WorkspaceId, EntityId), Source>,
     operations: BTreeMap<(WorkspaceId, OperationId), RecordedOperation>,
@@ -65,15 +62,6 @@ impl Fixture {
 
     pub fn all_mutations() -> Self {
         Self::with_capabilities([
-            Capability::NoteCreate,
-            Capability::NoteUpdate,
-            Capability::NoteDelete,
-            Capability::NoteRestore,
-            Capability::TaskCreate,
-            Capability::TaskUpdate,
-            Capability::TaskComplete,
-            Capability::TaskDelete,
-            Capability::TaskRestore,
             Capability::MemoryCreate,
             Capability::MemoryCorrect,
             Capability::MemoryDelete,
@@ -146,82 +134,6 @@ impl FakeState {
         Ok(self.lock()?.memories.len())
     }
 
-    pub fn task_count(&self) -> Result<usize, String> {
-        Ok(self.lock()?.tasks.len())
-    }
-}
-
-impl NoteRepository for FakeState {
-    async fn find(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Note>, ApplicationError> {
-        Ok(NoteRepository::find_history(self, workspace_id, entity_id)
-            .await?
-            .filter(|note| note.lifecycle() == Lifecycle::Active))
-    }
-
-    async fn find_history(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Note>, ApplicationError> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|_| ApplicationError::Internal)?
-            .notes
-            .get(&(workspace_id, entity_id))
-            .cloned())
-    }
-}
-
-impl TaskRepository for FakeState {
-    async fn list_active(
-        &self,
-        workspace_id: WorkspaceId,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<Task>, ApplicationError> {
-        let mut tasks: Vec<_> = self
-            .inner
-            .lock()
-            .map_err(|_| ApplicationError::Internal)?
-            .tasks
-            .iter()
-            .filter(|((stored_workspace, _), task)| {
-                *stored_workspace == workspace_id && task.lifecycle() == Lifecycle::Active
-            })
-            .map(|(_, task)| task.clone())
-            .collect();
-        tasks.sort_by_key(Task::id);
-        tasks.truncate(limit.get());
-        Ok(tasks)
-    }
-
-    async fn find(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Task>, ApplicationError> {
-        Ok(TaskRepository::find_history(self, workspace_id, entity_id)
-            .await?
-            .filter(|task| task.lifecycle() == Lifecycle::Active))
-    }
-
-    async fn find_history(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Task>, ApplicationError> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|_| ApplicationError::Internal)?
-            .tasks
-            .get(&(workspace_id, entity_id))
-            .cloned())
-    }
 }
 
 impl MemoryRepository for FakeState {
@@ -339,14 +251,6 @@ fn apply_change(
     change: AggregateChange,
 ) -> Result<(), ApplicationError> {
     match change {
-        change @ (AggregateChange::InsertNote(_)
-        | AggregateChange::ReplaceNote { .. }
-        | AggregateChange::DeleteNote { .. }
-        | AggregateChange::RestoreNote { .. }) => apply_note_change(state, workspace_id, change),
-        change @ (AggregateChange::InsertTask(_)
-        | AggregateChange::ReplaceTask { .. }
-        | AggregateChange::DeleteTask { .. }
-        | AggregateChange::RestoreTask { .. }) => apply_task_change(state, workspace_id, change),
         change @ (AggregateChange::InsertMemory(_)
         | AggregateChange::ReplaceMemory { .. }
         | AggregateChange::DeleteMemory { .. }
@@ -359,154 +263,6 @@ fn apply_change(
         }
         AggregateChange::LinkMemorySource { .. } => Ok(()),
     }
-}
-
-fn apply_note_change(
-    state: &mut State,
-    workspace_id: WorkspaceId,
-    change: AggregateChange,
-) -> Result<(), ApplicationError> {
-    match change {
-        AggregateChange::InsertNote(note) => {
-            state.notes.insert((workspace_id, note.id()), note);
-        }
-        AggregateChange::ReplaceNote {
-            entity_id,
-            expected_revision,
-            note,
-        } => {
-            require_revision(
-                state
-                    .notes
-                    .get(&(workspace_id, entity_id))
-                    .map(Note::revision),
-                expected_revision,
-                "note",
-            )?;
-            state.notes.insert((workspace_id, entity_id), note);
-        }
-        AggregateChange::DeleteNote {
-            entity_id,
-            expected_revision,
-        } => {
-            let note = state
-                .notes
-                .get(&(workspace_id, entity_id))
-                .cloned()
-                .ok_or(ApplicationError::NotFound { entity: "note" })?;
-            require_revision(Some(note.revision()), expected_revision, "note")?;
-            state.notes.insert(
-                (workspace_id, entity_id),
-                Note::rehydrate(
-                    entity_id,
-                    workspace_id,
-                    note.title().to_owned(),
-                    note.content().to_owned(),
-                    expected_revision.next()?,
-                    Lifecycle::Deleted,
-                )?,
-            );
-        }
-        AggregateChange::RestoreNote {
-            entity_id,
-            expected_revision,
-        } => {
-            let note = state
-                .notes
-                .get(&(workspace_id, entity_id))
-                .cloned()
-                .ok_or(ApplicationError::NotFound { entity: "note" })?;
-            require_revision(Some(note.revision()), expected_revision, "note")?;
-            state.notes.insert(
-                (workspace_id, entity_id),
-                Note::rehydrate(
-                    entity_id,
-                    workspace_id,
-                    note.title().to_owned(),
-                    note.content().to_owned(),
-                    expected_revision.next()?,
-                    Lifecycle::Active,
-                )?,
-            );
-        }
-        _ => return Err(ApplicationError::Internal),
-    }
-    Ok(())
-}
-
-fn apply_task_change(
-    state: &mut State,
-    workspace_id: WorkspaceId,
-    change: AggregateChange,
-) -> Result<(), ApplicationError> {
-    match change {
-        AggregateChange::InsertTask(task) => {
-            state.tasks.insert((workspace_id, task.id()), task);
-        }
-        AggregateChange::ReplaceTask {
-            entity_id,
-            expected_revision,
-            task,
-        } => {
-            require_revision(
-                state
-                    .tasks
-                    .get(&(workspace_id, entity_id))
-                    .map(Task::revision),
-                expected_revision,
-                "task",
-            )?;
-            state.tasks.insert((workspace_id, entity_id), task);
-        }
-        AggregateChange::DeleteTask {
-            entity_id,
-            expected_revision,
-        } => {
-            let task = state
-                .tasks
-                .get(&(workspace_id, entity_id))
-                .cloned()
-                .ok_or(ApplicationError::NotFound { entity: "task" })?;
-            require_revision(Some(task.revision()), expected_revision, "task")?;
-            state.tasks.insert(
-                (workspace_id, entity_id),
-                Task::rehydrate(
-                    entity_id,
-                    workspace_id,
-                    task.title().to_owned(),
-                    task.due_at(),
-                    task.status(),
-                    expected_revision.next()?,
-                    Lifecycle::Deleted,
-                )?,
-            );
-        }
-        AggregateChange::RestoreTask {
-            entity_id,
-            expected_revision,
-        } => {
-            let task = state
-                .tasks
-                .get(&(workspace_id, entity_id))
-                .cloned()
-                .ok_or(ApplicationError::NotFound { entity: "task" })?;
-            require_revision(Some(task.revision()), expected_revision, "task")?;
-            state.tasks.insert(
-                (workspace_id, entity_id),
-                Task::rehydrate(
-                    entity_id,
-                    workspace_id,
-                    task.title().to_owned(),
-                    task.due_at(),
-                    task.status(),
-                    expected_revision.next()?,
-                    Lifecycle::Active,
-                )?,
-            );
-        }
-        _ => return Err(ApplicationError::Internal),
-    }
-    Ok(())
 }
 
 fn apply_memory_change(

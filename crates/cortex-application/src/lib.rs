@@ -28,8 +28,7 @@ pub use capability::{
     Idempotency,
 };
 pub use command::{
-    CommandContext, MemoryCorrectInput, MemoryCreateInput, MutationResult, NoteCreateInput,
-    NoteUpdateInput, TaskCreateInput, TaskUpdateInput,
+    CommandContext, MemoryCorrectInput, MemoryCreateInput, MutationResult,
 };
 pub use cortex_domain::{PolicyDecision, PolicyDeny};
 pub use error::{ApplicationError, RecoveryHint};
@@ -46,9 +45,8 @@ pub use provider::{
     ProviderRead,
 };
 pub use query::{
-    AggregateChange, AtomicMutation, AtomicMutationPort, MemoryRepository, NoteRepository,
-    OperationIdentity, OperationResultRepository, RecordedOperation, SourceRepository,
-    TaskRepository,
+    AggregateChange, AtomicMutation, AtomicMutationPort, MemoryRepository, OperationIdentity,
+    OperationResultRepository, RecordedOperation, SourceRepository,
 };
 pub use review::{ReviewRunKind, ReviewRunLog, ReviewRunRecord, ReviewService};
 pub use search::{

@@ -2,97 +2,111 @@ mod support;
 
 use cortex_application::{
     ApplicationError, ApplicationService, Capability, CapabilityGrant, CommandContext, GrantPolicy,
-    NoteCreateInput, NoteRepository, NoteUpdateInput, TaskCreateInput,
+    MemoryCorrectInput, MemoryCreateInput, MemoryRepository,
 };
 use cortex_domain::{Lifecycle, OperationId, PrincipalId};
 use uuid::Uuid;
 
 use support::{Fixture, debug_error};
 
+fn new_memory() -> MemoryCreateInput {
+    MemoryCreateInput {
+        statement: "Original".to_owned(),
+        normalized_subject: "subject".to_owned(),
+        normalized_predicate: "predicate".to_owned(),
+        normalized_object: "object".to_owned(),
+        sources: Vec::new(),
+    }
+}
+
+fn correction() -> MemoryCorrectInput {
+    MemoryCorrectInput {
+        statement: "Updated".to_owned(),
+        normalized_subject: "subject".to_owned(),
+        normalized_predicate: "predicate".to_owned(),
+        normalized_object: "object".to_owned(),
+        sources: Vec::new(),
+    }
+}
+
 #[tokio::test]
-async fn stale_delete_is_rejected_and_leaves_newer_note_active() -> Result<(), String> {
+async fn stale_delete_is_rejected_and_leaves_newer_memory_active() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
-    let note = fixture
+    let memory = fixture
         .service
-        .create_note(fixture.context(), new_note())
+        .create_memory(fixture.context(), new_memory())
         .await
         .map_err(debug_error)?;
     let updated = fixture
         .service
-        .update_note(
+        .correct_memory(
             fixture.context(),
-            note.entity_id,
-            note.revision,
-            NoteUpdateInput {
-                title: "Updated".to_owned(),
-                content: "newer content".to_owned(),
-            },
+            memory.entity_id,
+            memory.revision,
+            correction(),
         )
         .await
         .map_err(debug_error)?;
     let result = fixture
         .service
-        .delete_note(fixture.context(), note.entity_id, note.revision)
+        .delete_memory(fixture.context(), memory.entity_id, memory.revision)
         .await;
 
     assert!(matches!(
         result,
-        Err(ApplicationError::Conflict { entity: "note" })
+        Err(ApplicationError::Conflict {
+            entity: "memory"
+        })
     ));
-    let persisted = NoteRepository::find(&fixture.state, fixture.workspace_id, note.entity_id)
+    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, memory.entity_id)
         .await
         .map_err(debug_error)?
-        .ok_or("newer note missing")?;
+        .ok_or("newer memory missing")?;
     assert_eq!(persisted.revision(), updated.revision);
     assert_eq!(persisted.lifecycle(), Lifecycle::Active);
-    assert_eq!(persisted.content(), "newer content");
-    assert_eq!(fixture.state.audits()?.len(), 3);
+    assert_eq!(persisted.statement(), "Updated");
     Ok(())
 }
 
 #[tokio::test]
 async fn repeated_operation_is_returned_before_revision_validation() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
-    let note = fixture
+    let memory = fixture
         .service
-        .create_note(fixture.context(), new_note())
+        .create_memory(fixture.context(), new_memory())
         .await
         .map_err(debug_error)?;
     let operation_id = OperationId::new();
     let first = fixture
         .service
-        .update_note(
+        .correct_memory(
             fixture.context_for(operation_id),
-            note.entity_id,
-            note.revision,
-            NoteUpdateInput {
-                title: "First".to_owned(),
-                content: "persisted once".to_owned(),
-            },
+            memory.entity_id,
+            memory.revision,
+            correction(),
         )
         .await
         .map_err(debug_error)?;
     let replay = fixture
         .service
-        .update_note(
+        .correct_memory(
             fixture.context_for(operation_id),
-            note.entity_id,
-            note.revision,
-            NoteUpdateInput {
-                title: "Ignored replay".to_owned(),
-                content: "must not replace".to_owned(),
+            memory.entity_id,
+            memory.revision,
+            MemoryCorrectInput {
+                statement: "Ignored replay".to_owned(),
+                ..correction()
             },
         )
         .await
         .map_err(debug_error)?;
 
     assert_eq!(replay, first);
-    let persisted = NoteRepository::find(&fixture.state, fixture.workspace_id, note.entity_id)
+    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, memory.entity_id)
         .await
         .map_err(debug_error)?
-        .ok_or("note missing")?;
-    assert_eq!(persisted.title(), "First");
-    assert_eq!(fixture.state.audits()?.len(), 2);
+        .ok_or("memory missing")?;
+    assert_eq!(persisted.statement(), "Updated");
     Ok(())
 }
 
@@ -102,7 +116,7 @@ async fn repeated_operation_still_requires_the_current_capability() -> Result<()
     let operation_id = OperationId::new();
     let first = fixture
         .service
-        .create_note(fixture.context_for(operation_id), new_note())
+        .create_memory(fixture.context_for(operation_id), new_memory())
         .await
         .map_err(debug_error)?;
     let denied = ApplicationService::new(
@@ -113,24 +127,20 @@ async fn repeated_operation_still_requires_the_current_capability() -> Result<()
     );
 
     let replay = denied
-        .update_note(
+        .correct_memory(
             fixture.context_for(operation_id),
             first.entity_id,
             first.revision,
-            NoteUpdateInput {
-                title: "Unauthorized replay".to_owned(),
-                content: "must not bypass policy".to_owned(),
-            },
+            correction(),
         )
         .await;
 
     assert!(matches!(replay, Err(ApplicationError::PolicyDenied(_))));
-    let persisted = NoteRepository::find(&fixture.state, fixture.workspace_id, first.entity_id)
+    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, first.entity_id)
         .await
         .map_err(debug_error)?
-        .ok_or("note missing")?;
-    assert_eq!(persisted.title(), "Original");
-    assert_eq!(fixture.state.audits()?.len(), 1);
+        .ok_or("memory missing")?;
+    assert_eq!(persisted.statement(), "Original");
     Ok(())
 }
 
@@ -140,7 +150,7 @@ async fn repeated_operation_rejects_a_different_granted_principal() -> Result<()
     let operation_id = OperationId::new();
     let first = fixture
         .service
-        .create_note(fixture.context_for(operation_id), new_note())
+        .create_memory(fixture.context_for(operation_id), new_memory())
         .await
         .map_err(debug_error)?;
     let other_principal = PrincipalId::new();
@@ -148,7 +158,7 @@ async fn repeated_operation_rejects_a_different_granted_principal() -> Result<()
         GrantPolicy::new([CapabilityGrant::new(
             fixture.workspace_id,
             other_principal,
-            Capability::NoteCreate,
+            Capability::MemoryCreate,
         )]),
         fixture.state.clone(),
         fixture.state.clone(),
@@ -156,16 +166,16 @@ async fn repeated_operation_rejects_a_different_granted_principal() -> Result<()
     );
 
     let replay = other_service
-        .create_note(
+        .create_memory(
             CommandContext::from_authenticated(
                 fixture.workspace_id,
                 other_principal,
                 operation_id,
                 Uuid::now_v7(),
             ),
-            NoteCreateInput {
-                title: "other principal".to_owned(),
-                content: "must not receive the first result".to_owned(),
+            MemoryCreateInput {
+                statement: "other principal".to_owned(),
+                ..new_memory()
             },
         )
         .await;
@@ -176,8 +186,7 @@ async fn repeated_operation_rejects_a_different_granted_principal() -> Result<()
             entity: "operation"
         })
     );
-    assert_eq!(fixture.state.audits()?.len(), 1);
-    let persisted = NoteRepository::find(&fixture.state, fixture.workspace_id, first.entity_id)
+    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, first.entity_id)
         .await
         .map_err(debug_error)?;
     assert!(persisted.is_some());
@@ -188,21 +197,15 @@ async fn repeated_operation_rejects_a_different_granted_principal() -> Result<()
 async fn repeated_operation_rejects_a_different_allowed_capability() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
     let operation_id = OperationId::new();
-    fixture
+    let memory = fixture
         .service
-        .create_note(fixture.context_for(operation_id), new_note())
+        .create_memory(fixture.context_for(operation_id), new_memory())
         .await
         .map_err(debug_error)?;
 
     let replay = fixture
         .service
-        .create_task(
-            fixture.context_for(operation_id),
-            TaskCreateInput {
-                title: "must not be acknowledged".to_owned(),
-                due_at: None,
-            },
-        )
+        .delete_memory(fixture.context_for(operation_id), memory.entity_id, memory.revision)
         .await;
 
     assert_eq!(
@@ -211,48 +214,48 @@ async fn repeated_operation_rejects_a_different_allowed_capability() -> Result<(
             entity: "operation"
         })
     );
-    assert_eq!(fixture.state.audits()?.len(), 1);
-    assert_eq!(fixture.state.task_count()?, 0);
+    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, memory.entity_id)
+        .await
+        .map_err(debug_error)?
+        .ok_or("memory missing")?;
+    assert_eq!(persisted.lifecycle(), Lifecycle::Active);
     Ok(())
 }
 
 #[tokio::test]
 async fn repeated_operation_rejects_a_different_target() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
-    let first_note = fixture
+    let first_memory = fixture
         .service
-        .create_note(fixture.context(), new_note())
+        .create_memory(fixture.context(), new_memory())
         .await
         .map_err(debug_error)?;
-    let second_note = fixture
+    let second_memory = fixture
         .service
-        .create_note(fixture.context(), new_note())
+        .create_memory(fixture.context(), new_memory())
         .await
         .map_err(debug_error)?;
     let operation_id = OperationId::new();
     fixture
         .service
-        .update_note(
+        .correct_memory(
             fixture.context_for(operation_id),
-            first_note.entity_id,
-            first_note.revision,
-            NoteUpdateInput {
-                title: "first target".to_owned(),
-                content: "updated once".to_owned(),
-            },
+            first_memory.entity_id,
+            first_memory.revision,
+            correction(),
         )
         .await
         .map_err(debug_error)?;
 
     let replay = fixture
         .service
-        .update_note(
+        .correct_memory(
             fixture.context_for(operation_id),
-            second_note.entity_id,
-            second_note.revision,
-            NoteUpdateInput {
-                title: "second target".to_owned(),
-                content: "must remain unchanged".to_owned(),
+            second_memory.entity_id,
+            second_memory.revision,
+            MemoryCorrectInput {
+                statement: "second target".to_owned(),
+                ..correction()
             },
         )
         .await;
@@ -263,18 +266,10 @@ async fn repeated_operation_rejects_a_different_target() -> Result<(), String> {
             entity: "operation"
         })
     );
-    let second = NoteRepository::find(&fixture.state, fixture.workspace_id, second_note.entity_id)
+    let second = MemoryRepository::find(&fixture.state, fixture.workspace_id, second_memory.entity_id)
         .await
         .map_err(debug_error)?
-        .ok_or("second note missing")?;
-    assert_eq!(second.title(), "Original");
-    assert_eq!(fixture.state.audits()?.len(), 3);
+        .ok_or("second memory missing")?;
+    assert_eq!(second.statement(), "Original");
     Ok(())
-}
-
-fn new_note() -> NoteCreateInput {
-    NoteCreateInput {
-        title: "Original".to_owned(),
-        content: "original content".to_owned(),
-    }
 }

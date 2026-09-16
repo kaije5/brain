@@ -1,11 +1,6 @@
 /// A typed operation exposed by the shared Cortex application boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Capability {
-    NoteCreate,
-    NoteUpdate,
-    NoteDelete,
-    NoteRestore,
-    NoteSearch,
     TaskCreate,
     TaskComplete,
     TaskUpdate,
@@ -96,41 +91,6 @@ macro_rules! query_metadata {
     };
 }
 
-const NOTE_CREATE: CapabilityMetadata = mutation_metadata!(
-    Capability::NoteCreate,
-    "cortex_note_create",
-    "Create a note",
-    false,
-    "NoteCreateInput"
-);
-const NOTE_UPDATE: CapabilityMetadata = mutation_metadata!(
-    Capability::NoteUpdate,
-    "cortex_note_update",
-    "Update a note",
-    false,
-    "NoteUpdateInput"
-);
-const NOTE_DELETE: CapabilityMetadata = mutation_metadata!(
-    Capability::NoteDelete,
-    "cortex_note_delete",
-    "Delete a note",
-    true,
-    "NoteDeleteInput"
-);
-const NOTE_RESTORE: CapabilityMetadata = mutation_metadata!(
-    Capability::NoteRestore,
-    "cortex_note_restore",
-    "Restore a note",
-    false,
-    "NoteRestoreInput"
-);
-const NOTE_SEARCH: CapabilityMetadata = query_metadata!(
-    Capability::NoteSearch,
-    "cortex_note_search",
-    "Search notes",
-    "NoteSearchRequest",
-    "NoteSearchResultList"
-);
 const TASK_CREATE: CapabilityMetadata = mutation_metadata!(
     Capability::TaskCreate,
     "cortex_task_create",
@@ -248,11 +208,6 @@ impl Capability {
     #[must_use]
     pub const fn metadata(self) -> CapabilityMetadata {
         match self {
-            Self::NoteCreate => NOTE_CREATE,
-            Self::NoteUpdate => NOTE_UPDATE,
-            Self::NoteDelete => NOTE_DELETE,
-            Self::NoteRestore => NOTE_RESTORE,
-            Self::NoteSearch => NOTE_SEARCH,
             Self::TaskCreate => TASK_CREATE,
             Self::TaskComplete => TASK_COMPLETE,
             Self::TaskUpdate => TASK_UPDATE,
@@ -288,11 +243,6 @@ impl CapabilityCatalog {
     #[must_use]
     pub const fn all() -> &'static [Capability] {
         &[
-            Capability::NoteCreate,
-            Capability::NoteUpdate,
-            Capability::NoteDelete,
-            Capability::NoteRestore,
-            Capability::NoteSearch,
             Capability::TaskCreate,
             Capability::TaskComplete,
             Capability::TaskUpdate,
@@ -305,6 +255,9 @@ impl CapabilityCatalog {
             Capability::MemoryRestore,
             Capability::MemorySearch,
             Capability::KnowledgeRetrieve,
+            Capability::KnowledgeCreate,
+            Capability::KnowledgeUpdate,
+            Capability::KnowledgeDelete,
             Capability::AgentRun,
         ]
     }
