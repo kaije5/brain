@@ -33,8 +33,8 @@ use tokio_util::sync::CancellationToken;
 use tower_service::Service;
 use uuid::Uuid;
 
-use crate::tools::decode_arguments;
-use crate::{McpError, tool_schema};
+use crate::McpError;
+use crate::tools::{decode_arguments, wire_capability};
 
 const MAX_TOOL_BYTES: usize = 32 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 64 * 1024;
@@ -103,7 +103,7 @@ impl McpServer {
         name: &str,
         arguments: Value,
     ) -> Result<Value, McpError> {
-        let schema = tool_schema(name).ok_or_else(McpError::invalid_input)?;
+        let capability = wire_capability(name).ok_or_else(McpError::invalid_input)?;
         let arguments = decode_arguments(name, arguments)?;
         if serialized_len(&arguments)? > MAX_TOOL_BYTES {
             return Err(McpError::invalid_input());
@@ -114,7 +114,9 @@ impl McpServer {
             // The daemon deliberately ignores this value after local authentication.
             principal_id: Uuid::now_v7(),
             operation_id: Uuid::now_v7(),
-            capability: schema.name,
+            // The normalized tool name dispatches under its capability
+            // identity: policy, grants, and audit are unchanged.
+            capability: capability.metadata().mcp_name.to_owned(),
             payload: arguments,
         };
         let response = timeout(TOOL_TIMEOUT, principal.request(&request))
@@ -398,7 +400,8 @@ fn serialized_len(value: &Value) -> Result<usize, McpError> {
 fn map_wire_error(code: &str) -> McpError {
     match code {
         "permission_denied" | "unauthenticated" => McpError::permission_denied(),
-        "invalid_request" | "unsupported_capability" => McpError::invalid_input(),
+        "conflict" => McpError::conflict(),
+        "invalid_request" | "not_found" | "unsupported_capability" => McpError::invalid_input(),
         _ => McpError::unavailable(),
     }
 }

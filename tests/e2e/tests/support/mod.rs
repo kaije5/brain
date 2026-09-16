@@ -337,7 +337,7 @@ base_url = \"{model_base_url}\"
 
     pub async fn mcp_remember(&self, statement: &str) -> CallResult {
         self.mcp_call(
-            "cortex_memory_create",
+            "memory.create",
             json!({
                 "statement": statement,
                 "normalized_subject": "cortex",
@@ -352,7 +352,7 @@ base_url = \"{model_base_url}\"
     pub async fn mcp_search(&self, query: &str) -> SearchResult {
         let value = self
             .gateway
-            .call_paired("cortex_memory_search", json!({"query": query}))
+            .call_paired("memory.search", json!({"query": query}))
             .await
             .assert_success_value();
         SearchResult(value)
@@ -360,7 +360,7 @@ base_url = \"{model_base_url}\"
 
     pub async fn mcp_delete(&self, entity_id: EntityId, revision: u64) -> CallResult {
         self.mcp_call(
-            "cortex_memory_delete",
+            "memory.delete",
             json!({"entity_id": Uuid::from(entity_id), "expected_revision": revision}),
         )
         .await
@@ -368,7 +368,7 @@ base_url = \"{model_base_url}\"
 
     pub async fn mcp_restore(&self, entity_id: EntityId, revision: u64) -> CallResult {
         self.mcp_call(
-            "cortex_memory_restore",
+            "memory.restore",
             json!({"entity_id": Uuid::from(entity_id), "expected_revision": revision}),
         )
         .await
@@ -382,10 +382,7 @@ base_url = \"{model_base_url}\"
     pub async fn assert_unpaired_denied(&self) {
         let response = self
             .gateway
-            .call_unpaired(
-                "cortex_memory_search",
-                json!({"query": "must not dispatch"}),
-            )
+            .call_unpaired("memory.search", json!({"query": "must not dispatch"}))
             .await;
         assert_eq!(response.status, 401);
         assert_eq!(response.body["error"]["code"], "cortex_unauthorized");
@@ -1022,7 +1019,12 @@ impl CallResult {
             let correlation_id = correlation_id(&value).unwrap_or_else(Uuid::now_v7);
             Self::success(value, correlation_id)
         } else {
-            assert_eq!(envelope["ok"], false, "{envelope}");
+            assert_eq!(
+                envelope["ok"],
+                false,
+                "stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             Self::error(
                 envelope["error"]["code"].as_str().expect("CLI error code"),
                 Uuid::now_v7(),

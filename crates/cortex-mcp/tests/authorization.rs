@@ -21,11 +21,7 @@ async fn file_enrolled_gateway_principal_dispatches_over_real_local_ipc() {
     let principal = McpPrincipal::from_ipc(client);
 
     let result = McpServer::new()
-        .call_tool_as(
-            &principal,
-            "cortex_knowledge_search",
-            json!({"query":"Cortex"}),
-        )
+        .call_tool_as(&principal, "knowledge.retrieve", json!({"query":"Cortex"}))
         .await
         .expect("paired IPC dispatch");
     assert!(result.is_array());
@@ -46,11 +42,7 @@ async fn tool_invocation_uses_authenticated_principal_not_input_workspace() {
     let server = McpServer::new();
 
     let result = server
-        .call_tool_as(
-            &principal,
-            "cortex_knowledge_search",
-            json!({"query": "Cortex"}),
-        )
+        .call_tool_as(&principal, "knowledge.retrieve", json!({"query": "Cortex"}))
         .await
         .expect("paired request is dispatched");
     assert!(result.is_array());
@@ -58,7 +50,7 @@ async fn tool_invocation_uses_authenticated_principal_not_input_workspace() {
     let rejected = server
         .call_tool_as(
             &principal,
-            "cortex_knowledge_search",
+            "knowledge.retrieve",
             json!({"query": "Cortex", "workspace_id": "attacker"}),
         )
         .await;
@@ -77,7 +69,7 @@ async fn bounded_limit_is_rejected_before_daemon_authorization() {
     let result = McpServer::new()
         .call_tool_as(
             &principal,
-            "cortex_knowledge_search",
+            "knowledge.retrieve",
             json!({"query":"Cortex","limit":101}),
         )
         .await;
@@ -123,7 +115,7 @@ fn tool_request(arguments: &serde_json::Value) -> Request<Full<Bytes>> {
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": "cortex_knowledge_search",
+            "name": "knowledge.retrieve",
             "arguments": arguments,
         }
     });

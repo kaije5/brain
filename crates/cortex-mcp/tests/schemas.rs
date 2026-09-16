@@ -2,25 +2,47 @@ use cortex_mcp::{tool_schema, tool_schemas};
 
 #[test]
 fn delete_tool_is_annotated_destructive_and_excludes_workspace_id() {
-    let schema = tool_schema("cortex_memory_delete").expect("memory delete schema");
+    let schema = tool_schema("memory.delete").expect("memory delete schema");
     assert!(schema.destructive);
     assert!(!schema.input_properties.contains_key("workspace_id"));
 }
 
 #[test]
-fn schema_catalog_exposes_only_supported_v0_1_tools() {
+fn schema_catalog_exposes_only_the_normalized_v2_tools() {
     let schemas = tool_schemas();
     let names: Vec<_> = schemas.iter().map(|schema| schema.name.as_str()).collect();
-    assert!(names.contains(&"cortex_note_create"));
-    assert!(names.contains(&"cortex_task_list"));
-    assert!(names.contains(&"cortex_memory_search"));
-    assert!(names.contains(&"cortex_knowledge_search"));
-    assert!(!names.contains(&"cortex_agent_run"));
+    // Normalized knowledge.* and task.* tools replace the legacy
+    // cortex_note_*/cortex_task_* contracts.
+    for name in [
+        "knowledge.create",
+        "knowledge.update",
+        "knowledge.delete",
+        "knowledge.retrieve",
+        "task.create",
+        "task.update",
+        "task.complete",
+        "task.delete",
+        "task.restore",
+        "task.list",
+    ] {
+        assert!(names.contains(&name), "missing normalized tool {name}");
+    }
+    assert!(names.contains(&"memory.search"));
+    // The agent loop is not an externally callable tool.
+    assert!(!names.contains(&"agent.run"));
+    // Legacy SQLite-entity tool names are gone.
+    for legacy in [
+        "cortex_note_create",
+        "cortex_task_list",
+        "cortex_knowledge_search",
+    ] {
+        assert!(!names.contains(&legacy), "legacy tool {legacy} removed");
+    }
 }
 
 #[test]
 fn memory_schema_requires_structured_source_references_and_task_limit_is_an_integer() {
-    let memory = tool_schema("cortex_memory_create").expect("memory create schema");
+    let memory = tool_schema("memory.create").expect("memory create schema");
     assert_eq!(
         memory.input_schema["required"],
         serde_json::json!([
@@ -37,7 +59,7 @@ fn memory_schema_requires_structured_source_references_and_task_limit_is_an_inte
     );
     assert!(memory.input_schema["properties"]["sources"]["items"]["$ref"].is_string());
 
-    let tasks = tool_schema("cortex_task_list").expect("task list schema");
+    let tasks = tool_schema("task.list").expect("task list schema");
     assert!(
         tasks.input_schema["properties"]["limit"]["type"]
             .as_array()
@@ -70,27 +92,28 @@ fn schemas_publish_wire_types_formats_bounds_and_closed_objects() {
         );
     }
 
-    let entity = tool_schema("cortex_note_delete").expect("entity command schema");
-    assert_eq!(
-        entity.input_schema["properties"]["entity_id"]["format"],
-        "uuid"
-    );
-    assert_eq!(
-        entity.input_schema["properties"]["expected_revision"]["minimum"],
-        1
+    // Resource-scoped mutations address opaque provider resource ids and
+    // observed revisions, not SQLite entity identity.
+    let resource = tool_schema("knowledge.delete").expect("resource command schema");
+    assert!(resource.input_schema["properties"]["resource_id"].is_object());
+    assert!(resource.input_schema["properties"]["expected_revision"].is_object());
+    assert!(
+        resource.input_schema["properties"]
+            .get("entity_id")
+            .is_none()
     );
 
-    let task = tool_schema("cortex_task_create").expect("task create schema");
+    let task = tool_schema("task.create").expect("task create schema");
     assert_eq!(
         task.input_schema["properties"]["due_at"]["format"],
         "date-time"
     );
 
-    let search = tool_schema("cortex_knowledge_search").expect("knowledge schema");
+    let search = tool_schema("knowledge.retrieve").expect("knowledge schema");
     assert_eq!(search.input_schema["properties"]["limit"]["minimum"], 1);
     assert_eq!(search.input_schema["properties"]["limit"]["maximum"], 100);
 
-    let memory = tool_schema("cortex_memory_create").expect("memory create schema");
+    let memory = tool_schema("memory.create").expect("memory create schema");
     assert_eq!(
         memory.input_schema["$defs"]["Source"]["properties"]["source_id"]["format"],
         "uuid"

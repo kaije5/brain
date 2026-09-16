@@ -365,6 +365,22 @@ where
             .map_err(|error| map_provider_error(Capability::KnowledgeRetrieve, &error))
     }
 
+    /// Public pre-authorization check for adapters that must evaluate
+    /// policy before any provider read (e.g. a restore that reads current
+    /// content before rewriting it). Denies are typed policy failures.
+    ///
+    /// # Errors
+    /// Returns the typed policy denial when the capability is not allowed
+    /// for the authenticated principal on the target.
+    pub async fn authorize(
+        &self,
+        context: &CommandContext,
+        capability: Capability,
+        target: ResourceTarget,
+    ) -> Result<(), ApplicationError> {
+        self.require(context, capability, target).await
+    }
+
     /// Read-only policy requirement: a deny is a typed policy failure
     /// without audit (reads carry no operation identity).
     #[allow(clippy::unused_async)] // kept async for uniform call sites
