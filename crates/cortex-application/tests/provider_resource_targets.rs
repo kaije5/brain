@@ -84,12 +84,13 @@ fn grant_policy_denies_provider_targets_outside_the_authenticated_workspace() {
 #[tokio::test]
 async fn replaying_an_operation_against_a_different_target_conflicts() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
     let memory_input = MemoryCreateInput {
         statement: "First".to_owned(),
         normalized_subject: "subject".to_owned(),
         normalized_predicate: "predicate".to_owned(),
         normalized_object: "object".to_owned(),
-        sources: Vec::new(),
+        sources: vec![cortex_domain::SourceRef { source_id }],
     };
     let first = fixture
         .service
@@ -115,7 +116,7 @@ async fn replaying_an_operation_against_a_different_target_conflicts() -> Result
                 normalized_subject: "subject".to_owned(),
                 normalized_predicate: "predicate".to_owned(),
                 normalized_object: "object".to_owned(),
-                sources: Vec::new(),
+                sources: vec![cortex_domain::SourceRef { source_id }],
             },
         )
         .await
@@ -134,7 +135,7 @@ async fn replaying_an_operation_against_a_different_target_conflicts() -> Result
                 normalized_subject: "subject".to_owned(),
                 normalized_predicate: "predicate".to_owned(),
                 normalized_object: "object".to_owned(),
-                sources: Vec::new(),
+                sources: vec![cortex_domain::SourceRef { source_id }],
             },
         )
         .await;
@@ -153,6 +154,7 @@ async fn replaying_an_operation_against_a_different_target_conflicts() -> Result
 #[tokio::test]
 async fn memory_audit_targets_are_recorded_without_content() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
     let created = fixture
         .service
         .create_memory(
@@ -162,7 +164,7 @@ async fn memory_audit_targets_are_recorded_without_content() -> Result<(), Strin
                 normalized_subject: "subject".to_owned(),
                 normalized_predicate: "predicate".to_owned(),
                 normalized_object: "object".to_owned(),
-                sources: Vec::new(),
+                sources: vec![cortex_domain::SourceRef { source_id }],
             },
         )
         .await

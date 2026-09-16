@@ -9,32 +9,33 @@ use uuid::Uuid;
 
 use support::{Fixture, debug_error};
 
-fn new_memory() -> MemoryCreateInput {
+fn new_memory(source_id: cortex_domain::EntityId) -> MemoryCreateInput {
     MemoryCreateInput {
         statement: "Original".to_owned(),
         normalized_subject: "subject".to_owned(),
         normalized_predicate: "predicate".to_owned(),
         normalized_object: "object".to_owned(),
-        sources: Vec::new(),
+        sources: vec![cortex_domain::SourceRef { source_id }],
     }
 }
 
-fn correction() -> MemoryCorrectInput {
+fn correction(source_id: cortex_domain::EntityId) -> MemoryCorrectInput {
     MemoryCorrectInput {
         statement: "Updated".to_owned(),
         normalized_subject: "subject".to_owned(),
         normalized_predicate: "predicate".to_owned(),
         normalized_object: "object".to_owned(),
-        sources: Vec::new(),
+        sources: vec![cortex_domain::SourceRef { source_id }],
     }
 }
 
 #[tokio::test]
 async fn stale_delete_is_rejected_and_leaves_newer_memory_active() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
     let memory = fixture
         .service
-        .create_memory(fixture.context(), new_memory())
+        .create_memory(fixture.context(), new_memory(source_id))
         .await
         .map_err(debug_error)?;
     let updated = fixture
@@ -43,7 +44,7 @@ async fn stale_delete_is_rejected_and_leaves_newer_memory_active() -> Result<(),
             fixture.context(),
             memory.entity_id,
             memory.revision,
-            correction(),
+            correction(source_id),
         )
         .await
         .map_err(debug_error)?;
@@ -58,7 +59,7 @@ async fn stale_delete_is_rejected_and_leaves_newer_memory_active() -> Result<(),
             entity: "memory"
         })
     ));
-    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, memory.entity_id)
+    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, memory.entity_id)
         .await
         .map_err(debug_error)?
         .ok_or("newer memory missing")?;
@@ -71,9 +72,10 @@ async fn stale_delete_is_rejected_and_leaves_newer_memory_active() -> Result<(),
 #[tokio::test]
 async fn repeated_operation_is_returned_before_revision_validation() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
     let memory = fixture
         .service
-        .create_memory(fixture.context(), new_memory())
+        .create_memory(fixture.context(), new_memory(source_id))
         .await
         .map_err(debug_error)?;
     let operation_id = OperationId::new();
@@ -83,7 +85,7 @@ async fn repeated_operation_is_returned_before_revision_validation() -> Result<(
             fixture.context_for(operation_id),
             memory.entity_id,
             memory.revision,
-            correction(),
+            correction(source_id),
         )
         .await
         .map_err(debug_error)?;
@@ -95,14 +97,14 @@ async fn repeated_operation_is_returned_before_revision_validation() -> Result<(
             memory.revision,
             MemoryCorrectInput {
                 statement: "Ignored replay".to_owned(),
-                ..correction()
+                ..correction(source_id)
             },
         )
         .await
         .map_err(debug_error)?;
 
     assert_eq!(replay, first);
-    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, memory.entity_id)
+    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, memory.entity_id)
         .await
         .map_err(debug_error)?
         .ok_or("memory missing")?;
@@ -113,10 +115,11 @@ async fn repeated_operation_is_returned_before_revision_validation() -> Result<(
 #[tokio::test]
 async fn repeated_operation_still_requires_the_current_capability() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
     let operation_id = OperationId::new();
     let first = fixture
         .service
-        .create_memory(fixture.context_for(operation_id), new_memory())
+        .create_memory(fixture.context_for(operation_id), new_memory(source_id))
         .await
         .map_err(debug_error)?;
     let denied = ApplicationService::new(
@@ -131,12 +134,12 @@ async fn repeated_operation_still_requires_the_current_capability() -> Result<()
             fixture.context_for(operation_id),
             first.entity_id,
             first.revision,
-            correction(),
+            correction(source_id),
         )
         .await;
 
     assert!(matches!(replay, Err(ApplicationError::PolicyDenied(_))));
-    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, first.entity_id)
+    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, first.entity_id)
         .await
         .map_err(debug_error)?
         .ok_or("memory missing")?;
@@ -147,10 +150,11 @@ async fn repeated_operation_still_requires_the_current_capability() -> Result<()
 #[tokio::test]
 async fn repeated_operation_rejects_a_different_granted_principal() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
     let operation_id = OperationId::new();
     let first = fixture
         .service
-        .create_memory(fixture.context_for(operation_id), new_memory())
+        .create_memory(fixture.context_for(operation_id), new_memory(source_id))
         .await
         .map_err(debug_error)?;
     let other_principal = PrincipalId::new();
@@ -175,7 +179,7 @@ async fn repeated_operation_rejects_a_different_granted_principal() -> Result<()
             ),
             MemoryCreateInput {
                 statement: "other principal".to_owned(),
-                ..new_memory()
+                ..new_memory(source_id)
             },
         )
         .await;
@@ -186,7 +190,7 @@ async fn repeated_operation_rejects_a_different_granted_principal() -> Result<()
             entity: "operation"
         })
     );
-    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, first.entity_id)
+    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, first.entity_id)
         .await
         .map_err(debug_error)?;
     assert!(persisted.is_some());
@@ -196,10 +200,11 @@ async fn repeated_operation_rejects_a_different_granted_principal() -> Result<()
 #[tokio::test]
 async fn repeated_operation_rejects_a_different_allowed_capability() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
     let operation_id = OperationId::new();
     let memory = fixture
         .service
-        .create_memory(fixture.context_for(operation_id), new_memory())
+        .create_memory(fixture.context_for(operation_id), new_memory(source_id))
         .await
         .map_err(debug_error)?;
 
@@ -214,7 +219,7 @@ async fn repeated_operation_rejects_a_different_allowed_capability() -> Result<(
             entity: "operation"
         })
     );
-    let persisted = MemoryRepository::find(&fixture.state, fixture.workspace_id, memory.entity_id)
+    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, memory.entity_id)
         .await
         .map_err(debug_error)?
         .ok_or("memory missing")?;
@@ -225,14 +230,15 @@ async fn repeated_operation_rejects_a_different_allowed_capability() -> Result<(
 #[tokio::test]
 async fn repeated_operation_rejects_a_different_target() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
     let first_memory = fixture
         .service
-        .create_memory(fixture.context(), new_memory())
+        .create_memory(fixture.context(), new_memory(source_id))
         .await
         .map_err(debug_error)?;
     let second_memory = fixture
         .service
-        .create_memory(fixture.context(), new_memory())
+        .create_memory(fixture.context(), new_memory(source_id))
         .await
         .map_err(debug_error)?;
     let operation_id = OperationId::new();
@@ -242,7 +248,7 @@ async fn repeated_operation_rejects_a_different_target() -> Result<(), String> {
             fixture.context_for(operation_id),
             first_memory.entity_id,
             first_memory.revision,
-            correction(),
+            correction(source_id),
         )
         .await
         .map_err(debug_error)?;
@@ -255,7 +261,7 @@ async fn repeated_operation_rejects_a_different_target() -> Result<(), String> {
             second_memory.revision,
             MemoryCorrectInput {
                 statement: "second target".to_owned(),
-                ..correction()
+                ..correction(source_id)
             },
         )
         .await;
@@ -266,7 +272,7 @@ async fn repeated_operation_rejects_a_different_target() -> Result<(), String> {
             entity: "operation"
         })
     );
-    let second = MemoryRepository::find(&fixture.state, fixture.workspace_id, second_memory.entity_id)
+    let second = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, second_memory.entity_id)
         .await
         .map_err(debug_error)?
         .ok_or("second memory missing")?;
