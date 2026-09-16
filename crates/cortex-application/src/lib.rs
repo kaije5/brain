@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod authority;
 mod capability;
 mod command;
 mod error;
@@ -11,6 +12,10 @@ mod secrets;
 mod service;
 mod task_provider;
 
+pub use authority::{
+    AuthorityPolicy, ProviderAuthority, ProviderMutationOutcome, ProviderOperationLog,
+    ProviderOperationRecord,
+};
 pub use capability::{
     AuditClassification, Capability, CapabilityCatalog, CapabilityMetadata, ContractDescriptor,
     Idempotency,

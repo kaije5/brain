@@ -4,6 +4,7 @@ mod audit;
 mod database;
 mod model_routing;
 mod operation;
+mod provider_operations;
 mod repositories;
 
 pub use audit::SqliteAuditPort;
@@ -13,4 +14,5 @@ pub use model_routing::{
     StoredRouteDecision,
 };
 pub use operation::{OperationStore, RemoteEnrollmentRecord, RemoteEnrollmentRequest};
+pub use provider_operations::ProviderOperationStore;
 pub use repositories::SqliteRepositories;

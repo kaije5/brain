@@ -699,8 +699,12 @@ async fn paired_note_create_is_dispatched_through_the_daemon_owned_application_s
     let WireResult::Success { value } = response.result else {
         panic!("note create should reach application service");
     };
-    assert!(value["entity_id"].as_str().is_some());
-    assert_eq!(value["revision"], 1);
+    // The provider authority returns resource identity plus an opaque
+    // observed revision instead of the legacy numeric entity contract.
+    assert_eq!(value["resource"]["provider_id"], "markdown-vault");
+    assert!(value["resource"]["resource_id"].as_str().is_some());
+    assert_eq!(value["resource"]["kind"], "knowledge");
+    assert!(value["revision"]["revision"].as_str().is_some());
 }
 
 #[tokio::test]
@@ -736,7 +740,15 @@ async fn task_list_is_authorized_audited_and_returns_only_active_workspace_tasks
     let WireResult::Success { value } = response.result else {
         panic!("list succeeds");
     };
-    assert_eq!(value[0]["title"], "listed");
+    // The vault task title is derived from the file stem, which embeds the
+    // stable brain_id prefix; the human title substring is preserved.
+    assert!(
+        value[0]["title"]
+            .as_str()
+            .expect("title is a string")
+            .contains("listed")
+    );
+    assert!(value[0]["revision"].as_str().is_some());
 }
 
 #[tokio::test]

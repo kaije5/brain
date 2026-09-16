@@ -80,7 +80,7 @@ async fn tui_renders_real_daemon_state_and_degrades_without_a_model() {
     app.select_tab(Tab::Tasks);
     let screen = render_app(&app);
     assert!(
-        screen.contains("Drive the TUI end to end"),
+        screen.to_lowercase().contains("drive-the-tui-end-to-end"),
         "tasks tab must render canonical daemon state, got:\n{screen}"
     );
 
