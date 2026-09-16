@@ -158,16 +158,13 @@ pub struct LocalDaemon {
     audit: SqliteAuditPort,
     authority: Option<Arc<DaemonAuthority>>,
     vault: Option<Arc<MarkdownVaultProvider>>,
-<<<<<<< HEAD
     /// Derived, rebuildable vault index backing fused knowledge retrieval.
     vault_index: Arc<std::sync::RwLock<DerivedVaultIndex>>,
-=======
     /// Resolved Brain prompt configuration: immutable for the process
     /// lifetime, so configuration changes apply only at the next daemon
     /// start and never mutate in-flight requests (SCRUM-147).
     prompt: ResolvedPromptConfig,
     resolved_profile: Arc<std::sync::RwLock<Option<String>>>,
->>>>>>> origin/main
 }
 
 #[derive(Clone)]
@@ -483,16 +480,12 @@ impl LocalDaemon {
             database.audit_port(),
         ));
         let audit = database.audit_port();
-<<<<<<< HEAD
-        let (authority, vault, vault_index) = match vault_config {
-=======
         let prompt = config
             .prompt
             .clone()
             .resolve()
             .map_err(|_| DaemonError::InvalidConfiguration)?;
-        let (authority, vault) = match vault_config {
->>>>>>> origin/main
+        let (authority, vault, vault_index) = match vault_config {
             Some(vault_config) => {
                 let opened = MarkdownVaultProvider::open(vault_config.clone(), config.workspace_id)
                     .map_err(|_| DaemonError::StartupFailed)?;
@@ -532,12 +525,9 @@ impl LocalDaemon {
             audit,
             authority,
             vault,
-<<<<<<< HEAD
             vault_index,
-=======
             prompt,
             resolved_profile: Arc::new(std::sync::RwLock::new(None)),
->>>>>>> origin/main
         })
     }
 
