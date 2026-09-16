@@ -190,7 +190,7 @@ fn shortened_document_during_a_reconcile_never_keeps_trailing_chunks() {
     )
     .expect("seed long body");
     let mut index = DerivedVaultIndex::new();
-    assert!(index.chunk_count() == 0);
+    assert_eq!(index.chunk_count(), 0);
     assert_eq!(
         reconcile_vault(&provider, &mut index)
             .expect("long reconcile")
