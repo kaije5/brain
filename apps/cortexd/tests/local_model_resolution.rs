@@ -23,15 +23,15 @@ fn settings_from(contents: &str) -> LocalSettings {
         .expect("file present")
 }
 
-/// Fake NIM transport: discovery lists two models, every capability probe
+/// Fake OpenAI-compatible transport: discovery lists two models, every capability probe
 /// succeeds. Discovery records the bearer it received for auth assertions.
 #[derive(Clone, Default)]
-struct FakeNimTransport {
+struct FakeOpenAiTransport {
     unavailable: bool,
     discovery_bearer: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 
-impl cortex_inference::NimTransport for FakeNimTransport {
+impl cortex_inference::OpenAiTransport for FakeOpenAiTransport {
     async fn get_json(
         &self,
         _endpoint: &str,
@@ -74,7 +74,7 @@ impl cortex_inference::NimTransport for FakeNimTransport {
 async fn default_profile_resolves_through_the_runtime_router() {
     let settings = settings_from(VALID_SETTINGS);
     let resolution =
-        resolve_default_model(Some(&settings), FakeNimTransport::default(), None).await;
+        resolve_default_model(Some(&settings), FakeOpenAiTransport::default(), None).await;
     match resolution {
         ModelResolution::Configured { config, route, .. } => {
             assert_eq!(route.profile_id.as_str(), "local");
@@ -95,7 +95,7 @@ async fn default_profile_resolves_through_the_runtime_router() {
 #[tokio::test]
 async fn resolved_bearer_authenticates_discovery() {
     let settings = settings_from(VALID_SETTINGS);
-    let transport = FakeNimTransport::default();
+    let transport = FakeOpenAiTransport::default();
     let seen = transport.discovery_bearer.clone();
     let resolution =
         resolve_default_model(Some(&settings), transport.clone(), Some("nvapi-test-key")).await;
@@ -113,9 +113,9 @@ async fn unavailable_provider_is_an_explicit_degraded_state() {
     let settings = settings_from(VALID_SETTINGS);
     let resolution = resolve_default_model(
         Some(&settings),
-        FakeNimTransport {
+        FakeOpenAiTransport {
             unavailable: true,
-            ..FakeNimTransport::default()
+            ..FakeOpenAiTransport::default()
         },
         None,
     )
@@ -138,7 +138,7 @@ base_url = "http://127.0.0.1:8000/v1/"
 "#,
     );
     let resolution =
-        resolve_default_model(Some(&settings), FakeNimTransport::default(), None).await;
+        resolve_default_model(Some(&settings), FakeOpenAiTransport::default(), None).await;
     assert!(matches!(resolution, ModelResolution::Degraded { .. }));
 }
 
@@ -146,7 +146,7 @@ base_url = "http://127.0.0.1:8000/v1/"
 async fn no_default_profile_leaves_inference_disabled() {
     let settings = settings_from("[daemon]\n");
     let resolution =
-        resolve_default_model(Some(&settings), FakeNimTransport::default(), None).await;
+        resolve_default_model(Some(&settings), FakeOpenAiTransport::default(), None).await;
     assert!(matches!(resolution, ModelResolution::Disabled));
 }
 
@@ -183,7 +183,7 @@ struct SelectiveTransport {
     probe_fails_for_endpoint_containing: &'static str,
 }
 
-impl cortex_inference::NimTransport for SelectiveTransport {
+impl cortex_inference::OpenAiTransport for SelectiveTransport {
     async fn get_json(
         &self,
         _endpoint: &str,
@@ -276,7 +276,7 @@ omit_tool_choice = true
 "#,
     );
     let resolution =
-        resolve_default_model(Some(&settings), FakeNimTransport::default(), None).await;
+        resolve_default_model(Some(&settings), FakeOpenAiTransport::default(), None).await;
     match resolution {
         ModelResolution::Configured { config, .. } => {
             assert_eq!(config.timeout().as_millis(), 9_000);

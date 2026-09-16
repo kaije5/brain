@@ -3,9 +3,10 @@ use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use chrono::Utc;
 use cortex_application::{ApplicationError, SecretRef};
 use cortex_inference::{
-    ApiMode, AuthStrategy, DiscoveredModel, ModelCatalog, ModelId, ModelRouter, NimConfig,
-    NimDiscovery, NimTransport, OpenAiCompatibleConfig, ProfileTimeouts, ProviderLimits,
-    ProviderProfile, ProviderProfileId, ProviderQuirks, RoleRoutingPolicy, RoutedModel,
+    ApiMode, AuthStrategy, DiscoveredModel, ModelCatalog, ModelId, ModelRouter,
+    OpenAiCompatibleConfig, OpenAiDiscoveryConfig, OpenAiModelDiscovery, OpenAiTransport,
+    ProfileTimeouts, ProviderLimits, ProviderProfile, ProviderProfileId, ProviderQuirks,
+    RoleRoutingPolicy, RoutedModel,
 };
 use serde::Deserialize;
 
@@ -484,7 +485,7 @@ fn profile_and_secret(profiles: &[ProviderProfile], profile_id: &str) -> Option<
 }
 
 /// Resolves the settings' default model profile through the SCRUM-41 runtime
-/// router: fresh NIM discovery on every enabled profile builds the capability
+/// router: fresh OpenAI-compatible discovery on every enabled profile builds the capability
 /// catalog (each with its own declared endpoint, auth strategy, and timeouts),
 /// then the deterministic agent-role policy selects the
 /// `{profile_id, model_id}` route. The bearer credential is resolved once by
@@ -495,7 +496,7 @@ fn profile_and_secret(profiles: &[ProviderProfile], profile_id: &str) -> Option<
 /// Discovery and probes talk to the configured endpoints; failures surface as
 /// [`ModelResolution::Degraded`] rather than blocking deterministic operation.
 /// There is no fallback: the routed selection is the typed decision.
-pub async fn resolve_default_model<T: NimTransport + Clone>(
+pub async fn resolve_default_model<T: OpenAiTransport + Clone>(
     settings: Option<&LocalSettings>,
     transport: T,
     bearer: Option<&str>,
@@ -604,7 +605,7 @@ pub async fn resolve_default_model<T: NimTransport + Clone>(
 /// profile's evidence. Returns `None` when the default profile's discovery
 /// fails; other profiles degrade best-effort so one unreachable endpoint
 /// cannot hide an eligible alternative.
-async fn discover_enabled_profiles<T: NimTransport + Clone>(
+async fn discover_enabled_profiles<T: OpenAiTransport + Clone>(
     settings: &LocalSettings,
     profiles: &[ProviderProfile],
     default_profile_id: &ProviderProfileId,
@@ -614,7 +615,7 @@ async fn discover_enabled_profiles<T: NimTransport + Clone>(
     let mut discovered = Vec::new();
     for profile in profiles.iter().filter(|profile| profile.enabled()) {
         let base_url = settings.endpoint_for(profile.id().as_str())?;
-        let Ok(discovery_config) = NimConfig::new(
+        let Ok(discovery_config) = OpenAiDiscoveryConfig::new(
             base_url,
             profile.secret_reference().cloned(),
             profile.timeouts().request(),
@@ -630,7 +631,7 @@ async fn discover_enabled_profiles<T: NimTransport + Clone>(
             AuthStrategy::SecretRef => bearer,
             AuthStrategy::None => None,
         };
-        match NimDiscovery::new(discovery_config, transport.clone())
+        match OpenAiModelDiscovery::new(discovery_config, transport.clone())
             .refresh(profile_bearer)
             .await
         {

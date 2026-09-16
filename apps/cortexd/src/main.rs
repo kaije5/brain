@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bearer = credential.as_deref();
         match resolve_default_model(
             resolve_settings.as_ref(),
-            cortexd::ReqwestNimTransport::default(),
+            cortexd::ReqwestOpenAiTransport::default(),
             bearer,
         )
         .await

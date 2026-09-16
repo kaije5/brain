@@ -16,7 +16,7 @@ mod windows_security;
 pub use client::AuthenticatedIpcClient;
 pub use config::{DaemonConfig, InferenceBearer};
 pub use cortex_application::SecretRef;
-pub use cortex_inference::ReqwestNimTransport;
+pub use cortex_inference::ReqwestOpenAiTransport;
 pub use governed::GovernedVaultProvider;
 pub use ipc::{
     AuthenticatedLocalClient, DaemonError, DaemonRequest, DaemonResponse, LocalDaemon,
