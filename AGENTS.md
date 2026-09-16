@@ -47,5 +47,5 @@ Before opening a PR (at any level), run:
 ```text
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked
-cargo test --workspace
+cargo nextest run --workspace
 ```
