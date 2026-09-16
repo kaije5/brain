@@ -488,6 +488,10 @@ pub struct App {
     transcript: Vec<(String, String)>,
     partial_reply: Option<String>,
     tasks: Vec<(String, String)>,
+    /// Freshness tag of the last vault task list: `None` until one loads.
+    task_freshness: Option<String>,
+    /// Provider id of the daemon's configured vault, when present.
+    vault_provider: Option<String>,
     notes_query: String,
     note_results: Vec<String>,
     settings: Option<SettingsSummary>,
@@ -505,6 +509,8 @@ impl Default for App {
             transcript: Vec::new(),
             partial_reply: None,
             tasks: Vec::new(),
+            task_freshness: None,
+            vault_provider: None,
             notes_query: String::new(),
             note_results: Vec::new(),
             settings: None,
@@ -629,6 +635,27 @@ impl App {
 
     pub fn set_tasks(&mut self, rows: Vec<(String, String)>) {
         self.tasks = rows;
+    }
+
+    /// Records the freshness tag of the last vault task list.
+    pub fn set_task_freshness(&mut self, freshness: Option<String>) {
+        self.task_freshness = freshness;
+    }
+
+    /// Whether the last vault task list reported a stale (degraded) index.
+    #[must_use]
+    pub fn task_index_stale(&self) -> bool {
+        self.task_freshness.as_deref() == Some("stale")
+    }
+
+    /// Records the provider id of the daemon's configured vault, if any.
+    pub fn set_vault_provider(&mut self, provider_id: Option<String>) {
+        self.vault_provider = provider_id;
+    }
+
+    #[must_use]
+    pub fn vault_provider(&self) -> Option<&str> {
+        self.vault_provider.as_deref()
     }
 
     #[must_use]

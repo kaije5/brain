@@ -1444,6 +1444,13 @@ impl LocalDaemon {
                     "workspace_id": Uuid::from(self.workspace_id).to_string(),
                     "principal_id": Uuid::from(principal_id).to_string(),
                     "migrations_applied": self.migrations_applied,
+                    "vault": match &self.vault {
+                        Some(vault) => json!({
+                            "configured": true,
+                            "provider_id": vault.provider_reference_id().as_str(),
+                        }),
+                        None => json!({ "configured": false }),
+                    },
                 }),
             },
         }

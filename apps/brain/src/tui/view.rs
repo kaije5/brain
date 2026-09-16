@@ -156,6 +156,27 @@ fn render_chat(app: &App, area: Rect, buffer: &mut Buffer) {
 }
 
 fn render_tasks(app: &App, area: Rect, buffer: &mut Buffer) {
+    // The degraded state is always visible before task content: a stale
+    // index means rows may lag recent vault edits.
+    if app.task_index_stale() {
+        let [banner, rest] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
+        paragraph(
+            vec![Line::styled(
+                "!! vault index is stale - results may lag recent edits (degraded)",
+                Style::default().fg(Color::Red),
+            )],
+            " Tasks ",
+            banner,
+            buffer,
+        );
+        render_task_rows(app, rest, buffer);
+        return;
+    }
+    render_task_rows(app, area, buffer);
+}
+
+fn render_task_rows(app: &App, area: Rect, buffer: &mut Buffer) {
     if app.tasks.is_empty() {
         paragraph(
             vec![
@@ -248,6 +269,25 @@ fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
                 Span::raw(format!("{id} @ {url}")),
             ]));
         }
+        lines.push(Line::default());
+        // The configured vault authority and the last observed task-index
+        // freshness are surfaced so degradation is visible without leaving
+        // the TUI.
+        lines.push(Line::from(vec![
+            Span::styled("vault: ", accent()),
+            Span::raw(match app.vault_provider() {
+                Some(provider) => format!("{provider} (configured)"),
+                None => "not configured".to_owned(),
+            }),
+        ]));
+        lines.push(Line::from(format!(
+            "task index: {}",
+            if app.task_index_stale() {
+                "stale (degraded)"
+            } else {
+                "current"
+            }
+        )));
         lines.push(Line::default());
         lines.push(Line::from(format!("config: {}", summary.config_path)));
         lines.push(Line::from(

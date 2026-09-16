@@ -215,3 +215,76 @@ fn loaded_status_does_not_replace_contextual_shortcuts() {
     app.set_status_line("1 tasks loaded".to_owned());
     assert!(render_app(&app).contains("r: refresh"));
 }
+
+#[test]
+fn stale_task_index_renders_the_degraded_banner_above_rows() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.set_task_freshness(Some("stale".to_owned()));
+    app.set_tasks(vec![("Write the TUI".to_owned(), "open".to_owned())]);
+    let screen = render_app(&app);
+    assert!(screen.contains("vault index is stale"));
+    assert!(screen.contains("(degraded)"));
+    // Rows remain visible below the banner.
+    assert!(screen.contains("Write the TUI"));
+}
+
+#[test]
+fn current_task_index_renders_without_the_degraded_banner() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.set_task_freshness(Some("current".to_owned()));
+    app.set_tasks(vec![("Write the TUI".to_owned(), "open".to_owned())]);
+    let screen = render_app(&app);
+    assert!(!screen.contains("vault index is stale"));
+    assert!(screen.contains("Write the TUI"));
+}
+
+#[test]
+fn empty_tasks_with_a_stale_index_still_explain_the_degraded_state() {
+    let mut app = App::new();
+    app.tab = Tab::Tasks;
+    app.set_task_freshness(Some("stale".to_owned()));
+    let screen = render_app(&app);
+    assert!(screen.contains("vault index is stale"));
+    assert!(screen.contains("No tasks to show"));
+}
+
+#[test]
+fn conflict_recovery_is_visible_in_the_status_line() {
+    let mut app = App::new();
+    app.set_status_line("tasks unavailable: conflict (vault changed; refreshing)".to_owned());
+    let screen = render_app(&app);
+    assert!(screen.contains("conflict"));
+    assert!(screen.contains("refreshing"));
+    assert!(screen.contains("tasks unavailable"));
+}
+
+#[test]
+fn settings_tab_shows_the_configured_vault_and_index_state() {
+    let mut app = App::new();
+    app.tab = Tab::Settings;
+    app.set_vault_provider(Some("markdown-vault".to_owned()));
+    app.set_task_freshness(Some("stale".to_owned()));
+    app.set_settings_summary(brain::tui::SettingsSummary {
+        config_path: "C:/data/cortexd.toml".to_owned(),
+        default_profile: None,
+        profiles: Vec::new(),
+        model_status: "ready".to_owned(),
+    });
+    let screen = render_app(&app);
+    assert!(screen.contains("vault: markdown-vault (configured)"));
+    assert!(screen.contains("task index: stale (degraded)"));
+
+    let mut app = App::new();
+    app.tab = Tab::Settings;
+    app.set_settings_summary(brain::tui::SettingsSummary {
+        config_path: "C:/data/cortexd.toml".to_owned(),
+        default_profile: None,
+        profiles: Vec::new(),
+        model_status: "ready".to_owned(),
+    });
+    let screen = render_app(&app);
+    assert!(screen.contains("vault: not configured"));
+    assert!(screen.contains("task index: current"));
+}

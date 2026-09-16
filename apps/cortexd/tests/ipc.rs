@@ -789,3 +789,30 @@ async fn malformed_or_oversized_ipc_envelopes_are_rejected_without_details() {
     let error = daemon.decode_request(&vec![b'x'; 65 * 1024]).unwrap_err();
     assert_eq!(error, DaemonError::InvalidRequest);
 }
+
+#[tokio::test]
+async fn daemon_status_reports_the_configured_vault_identity() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let daemon = LocalDaemon::start(DaemonConfig::for_test(directory.path()))
+        .await
+        .expect("daemon starts");
+    let response = daemon
+        .paired_client()
+        .request(&DaemonRequest {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: "cortex_daemon_status".to_owned(),
+            payload: json!({}),
+        })
+        .await
+        .expect("status response");
+    let WireResult::Success { value } = response.result else {
+        panic!("status succeeds");
+    };
+    // The configured vault authority is visible to clients without any
+    // direct storage access.
+    assert_eq!(value["vault"]["configured"], true);
+    assert_eq!(value["vault"]["provider_id"], "markdown-vault");
+}
