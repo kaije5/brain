@@ -240,7 +240,7 @@ fn note_update_and_delete_map_resource_payloads() {
     ])
     .expect("parses");
     let request = command(&cli);
-    assert_eq!(request.capability, "cortex_note_update");
+    assert_eq!(request.capability, "cortex_knowledge_update");
     assert_eq!(
         request.payload,
         json!({"resource_id": "path:Design.md", "expected_revision": "rev-abc",
@@ -257,7 +257,7 @@ fn note_update_and_delete_map_resource_payloads() {
     ])
     .expect("parses");
     let request = command(&cli);
-    assert_eq!(request.capability, "cortex_note_delete");
+    assert_eq!(request.capability, "cortex_knowledge_delete");
     assert_eq!(
         request.payload,
         json!({"resource_id": "path:Design.md", "expected_revision": "rev-abc"})

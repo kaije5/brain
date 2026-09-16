@@ -5,8 +5,8 @@ use cortex_application::{
 use cortex_domain::{
     AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion,
     MemoryAssertionInput, OperationId, PolicyDecision, PrincipalId, ProviderId, ProviderResourceId,
-    ProviderResourceKind, ProviderResourceRef, ResourceTarget, Revision, Source, SourceInput,
-    SourceRef, WorkspaceId,
+    ProviderResourceKind, ProviderResourceRef, ResourceTarget, Revision, Source, SourceRef,
+    WorkspaceId,
 };
 use cortex_storage::SqliteDatabase;
 use tempfile::TempDir;

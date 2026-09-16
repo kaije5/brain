@@ -686,15 +686,14 @@ impl LocalDaemon {
             }
             "cortex_model_list" => Ok(self.model_list_response(correlation_id)),
             "cortex_remote_enroll" => self.enroll_remote_principal(principal_id, request).await,
-            "cortex_knowledge_search" | "cortex_note_search" | "cortex_memory_search" => {
+            "cortex_knowledge_search" | "cortex_memory_search" => {
                 self.search_knowledge(principal_id, request).await
             }
             "cortex_task_list" => self.list_tasks(principal_id, request).await,
             "cortex_agent_run" => self.run_agent(principal_id, request).await,
-            "cortex_note_create"
-            | "cortex_note_update"
-            | "cortex_note_delete"
-            | "cortex_note_restore"
+            "cortex_knowledge_create"
+            | "cortex_knowledge_update"
+            | "cortex_knowledge_delete"
             | "cortex_task_create"
             | "cortex_task_update"
             | "cortex_task_complete"
@@ -809,12 +808,12 @@ impl LocalDaemon {
             .map_err(DaemonError::from)
     }
 
-    async fn create_note(
+    async fn create_knowledge_document(
         &self,
         principal_id: PrincipalId,
         request: &DaemonRequest,
     ) -> Result<DaemonResponse, DaemonError> {
-        let input: WireNoteCreate = serde_json::from_value(request.payload.clone())
+        let input: WireKnowledgeCreate = serde_json::from_value(request.payload.clone())
             .map_err(|_| DaemonError::InvalidRequest)?;
         let context = self.command_context(principal_id, request)?;
         let authority = self
@@ -880,13 +879,13 @@ impl LocalDaemon {
         principal_id: PrincipalId,
         request: &DaemonRequest,
     ) -> Result<DaemonResponse, DaemonError> {
-        if request.capability == "cortex_note_create" {
-            return self.create_note(principal_id, request).await;
+        if request.capability == "cortex_knowledge_create" {
+            return self.create_knowledge_document(principal_id, request).await;
         }
         let context = self.command_context(principal_id, request)?;
         let result: MutationOutcome = match request.capability.as_str() {
-            "cortex_note_update" => {
-                let input: WireNoteUpdate = decode_payload(&request.payload)?;
+            "cortex_knowledge_update" => {
+                let input: WireKnowledgeUpdate = decode_payload(&request.payload)?;
                 let (resource_id, expected_revision) = input.resource()?;
                 let authority = self
                     .authority
@@ -910,7 +909,7 @@ impl LocalDaemon {
                     .await
                     .map(MutationOutcome::Provider)
             }
-            "cortex_note_delete" => {
+            "cortex_knowledge_delete" => {
                 let input: WireResourceCommand = decode_payload(&request.payload)?;
                 let authority = self
                     .authority
@@ -932,11 +931,6 @@ impl LocalDaemon {
                     .await
                     .map(MutationOutcome::Provider)
             }
-            // The vault format has no undelete: a deleted document cannot be
-            // restored, so the legacy restore capability is a typed rejection.
-            "cortex_note_restore" => Err(ApplicationError::NotFound {
-                entity: "knowledge_document",
-            }),
             "cortex_task_create" => {
                 let input: WireTaskCreate = decode_payload(&request.payload)?;
                 let due_at = input.due_at()?;
@@ -1614,7 +1608,7 @@ fn is_v7(value: Uuid) -> bool {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WireNoteCreate {
+struct WireKnowledgeCreate {
     title: String,
     content: String,
 }
@@ -1643,14 +1637,14 @@ impl WireResourceCommand {
 /// revision the caller based the write on.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WireNoteUpdate {
+struct WireKnowledgeUpdate {
     resource_id: String,
     expected_revision: String,
     title: String,
     content: String,
 }
 
-impl WireNoteUpdate {
+impl WireKnowledgeUpdate {
     fn resource(
         &self,
     ) -> Result<(cortex_domain::ProviderResourceId, ObservedRevision), DaemonError> {
@@ -2434,7 +2428,7 @@ mod tests {
     async fn denied_wire_search_returns_safe_error_and_writes_a_denial_audit() {
         let directory = TempDir::new().expect("temporary directory");
         let config = DaemonConfig::for_test(directory.path())
-            .with_bootstrap_grants(vec![Capability::NoteCreate]);
+            .with_bootstrap_grants(vec![Capability::KnowledgeCreate]);
         let client = config.provisioned_client();
         let daemon = LocalDaemon::start(config).await.expect("daemon");
         let request_id = Uuid::now_v7();

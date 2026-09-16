@@ -536,14 +536,6 @@ async fn active_search_snippet(
     kind: &str,
 ) -> Result<Option<String>, ApplicationError> {
     let query = match kind {
-        "note" => {
-            "SELECT title || char(10) || content FROM note \
-             WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'"
-        }
-        "task" => {
-            "SELECT title FROM task \
-             WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'"
-        }
         "memory" => {
             "SELECT statement FROM memory_assertion \
              WHERE workspace_id = ? AND id = ? AND lifecycle = 'active' AND status = 'active'"
@@ -764,14 +756,6 @@ async fn set_lifecycle(
 ) -> Result<(), ApplicationError> {
     let new_revision = expected_revision.next().map_err(ApplicationError::from)?;
     let query = match table {
-        "note" => {
-            "UPDATE note SET lifecycle = ?, revision = ?, updated_at = CURRENT_TIMESTAMP \
-             WHERE workspace_id = ? AND id = ? AND revision = ?"
-        }
-        "task" => {
-            "UPDATE task SET lifecycle = ?, revision = ?, updated_at = CURRENT_TIMESTAMP \
-             WHERE workspace_id = ? AND id = ? AND revision = ?"
-        }
         "memory_assertion" => {
             "UPDATE memory_assertion SET lifecycle = ?, revision = ?, updated_at = CURRENT_TIMESTAMP \
              WHERE workspace_id = ? AND id = ? AND revision = ?"

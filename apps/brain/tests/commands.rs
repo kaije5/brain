@@ -6,7 +6,7 @@ use serde_json::json;
 fn note_create_maps_only_client_safe_payload_fields() {
     let cli = Cli::try_parse_from(["brain", "note", "create", "Title", "Body"]).expect("parses");
     let request = command_request(&cli).expect("maps");
-    assert_eq!(request.capability, "cortex_note_create");
+    assert_eq!(request.capability, "cortex_knowledge_create");
     assert_eq!(request.payload, json!({"title":"Title","content":"Body"}));
     assert_ne!(request.request_id, request.operation_id);
 }
@@ -28,14 +28,14 @@ fn remote_enroll_maps_only_subject_and_explicit_requested_grants() {
         "--subject",
         "chatgpt-owner-subject",
         "--grant",
-        "cortex_note_create",
+        "cortex_knowledge_create",
     ])
     .expect("parses");
     let request = command_request(&cli).expect("maps");
     assert_eq!(request.capability, "cortex_remote_enroll");
     assert_eq!(
         request.payload,
-        json!({"subject":"chatgpt-owner-subject","grants":["cortex_note_create"]})
+        json!({"subject":"chatgpt-owner-subject","grants":["cortex_knowledge_create"]})
     );
 }
 

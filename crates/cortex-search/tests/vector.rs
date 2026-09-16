@@ -5,8 +5,9 @@ use cortex_application::{
     CommandContext, Embedding, EntityKind, MutationResult, SearchIndex,
 };
 use cortex_domain::{
-    AuditEvent, AuditEventId, AuditResult, EntityId, Note, NoteInput, OperationId, PolicyDecision,
-    PrincipalId, WorkspaceId,
+    AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion,
+    MemoryAssertionInput, OperationId, PolicyDecision, PrincipalId, Revision, Source, SourceRef,
+    WorkspaceId,
 };
 use cortex_search::{VectorRecord, cosine_candidates};
 use cortex_storage::SqliteDatabase;
@@ -104,15 +105,15 @@ async fn sqlite_embeddings_validate_blob_dimensions_and_load_bounded_authorized_
         .grant_capability(workspace_id, principal_id, Capability::KnowledgeRetrieve)
         .await
         .map_err(debug_error)?;
-    let note = Note::create(NoteInput {
-        workspace_id,
-        title: "Local inference".to_owned(),
-        content: "Cortex uses local embeddings".to_owned(),
-    })
-    .map_err(debug_error)?;
-    persist_note(&database, principal_id, note.clone()).await?;
+    let note = memory(workspace_id, "Cortex uses local embeddings")?;
+    persist_memory(&database, principal_id, note.clone()).await?;
     repositories
-        .upsert_search_document(workspace_id, note.id(), EntityKind::Note, note.content())
+        .upsert_search_document(
+            workspace_id,
+            note.id(),
+            EntityKind::Memory,
+            note.statement(),
+        )
         .await
         .map_err(debug_error)?;
     let stored = embedding(vec![0.8, 0.2])?;
@@ -182,7 +183,7 @@ async fn sqlite_embeddings_validate_blob_dimensions_and_load_bounded_authorized_
 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].candidate.entity_id, note.id());
-    assert_eq!(records[0].candidate.kind, EntityKind::Note);
+    assert_eq!(records[0].candidate.kind, EntityKind::Memory);
     assert_eq!(records[0].embedding, stored);
     Ok(())
 }
@@ -209,15 +210,10 @@ async fn changing_searchable_text_atomically_invalidates_the_stale_embedding() -
         .grant_capability(workspace_id, principal_id, Capability::KnowledgeRetrieve)
         .await
         .map_err(debug_error)?;
-    let note = Note::create(NoteInput {
-        workspace_id,
-        title: "Content hash".to_owned(),
-        content: "content A".to_owned(),
-    })
-    .map_err(debug_error)?;
-    persist_note(&database, principal_id, note.clone()).await?;
+    let note = memory(workspace_id, "content A")?;
+    persist_memory(&database, principal_id, note.clone()).await?;
     repositories
-        .upsert_search_document(workspace_id, note.id(), EntityKind::Note, "content A")
+        .upsert_search_document(workspace_id, note.id(), EntityKind::Memory, "content A")
         .await
         .map_err(debug_error)?;
     let old_embedding = embedding(vec![1.0, 0.0])?;
@@ -240,7 +236,7 @@ async fn changing_searchable_text_atomically_invalidates_the_stale_embedding() -
     );
 
     repositories
-        .upsert_search_document(workspace_id, note.id(), EntityKind::Note, "content B")
+        .upsert_search_document(workspace_id, note.id(), EntityKind::Memory, "content B")
         .await
         .map_err(debug_error)?;
     assert!(
@@ -286,37 +282,48 @@ async fn semantic_records(
     .map_err(debug_error)
 }
 
-async fn persist_note(
+async fn persist_memory(
     database: &SqliteDatabase,
     principal_id: PrincipalId,
-    note: Note,
+    memory: MemoryAssertion,
 ) -> Result<(), String> {
     let context = CommandContext::from_authenticated(
-        note.workspace_id(),
+        memory.workspace_id(),
         principal_id,
         OperationId::new(),
         Uuid::now_v7(),
     );
     let result = MutationResult {
-        entity_id: note.id(),
-        revision: note.revision(),
-        lifecycle: note.lifecycle(),
+        entity_id: memory.id(),
+        revision: memory.revision(),
+        lifecycle: memory.lifecycle(),
         audit_correlation_id: context.correlation_id,
     };
+    let source = Source::rehydrate(
+        memory.sources()[0].source_id,
+        memory.workspace_id(),
+        "vector-test".to_owned(),
+        Revision::initial(),
+        Lifecycle::Active,
+    )
+    .map_err(debug_error)?;
     let mutation = AtomicMutation::new(
         context,
-        Capability::NoteCreate,
+        Capability::MemoryCreate,
         None,
-        vec![AggregateChange::InsertNote(note.clone())],
+        vec![
+            AggregateChange::InsertSource(source),
+            AggregateChange::InsertMemory(memory.clone()),
+        ],
         result,
         AuditEvent {
             id: AuditEventId::new(),
-            workspace_id: note.workspace_id(),
+            workspace_id: memory.workspace_id(),
             principal_id,
             operation_id: context.operation_id,
             correlation_id: context.correlation_id,
-            capability: Capability::NoteCreate.metadata().mcp_name,
-            target: Some(cortex_domain::ResourceTarget::CortexEntity(note.id())),
+            capability: Capability::MemoryCreate.metadata().mcp_name,
+            target: Some(cortex_domain::ResourceTarget::CortexEntity(memory.id())),
             provider_metadata: None,
             policy_decision: PolicyDecision::Allow,
             result: AuditResult::Succeeded,
@@ -329,6 +336,20 @@ async fn persist_note(
         .await
         .map(|_| ())
         .map_err(debug_error)
+}
+
+fn memory(workspace_id: WorkspaceId, statement: &str) -> Result<MemoryAssertion, String> {
+    MemoryAssertion::create(MemoryAssertionInput {
+        workspace_id,
+        statement: statement.to_owned(),
+        normalized_subject: "subject".to_owned(),
+        normalized_predicate: "predicate".to_owned(),
+        normalized_object: "object".to_owned(),
+        sources: vec![SourceRef {
+            source_id: EntityId::new(),
+        }],
+    })
+    .map_err(debug_error)
 }
 
 fn embedding(values: Vec<f32>) -> Result<Embedding, String> {

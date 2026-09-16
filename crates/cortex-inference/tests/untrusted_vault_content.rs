@@ -47,7 +47,7 @@ fn tool_names(capabilities: &AuthorizedCapabilities) -> Vec<String> {
 #[test]
 fn tool_definitions_are_identical_whatever_the_turn_content_contains() {
     let context = context();
-    let policy = granted(&context, [Capability::NoteSearch]);
+    let policy = granted(&context, [Capability::KnowledgeRetrieve]);
 
     // The same resolution is run for a clean turn and for a turn whose
     // message content is an indexed vault document carrying injected
@@ -66,7 +66,10 @@ fn tool_definitions_are_identical_whatever_the_turn_content_contains() {
     )
     .expect("resolution with injected content in the turn");
     assert_eq!(tool_names(&clean), tool_names(&injected));
-    assert_eq!(tool_names(&clean), vec!["cortex_note_search".to_owned()]);
+    assert_eq!(
+        tool_names(&clean),
+        vec!["cortex_knowledge_search".to_owned()]
+    );
 
     // The injected text cannot widen an all-denied policy either.
     let denied = granted(&context, []);

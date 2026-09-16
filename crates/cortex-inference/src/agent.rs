@@ -581,26 +581,7 @@ fn input_schema(capability: Capability) -> Value {
         "expected_revision": { "type": "integer", "minimum": 1 }
     });
     match capability {
-        Capability::NoteCreate => object_schema(
-            &["title", "content"],
-            json!({
-                "title": { "type": "string", "minLength": 1 },
-                "content": { "type": "string", "minLength": 1 }
-            }),
-        ),
-        Capability::NoteUpdate => object_schema(
-            &["entity_id", "expected_revision", "title", "content"],
-            merge_properties(
-                entity_revision,
-                json!({
-                    "title": { "type": "string", "minLength": 1 },
-                    "content": { "type": "string", "minLength": 1 }
-                }),
-            ),
-        ),
-        Capability::NoteDelete
-        | Capability::KnowledgeDelete
-        | Capability::NoteRestore
+        Capability::KnowledgeDelete
         | Capability::TaskComplete
         | Capability::TaskDelete
         | Capability::TaskRestore
@@ -677,16 +658,15 @@ fn input_schema(capability: Capability) -> Value {
                 }),
             ),
         ),
-        Capability::NoteSearch
-        | Capability::MemorySearch
-        | Capability::KnowledgeRetrieve
-        | Capability::AgentRun => object_schema(
-            &["query"],
-            json!({
-                "query": { "type": "string", "minLength": 1 },
-                "limit": { "type": "integer", "minimum": 1 }
-            }),
-        ),
+        Capability::MemorySearch | Capability::KnowledgeRetrieve | Capability::AgentRun => {
+            object_schema(
+                &["query"],
+                json!({
+                    "query": { "type": "string", "minLength": 1 },
+                    "limit": { "type": "integer", "minimum": 1 }
+                }),
+            )
+        }
     }
 }
 
@@ -724,13 +704,9 @@ fn validated_arguments(capability: Capability, arguments: &str) -> Result<Value,
             reason: "tool arguments are not valid JSON",
         })?;
     let normalized = match capability {
-        Capability::NoteCreate => decode::<NoteCreateArguments>(value),
         Capability::KnowledgeCreate => decode::<KnowledgeCreateArguments>(value),
         Capability::KnowledgeUpdate => decode::<KnowledgeUpdateArguments>(value),
-        Capability::NoteUpdate => decode::<NoteUpdateArguments>(value),
-        Capability::NoteDelete
-        | Capability::KnowledgeDelete
-        | Capability::NoteRestore
+        Capability::KnowledgeDelete
         | Capability::TaskComplete
         | Capability::TaskDelete
         | Capability::TaskRestore
@@ -741,10 +717,9 @@ fn validated_arguments(capability: Capability, arguments: &str) -> Result<Value,
         Capability::TaskList => decode::<TaskListArguments>(value),
         Capability::MemoryCreate => decode::<MemoryCreateArguments>(value),
         Capability::MemoryCorrect => decode::<MemoryCorrectArguments>(value),
-        Capability::NoteSearch
-        | Capability::MemorySearch
-        | Capability::KnowledgeRetrieve
-        | Capability::AgentRun => decode::<SearchArguments>(value),
+        Capability::MemorySearch | Capability::KnowledgeRetrieve | Capability::AgentRun => {
+            decode::<SearchArguments>(value)
+        }
     }?;
     validate_capability_semantics(capability, &normalized)?;
     validate_normalized_arguments(&normalized)?;
@@ -807,22 +782,6 @@ fn validate_normalized_arguments(value: &Value) -> Result<(), ApplicationError> 
             Ok(())
         }
     }
-}
-
-#[derive(serde::Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct NoteCreateArguments {
-    title: String,
-    content: String,
-}
-
-#[derive(serde::Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct NoteUpdateArguments {
-    entity_id: V7Uuid,
-    expected_revision: NonZeroU64,
-    title: String,
-    content: String,
 }
 
 #[derive(serde::Deserialize, Serialize)]

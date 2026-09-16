@@ -167,7 +167,7 @@ fn request() -> InferenceRequest {
             content: "remember Cortex".to_owned(),
         }],
         tools: vec![InferenceTool {
-            name: "cortex_note_create".to_owned(),
+            name: "cortex_knowledge_create".to_owned(),
             description: "Create a note".to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -192,7 +192,7 @@ async fn adapter_maps_openai_tool_calls_into_provider_neutral_output() {
                     "id": "call-7",
                     "type": "function",
                     "function": {
-                        "name": "cortex_note_create",
+                        "name": "cortex_knowledge_create",
                         "arguments": "{\"title\":\"Cortex\",\"content\":\"local first\"}"
                     }
                 }]
@@ -209,7 +209,7 @@ async fn adapter_maps_openai_tool_calls_into_provider_neutral_output() {
             content: None,
             tool_calls: vec![ToolCall {
                 id: "call-7".to_owned(),
-                name: "cortex_note_create".to_owned(),
+                name: "cortex_knowledge_create".to_owned(),
                 arguments: "{\"title\":\"Cortex\",\"content\":\"local first\"}".to_owned(),
             }],
         })

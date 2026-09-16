@@ -25,7 +25,7 @@ subject, requested grants, enrollment **path**, correlation ID, and
 
 ```powershell
 $env:CORTEX_DATABASE = 'C:\CortexData\cortex.db'
-cargo run -p brain -- --output json remote enroll --subject 'chatgpt-owner-subject' --grant cortex_note_create --grant cortex_note_search --grant cortex_memory_search
+cargo run -p brain -- --output json remote enroll --subject 'chatgpt-owner-subject' --grant cortex_knowledge_create --grant cortex_knowledge_search --grant cortex_memory_search
 ```
 
 The exact same subject/grant set is idempotent: retrying it returns the existing

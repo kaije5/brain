@@ -87,7 +87,7 @@ async fn obsolete_v1_entity_payloads_are_rejected() {
 
     let obsolete_note = client
         .request(&request(
-            "cortex_note_delete",
+            "cortex_knowledge_delete",
             json!({"entity_id": Uuid::now_v7(), "expected_revision": 7}),
         ))
         .await
@@ -235,7 +235,7 @@ async fn note_updates_address_vault_paths_with_opaque_revisions() {
     let created = success_value(
         client
             .request(&request(
-                "cortex_note_create",
+                "cortex_knowledge_create",
                 json!({"title": "Design", "content": "first draft"}),
             ))
             .await
@@ -255,7 +255,7 @@ async fn note_updates_address_vault_paths_with_opaque_revisions() {
     let updated = success_value(
         client
             .request(&request(
-                "cortex_note_update",
+                "cortex_knowledge_update",
                 json!({
                     "resource_id": resource_id,
                     "expected_revision": revision,
@@ -275,7 +275,7 @@ async fn note_updates_address_vault_paths_with_opaque_revisions() {
     // A stale write is a typed conflict that leaves the file untouched.
     let conflict = client
         .request(&request(
-            "cortex_note_update",
+            "cortex_knowledge_update",
             json!({
                 "resource_id": resource_id,
                 "expected_revision": revision,
@@ -291,7 +291,7 @@ async fn note_updates_address_vault_paths_with_opaque_revisions() {
     // succeeds and the response carries the final provenance.
     let stale_delete = client
         .request(&request(
-            "cortex_note_delete",
+            "cortex_knowledge_delete",
             json!({"resource_id": resource_id, "expected_revision": revision}),
         ))
         .await
@@ -301,7 +301,7 @@ async fn note_updates_address_vault_paths_with_opaque_revisions() {
     let deleted = success_value(
         client
             .request(&request(
-                "cortex_note_delete",
+                "cortex_knowledge_delete",
                 json!({"resource_id": resource_id, "expected_revision": fresh}),
             ))
             .await

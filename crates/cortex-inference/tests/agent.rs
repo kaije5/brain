@@ -186,7 +186,7 @@ fn final_response(content: &str) -> InferenceResponse {
 fn note_call(id: &str, arguments: &str) -> ToolCall {
     ToolCall {
         id: id.to_owned(),
-        name: "cortex_note_create".to_owned(),
+        name: "cortex_knowledge_create".to_owned(),
         arguments: arguments.to_owned(),
     }
 }
@@ -194,7 +194,7 @@ fn note_call(id: &str, arguments: &str) -> ToolCall {
 #[tokio::test]
 async fn malformed_tool_arguments_never_call_the_application_service() {
     let provider = Arc::new(FakeProvider::from_responses(vec![tool_response(vec![
-        note_call("call-1", "{\"title\":42,\"content\":\"x\"}"),
+        note_call("call-1", "{\"title\":42,\"body\":\"x\"}"),
     ])]));
     let service = Arc::new(RecordingService::default());
     let runner = AgentRunner::new(
@@ -204,7 +204,11 @@ async fn malformed_tool_arguments_never_call_the_application_service() {
     );
 
     let outcome = runner
-        .run(context(), "remember x", allowed([Capability::NoteCreate]))
+        .run(
+            context(),
+            "remember x",
+            allowed([Capability::KnowledgeCreate]),
+        )
         .await;
 
     assert!(matches!(
@@ -254,7 +258,7 @@ async fn capability_semantics_are_validated_before_service_invocation() {
 
 #[tokio::test]
 async fn duplicate_tool_call_is_rejected_before_a_second_side_effect() {
-    let valid = "{\"title\":\"Cortex\",\"content\":\"local first\"}";
+    let valid = "{\"title\":\"Cortex\",\"body\":\"local first\"}";
     let provider = Arc::new(FakeProvider::from_responses(vec![tool_response(vec![
         note_call("call-7", valid),
         note_call("call-7", valid),
@@ -270,7 +274,7 @@ async fn duplicate_tool_call_is_rejected_before_a_second_side_effect() {
         .run(
             context(),
             "remember Cortex",
-            allowed([Capability::NoteCreate]),
+            allowed([Capability::KnowledgeCreate]),
         )
         .await;
 
@@ -286,7 +290,7 @@ async fn successful_tool_result_is_returned_to_provider_before_final_text() {
     let provider = Arc::new(FakeProvider::from_responses(vec![
         tool_response(vec![note_call(
             "call-2",
-            "{\"title\":\"Cortex\",\"content\":\"local first\"}",
+            "{\"title\":\"Cortex\",\"body\":\"local first\"}",
         )]),
         final_response("Remembered."),
     ]));
@@ -301,7 +305,7 @@ async fn successful_tool_result_is_returned_to_provider_before_final_text() {
         .run(
             context(),
             "remember Cortex",
-            allowed([Capability::NoteCreate]),
+            allowed([Capability::KnowledgeCreate]),
         )
         .await;
 
@@ -320,7 +324,7 @@ async fn total_agent_timeout_cancels_before_any_late_side_effect() {
     );
 
     let outcome = runner
-        .run(context(), "wait", allowed([Capability::NoteCreate]))
+        .run(context(), "wait", allowed([Capability::KnowledgeCreate]))
         .await;
 
     assert_eq!(outcome, Err(ApplicationError::InferenceTimeout));
@@ -330,10 +334,7 @@ async fn total_agent_timeout_cancels_before_any_late_side_effect() {
 #[tokio::test]
 async fn iteration_limit_stops_an_unfinished_agent_loop() {
     let provider = Arc::new(FakeProvider::from_responses(vec![tool_response(vec![
-        note_call(
-            "call-3",
-            "{\"title\":\"Cortex\",\"content\":\"local first\"}",
-        ),
+        note_call("call-3", "{\"title\":\"Cortex\",\"body\":\"local first\"}"),
     ])]));
     let service = Arc::new(RecordingService::default());
     let runner = AgentRunner::new(
@@ -343,7 +344,7 @@ async fn iteration_limit_stops_an_unfinished_agent_loop() {
     );
 
     let outcome = runner
-        .run(context(), "loop", allowed([Capability::NoteCreate]))
+        .run(context(), "loop", allowed([Capability::KnowledgeCreate]))
         .await;
 
     assert!(matches!(
@@ -367,7 +368,7 @@ async fn model_receives_only_the_authorized_capability_subset() {
         .run(
             context(),
             "show tools",
-            allowed([Capability::NoteSearch, Capability::TaskList]),
+            allowed([Capability::KnowledgeRetrieve, Capability::TaskList]),
         )
         .await;
 
@@ -375,8 +376,9 @@ async fn model_receives_only_the_authorized_capability_subset() {
     let requests = provider.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].tools.len(), 2);
-    assert_eq!(requests[0].tools[0].name, "cortex_note_search");
-    assert_eq!(requests[0].tools[1].name, "cortex_task_list");
+    // Catalog order: task query precedes knowledge retrieval.
+    assert_eq!(requests[0].tools[0].name, "cortex_task_list");
+    assert_eq!(requests[0].tools[1].name, "cortex_knowledge_search");
 }
 
 #[tokio::test]
@@ -399,7 +401,11 @@ async fn canonical_but_unauthorized_tool_is_rejected_before_executor() {
     );
 
     let outcome = runner
-        .run(context(), "delete task", allowed([Capability::NoteSearch]))
+        .run(
+            context(),
+            "delete task",
+            allowed([Capability::KnowledgeRetrieve]),
+        )
         .await;
 
     assert!(matches!(
@@ -415,7 +421,7 @@ async fn oversized_assistant_content_with_tool_call_is_not_retained_or_executed(
         content: Some("x".repeat(129)),
         tool_calls: vec![note_call(
             "call-large-assistant",
-            "{\"title\":\"Cortex\",\"content\":\"bounded\"}",
+            "{\"title\":\"Cortex\",\"body\":\"bounded\"}",
         )],
     }]));
     let service = Arc::new(RecordingService::default());
@@ -426,7 +432,7 @@ async fn oversized_assistant_content_with_tool_call_is_not_retained_or_executed(
     );
 
     let outcome = runner
-        .run(context(), "bounded", allowed([Capability::NoteCreate]))
+        .run(context(), "bounded", allowed([Capability::KnowledgeCreate]))
         .await;
 
     assert!(matches!(
@@ -441,7 +447,7 @@ async fn oversized_tool_result_is_not_added_to_conversation_history() {
     let provider = Arc::new(FakeProvider::from_responses(vec![tool_response(vec![
         note_call(
             "call-large-result",
-            "{\"title\":\"Cortex\",\"content\":\"bounded\"}",
+            "{\"title\":\"Cortex\",\"body\":\"bounded\"}",
         ),
     ])]));
     let service = Arc::new(RecordingService::responding(
@@ -455,7 +461,7 @@ async fn oversized_tool_result_is_not_added_to_conversation_history() {
     );
 
     let outcome = runner
-        .run(context(), "bounded", allowed([Capability::NoteCreate]))
+        .run(context(), "bounded", allowed([Capability::KnowledgeCreate]))
         .await;
 
     assert!(matches!(
@@ -471,11 +477,11 @@ async fn cumulative_history_is_bounded_before_another_inference_request() {
     let provider = Arc::new(FakeProvider::from_responses(vec![
         tool_response(vec![note_call(
             "call-history-1",
-            "{\"title\":\"Cortex\",\"content\":\"one\"}",
+            "{\"title\":\"Cortex\",\"body\":\"one\"}",
         )]),
         tool_response(vec![note_call(
             "call-history-2",
-            "{\"title\":\"Cortex\",\"content\":\"two\"}",
+            "{\"title\":\"Cortex\",\"body\":\"two\"}",
         )]),
         final_response("unreachable"),
     ]));
@@ -493,7 +499,7 @@ async fn cumulative_history_is_bounded_before_another_inference_request() {
         .run(
             context(),
             "bounded history",
-            allowed([Capability::NoteCreate]),
+            allowed([Capability::KnowledgeCreate]),
         )
         .await;
 
@@ -510,7 +516,7 @@ async fn started_tool_execution_is_awaited_even_when_agent_deadline_expires() {
     let provider = Arc::new(FakeProvider::from_responses(vec![
         tool_response(vec![note_call(
             "call-blocking",
-            "{\"title\":\"Cortex\",\"content\":\"durable\"}",
+            "{\"title\":\"Cortex\",\"body\":\"durable\"}",
         )]),
         final_response("too late"),
     ]));
@@ -528,7 +534,7 @@ async fn started_tool_execution_is_awaited_even_when_agent_deadline_expires() {
         .run(
             context(),
             "commit safely",
-            allowed([Capability::NoteCreate]),
+            allowed([Capability::KnowledgeCreate]),
         )
         .await;
 
@@ -540,7 +546,7 @@ async fn started_tool_execution_is_awaited_even_when_agent_deadline_expires() {
 
 #[tokio::test]
 async fn configured_duplicate_occurrence_limit_is_honored() {
-    let valid = "{\"title\":\"Cortex\",\"content\":\"local first\"}";
+    let valid = "{\"title\":\"Cortex\",\"body\":\"local first\"}";
     let provider = Arc::new(FakeProvider::from_responses(vec![tool_response(vec![
         note_call("call-repeat", valid),
         note_call("call-repeat", valid),
@@ -557,7 +563,7 @@ async fn configured_duplicate_occurrence_limit_is_honored() {
         .run(
             context(),
             "repeat safely",
-            allowed([Capability::NoteCreate]),
+            allowed([Capability::KnowledgeCreate]),
         )
         .await;
 
@@ -655,7 +661,11 @@ async fn provider_failure_fails_the_turn_safely_without_side_effects() {
     );
 
     let outcome = runner
-        .run(context(), "remember x", allowed([Capability::NoteCreate]))
+        .run(
+            context(),
+            "remember x",
+            allowed([Capability::KnowledgeCreate]),
+        )
         .await;
 
     assert_eq!(outcome, Err(ApplicationError::InferenceUnavailable));
@@ -671,7 +681,7 @@ async fn streaming_reports_each_assistant_segment_in_order() {
     let provider = FakeProvider::from_responses(vec![
         InferenceResponse {
             content: Some("checking your notes".to_owned()),
-            tool_calls: vec![note_call("call-1", r#"{ "title": "t", "content": "c" }"#)],
+            tool_calls: vec![note_call("call-1", r#"{ "title": "t", "body": "c" }"#)],
         },
         final_response("all done"),
     ]);
@@ -690,7 +700,7 @@ async fn streaming_reports_each_assistant_segment_in_order() {
         .run_streaming(
             context(),
             "stream please",
-            allowed([Capability::NoteCreate]),
+            allowed([Capability::KnowledgeCreate]),
             &on_chunk,
         )
         .await
@@ -735,7 +745,7 @@ async fn system_prompt_prepends_a_byte_stable_system_message_to_every_request() 
     let provider = Arc::new(FakeProvider::from_responses(vec![
         tool_response(vec![note_call(
             "call-sys-1",
-            "{\"title\":\"Cortex\",\"content\":\"local first\"}",
+            "{\"title\":\"Cortex\",\"body\":\"local first\"}",
         )]),
         final_response("done"),
     ]));
@@ -752,7 +762,7 @@ async fn system_prompt_prepends_a_byte_stable_system_message_to_every_request() 
     );
 
     let outcome = runner
-        .run(context(), "greet", allowed([Capability::NoteCreate]))
+        .run(context(), "greet", allowed([Capability::KnowledgeCreate]))
         .await;
 
     assert_eq!(outcome, Ok("done".to_owned()));
@@ -775,11 +785,11 @@ async fn compaction_replaces_old_turns_with_a_summary_and_the_run_still_succeeds
     let provider = Arc::new(FakeProvider::from_responses(vec![
         tool_response(vec![note_call(
             "call-compact-1",
-            "{\"title\":\"Cortex\",\"content\":\"first turn\"}",
+            "{\"title\":\"Cortex\",\"body\":\"first turn\"}",
         )]),
         tool_response(vec![note_call(
             "call-compact-2",
-            "{\"title\":\"Cortex\",\"content\":\"second turn\"}",
+            "{\"title\":\"Cortex\",\"body\":\"second turn\"}",
         )]),
         InferenceResponse {
             content: Some("summary of the earlier turns".to_owned()),
@@ -800,7 +810,11 @@ async fn compaction_replaces_old_turns_with_a_summary_and_the_run_still_succeeds
     .expect("compaction threshold below request limit");
 
     let outcome = runner
-        .run(context(), "compact me", allowed([Capability::NoteCreate]))
+        .run(
+            context(),
+            "compact me",
+            allowed([Capability::KnowledgeCreate]),
+        )
         .await;
 
     assert_eq!(outcome, Ok("completed after compaction".to_owned()));
@@ -838,11 +852,11 @@ async fn compaction_summary_is_never_streamed_to_the_user() {
     let provider = Arc::new(FakeProvider::from_responses(vec![
         tool_response(vec![note_call(
             "call-stream-compact",
-            "{\"title\":\"Cortex\",\"content\":\"first turn\"}",
+            "{\"title\":\"Cortex\",\"body\":\"first turn\"}",
         )]),
         tool_response(vec![note_call(
             "call-stream-compact-2",
-            "{\"title\":\"Cortex\",\"content\":\"second turn\"}",
+            "{\"title\":\"Cortex\",\"body\":\"second turn\"}",
         )]),
         InferenceResponse {
             content: Some("internal summary".to_owned()),
@@ -871,7 +885,7 @@ async fn compaction_summary_is_never_streamed_to_the_user() {
         .run_streaming(
             context(),
             "compact and stream",
-            allowed([Capability::NoteCreate]),
+            allowed([Capability::KnowledgeCreate]),
             &on_chunk,
         )
         .await
@@ -890,7 +904,7 @@ async fn compaction_rejects_unusable_summaries_as_malformed_output() {
     let provider = Arc::new(FakeProvider::from_responses(vec![
         tool_response(vec![note_call(
             "call-bad-summary",
-            "{\"title\":\"Cortex\",\"content\":\"first turn\"}",
+            "{\"title\":\"Cortex\",\"body\":\"first turn\"}",
         )]),
         final_response("   "),
         final_response("unreachable"),
@@ -908,7 +922,11 @@ async fn compaction_rejects_unusable_summaries_as_malformed_output() {
     .expect("compaction threshold below request limit");
 
     let outcome = runner
-        .run(context(), "compact me", allowed([Capability::NoteCreate]))
+        .run(
+            context(),
+            "compact me",
+            allowed([Capability::KnowledgeCreate]),
+        )
         .await;
 
     assert!(matches!(

@@ -176,7 +176,7 @@ pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
         Command::Doctor => ("cortex_daemon_doctor", json!({}), false),
         Command::Logs => ("cortex_daemon_logs", json!({}), false),
         Command::Note(NoteCommand::Create { title, content }) => (
-            "cortex_note_create",
+            "cortex_knowledge_create",
             json!({"title": title, "content": content}),
             true,
         ),
@@ -186,7 +186,7 @@ pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
             title,
             content,
         }) => (
-            "cortex_note_update",
+            "cortex_knowledge_update",
             json!({
                 "resource_id": resource_id,
                 "expected_revision": revision,
@@ -199,11 +199,11 @@ pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
             resource_id,
             revision,
         }) => (
-            "cortex_note_delete",
+            "cortex_knowledge_delete",
             json!({"resource_id": resource_id, "expected_revision": revision}),
             true,
         ),
-        Command::Note(NoteCommand::Search(input)) => search("cortex_note_search", input)?,
+        Command::Note(NoteCommand::Search(input)) => search("cortex_knowledge_search", input)?,
         Command::Task(TaskCommand::Add { title, due }) => (
             "cortex_task_create",
             json!({"title": title, "due_at": due.as_deref().map(normalize_due).transpose()?}),

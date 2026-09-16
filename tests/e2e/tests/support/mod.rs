@@ -337,7 +337,7 @@ base_url = \"{model_base_url}\"
         content: &str,
     ) -> CallResult {
         self.ipc_call(
-            "cortex_note_update",
+            "cortex_knowledge_update",
             json!({
                 "resource_id": resource_id,
                 "expected_revision": revision,
@@ -350,7 +350,7 @@ base_url = \"{model_base_url}\"
 
     pub async fn ipc_note_delete(&self, resource_id: &str, revision: &str) -> CallResult {
         self.ipc_call(
-            "cortex_note_delete",
+            "cortex_knowledge_delete",
             json!({"resource_id": resource_id, "expected_revision": revision}),
         )
         .await

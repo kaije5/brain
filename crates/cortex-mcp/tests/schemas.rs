@@ -12,7 +12,7 @@ fn schema_catalog_exposes_only_the_normalized_v2_tools() {
     let schemas = tool_schemas();
     let names: Vec<_> = schemas.iter().map(|schema| schema.name.as_str()).collect();
     // Normalized knowledge.* and task.* tools replace the legacy
-    // cortex_note_*/cortex_task_* contracts.
+    // knowledge/task contracts.
     for name in [
         "knowledge.create",
         "knowledge.update",
@@ -32,7 +32,7 @@ fn schema_catalog_exposes_only_the_normalized_v2_tools() {
     assert!(!names.contains(&"agent.run"));
     // Legacy SQLite-entity tool names are gone.
     for legacy in [
-        "cortex_note_create",
+        "cortex_knowledge_create",
         "cortex_task_list",
         "cortex_knowledge_search",
     ] {
