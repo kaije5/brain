@@ -16,4 +16,4 @@ pub use local_ops::{
     default_database_path, default_database_path_for, import_secret, init_config,
     validate_profile_id,
 };
-pub use render::{CliEnvelope, render_json, render_text};
+pub use render::{CliEnvelope, error_hint, render_json, render_text};
