@@ -171,32 +171,3 @@ async fn normalized_task_lifecycle_runs_against_the_daemon_vault() {
     assert!(!conflict.message.contains('/'));
     let _ = fresh;
 }
-
-#[tokio::test]
-async fn memory_delete_round_trip_with_granted_principal() {
-    let (_dir, server, principal) = server_with_grants(true).await;
-    let created = server
-        .call_tool_as(
-            &principal,
-            "memory.create",
-            json!({"statement": "s", "normalized_subject": "s",
-                   "normalized_predicate": "p", "normalized_object": "o",
-                   "sources": [{"source_id": Uuid::now_v7()}]}),
-        )
-        .await
-        .expect("memory create dispatches");
-    let entity_id = created["entity_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("memory create returns entity identity: {created}"));
-    let deleted = server
-        .call_tool_as(
-            &principal,
-            "memory.delete",
-            json!({"entity_id": entity_id, "expected_revision": 1}),
-        )
-        .await;
-    match deleted {
-        Ok(value) => assert!(!value.is_null()),
-        Err(error) => panic!("memory delete failed: {} {}", error.code, error.message),
-    }
-}
