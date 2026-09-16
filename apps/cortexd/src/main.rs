@@ -4,21 +4,9 @@ use std::sync::Arc;
 
 use cortexd::{
     DaemonConfig, LocalDaemon, LocalSettings, ModelResolution, PlatformSecretStore, data_directory,
-    default_database_path, resolve_default_model,
+    default_database_path, resolve_default_model_with_lookup,
 };
 use tokio::sync::watch;
-
-/// The default profile's opaque secret locator, when one is configured.
-fn default_profile_secret(settings: Option<&LocalSettings>) -> Option<cortexd::SecretRef> {
-    let settings = settings?;
-    let profile_id = settings.default_profile_id()?;
-    settings
-        .provider_profiles()
-        .ok()?
-        .into_iter()
-        .find(|profile| profile.id().as_str() == profile_id)
-        .and_then(|profile| profile.secret_reference().cloned())
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,16 +40,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let resolve_settings = settings.clone();
     let resolve_daemon = daemon.clone();
     tokio::spawn(async move {
-        let credential = match default_profile_secret(resolve_settings.as_ref()) {
-            Some(reference) => PlatformSecretStore.resolve_value(&reference).ok(),
-            None => None,
-        }
-        .map(|value| value.as_str().to_owned());
-        let bearer = credential.as_deref();
-        match resolve_default_model(
+        match resolve_default_model_with_lookup(
             resolve_settings.as_ref(),
             cortexd::ReqwestOpenAiTransport::default(),
-            bearer,
+            |reference| {
+                PlatformSecretStore
+                    .resolve_value(reference)
+                    .ok()
+                    .map(|value| value.as_str().to_owned())
+            },
         )
         .await
         {
@@ -70,8 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config,
                 models,
                 route,
+                bearer,
             } => {
-                resolve_daemon.install_resolved_model(config, bearer.map(str::to_owned), models);
+                resolve_daemon.install_resolved_model(config, bearer, models);
                 // SCRUM-82: persist the typed {profile_id, model_id} decision
                 // for diagnostics; identifiers only, never secrets.
                 if let Err(error) = resolve_daemon

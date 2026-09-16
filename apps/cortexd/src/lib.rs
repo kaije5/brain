@@ -26,6 +26,7 @@ pub use platform_secret_store::PlatformSecretStore;
 pub use settings::{
     LocalSettings, ModelResolution, SettingsError, data_directory, data_directory_for,
     default_database_path, default_database_path_for, resolve_default_model,
+    resolve_default_model_with_lookup,
 };
 pub use vault::{
     InMemoryVaultProvider, VaultConfigError, VaultExclusion, VaultProviderConfig,

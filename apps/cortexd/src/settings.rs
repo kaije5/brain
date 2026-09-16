@@ -458,6 +458,8 @@ pub enum ModelResolution {
         route: RoutedModel,
         /// Every model id discovered on the profile, for client selection.
         models: Vec<String>,
+        /// Resolved credential for the routed profile only.
+        bearer: Option<String>,
     },
     /// A configured profile could not produce an eligible model. The daemon
     /// starts and reports the degraded state; it never falls back silently.
@@ -501,6 +503,24 @@ pub async fn resolve_default_model<T: OpenAiTransport + Clone>(
     transport: T,
     bearer: Option<&str>,
 ) -> ModelResolution {
+    resolve_default_model_with_lookup(settings, transport, |reference| {
+        let _ = reference;
+        bearer.map(str::to_owned)
+    })
+    .await
+}
+
+/// Resolves model routing with a credential lookup scoped to each profile's
+/// opaque secret reference.
+pub async fn resolve_default_model_with_lookup<T, F>(
+    settings: Option<&LocalSettings>,
+    transport: T,
+    lookup: F,
+) -> ModelResolution
+where
+    T: OpenAiTransport + Clone,
+    F: Fn(&SecretRef) -> Option<String>,
+{
     let Some(settings) = settings else {
         return ModelResolution::Disabled;
     };
@@ -528,7 +548,7 @@ pub async fn resolve_default_model<T: OpenAiTransport + Clone>(
         &profiles,
         default_profile.id(),
         &transport,
-        bearer,
+        &lookup,
     )
     .await;
     let Some(discovered) = discovery else {
@@ -567,6 +587,16 @@ pub async fn resolve_default_model<T: OpenAiTransport + Clone>(
         };
     };
     let routed_secret = routed_profile.secret_reference().cloned();
+    let routed_bearer = match routed_profile.auth_strategy() {
+        AuthStrategy::SecretRef => routed_secret.as_ref().and_then(&lookup),
+        AuthStrategy::None => None,
+    };
+    if routed_profile.auth_strategy() == AuthStrategy::SecretRef && routed_bearer.is_none() {
+        return ModelResolution::Degraded {
+            reason: "routed_profile_credential_unavailable",
+            secret: routed_secret,
+        };
+    }
     let Ok(limits) = ProviderLimits::new(
         MODEL_RESPONSE_BYTES,
         MODEL_EMBEDDING_INPUT_BYTES,
@@ -591,6 +621,7 @@ pub async fn resolve_default_model<T: OpenAiTransport + Clone>(
             config,
             route,
             models,
+            bearer: routed_bearer,
         },
         Err(_) => ModelResolution::Degraded {
             reason: "invalid_model_config",
@@ -610,7 +641,7 @@ async fn discover_enabled_profiles<T: OpenAiTransport + Clone>(
     profiles: &[ProviderProfile],
     default_profile_id: &ProviderProfileId,
     transport: &T,
-    bearer: Option<&str>,
+    lookup: &impl Fn(&SecretRef) -> Option<String>,
 ) -> Option<Vec<DiscoveredModel>> {
     let mut discovered = Vec::new();
     for profile in profiles.iter().filter(|profile| profile.enabled()) {
@@ -628,11 +659,15 @@ async fn discover_enabled_profiles<T: OpenAiTransport + Clone>(
         // Credentials cross the transport boundary only for profiles whose
         // typed auth strategy references secret material.
         let profile_bearer = match profile.auth_strategy() {
-            AuthStrategy::SecretRef => bearer,
+            AuthStrategy::SecretRef => match profile.secret_reference().and_then(lookup) {
+                Some(bearer) => Some(bearer),
+                None if profile.id() == default_profile_id => return None,
+                None => continue,
+            },
             AuthStrategy::None => None,
         };
         match OpenAiModelDiscovery::new(discovery_config, transport.clone())
-            .refresh(profile_bearer)
+            .refresh(profile_bearer.as_deref())
             .await
         {
             Ok(catalog) => discovered.extend(

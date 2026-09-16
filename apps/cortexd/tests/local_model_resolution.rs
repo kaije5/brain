@@ -73,8 +73,12 @@ impl cortex_inference::OpenAiTransport for FakeOpenAiTransport {
 #[tokio::test]
 async fn default_profile_resolves_through_the_runtime_router() {
     let settings = settings_from(VALID_SETTINGS);
-    let resolution =
-        resolve_default_model(Some(&settings), FakeOpenAiTransport::default(), None).await;
+    let resolution = resolve_default_model(
+        Some(&settings),
+        FakeOpenAiTransport::default(),
+        Some("local-test-token"),
+    )
+    .await;
     match resolution {
         ModelResolution::Configured { config, route, .. } => {
             assert_eq!(route.profile_id.as_str(), "local");
