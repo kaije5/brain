@@ -4,7 +4,7 @@
 
 **Goal:** Replace the NIM-specific inference path with a general OpenAI-compatible connector that supports explicit model candidates or API listing, capability probes, and secure model routing.
 
-**Architecture:** A validated API base and one JSON transport serve model listing, probes, and the existing Chat Completions inference adapter. Each profile chooses `list` or `configured` candidates explicitly. The daemon resolves credentials per profile and carries the selected route's credential into inference.
+**Architecture:** A validated API base and one JSON transport serve dynamic model listing, probes, and the existing Chat Completions inference adapter. Every enabled profile lists its available models, then capability-probes those dynamic results. The daemon resolves credentials per profile and carries the selected route's credential into inference.
 
 **Tech Stack:** Rust, Tokio, Reqwest, Serde JSON, Cargo nextest.
 
@@ -14,7 +14,7 @@
 
 - `api_mode = "openai_completions"` is the only supported wire mode; unknown modes are rejected.
 - Use the supplied API base path exactly: join `models`, `chat/completions`, and `embeddings`; never invent `/v1`.
-- Default `model_source` to `list`; configured candidates require a nonempty `models` array and never trigger GET.
+- Every enabled profile dynamically lists `GET {api_base}/models`; model IDs and capabilities are never supplied as a static replacement for discovery.
 - Preserve HTTPS for remote endpoints, loopback HTTP, bounded responses, no proxy, no redirects, redacted errors, and explicit degradation.
 - Never send one profile's secret to another profile's endpoint.
 - Require observed tool calls and strict-schema output for their respective capability evidence; HTTP success alone is insufficient.
@@ -65,14 +65,13 @@ Do not change knowledge/task provider contracts or vault code. Assign a Jira sto
 
 **Files:** Create `crates/cortex-inference/src/discovery.rs` and `crates/cortex-inference/tests/discovery.rs`; modify `crates/cortex-inference/src/lib.rs`; remove `crates/cortex-inference/src/nim.rs` and `crates/cortex-inference/tests/nim.rs` after caller migration.
 
-**Interface:** `OpenAiCompatibleDiscovery<T: OpenAiTransport>` accepts a validated API base, timeout, typed quirks, and `ModelCandidates` (`List { allowlist }` or `Configured(Vec<ModelId>)`). `refresh(bearer: Option<&str>) -> Result<ModelCatalog, ApplicationError>` returns normalized evidence and never silently changes candidate source.
+**Interface:** `OpenAiCompatibleDiscovery<T: OpenAiTransport>` accepts a validated API base, timeout, and typed quirks. `refresh(bearer: Option<&str>) -> Result<ModelCatalog, ApplicationError>` dynamically lists and capability-probes normalized API results.
 
-- [ ] **Step 1: Write failing candidate tests.** In list mode parse bounded `data[*].id`, reject malformed or oversized responses, and apply the configured allowlist before probing. In configured mode probe only declared IDs and assert zero GET requests. Assert a failed list GET does not use configured IDs.
+- [ ] **Step 1: Write failing candidate tests.** Parse bounded `data[*].id`, reject malformed or oversized responses, and probe only dynamically listed model IDs. A failed list GET must leave the profile degraded; it must not fabricate candidates.
 
   ```rust
-  assert_eq!(list_fake.get_count(), 1);
-  assert_eq!(configured_fake.get_count(), 0);
-  assert_eq!(configured_fake.probed_models(), ["model-a"]);
+  assert_eq!(fake.get_count(), 1);
+  assert_eq!(fake.probed_models(), ["model-a"]);
   ```
 
 - [ ] **Step 2: Write failing evidence tests.** A 200 with `{}`, wrong tool name, malformed arguments, schema mismatch, `finish_reason = "length"` or `content_filter`, and a 202 pending response grant no capability. A complete `cortex_probe` call grants `ToolCalling`; a separate no-tools strict `json_schema` response matching the schema grants `StructuredOutput`. Check request payload and response budgets, 128-model cap, probe concurrency 8, and at most 128 output tokens.
@@ -99,9 +98,9 @@ Do not change knowledge/task provider contracts or vault code. Assign a Jira sto
 
 **Files:** Modify `apps/cortexd/src/settings.rs`, `apps/cortexd/src/main.rs`, `apps/cortexd/src/lib.rs`, `apps/cortexd/tests/local_settings.rs`, and `apps/cortexd/tests/local_model_resolution.rs`. Inspect `apps/cortexd/src/platform_secret_store.rs` for the existing zeroizing secret reader.
 
-**Interface:** Parse `model_source = "list" | "configured"` and `probe_token_limit_field = "max_tokens" | "max_completion_tokens"`. Replace `resolve_default_model(..., bearer: Option<&str>)` with an injected per-`SecretRef` lookup. `ModelResolution::Configured` carries a redacted, zeroizing bearer for the routed profile alongside its config and route.
+**Interface:** Parse `probe_token_limit_field = "max_tokens" | "max_completion_tokens"`. Replace `resolve_default_model(..., bearer: Option<&str>)` with an injected per-`SecretRef` lookup. `ModelResolution::Configured` carries a redacted, zeroizing bearer for the routed profile alongside its config and route.
 
-- [ ] **Step 1: Write failing settings tests.** Existing files default to list mode. Configured mode without `models` is invalid; unknown source and token field are invalid. Explicit API bases retain their path. Existing `models` remains a list-mode allowlist.
+- [ ] **Step 1: Write failing settings tests.** Every enabled profile uses dynamic listing. Unknown token fields are invalid and explicit API bases retain their path. Static configured model-ID sources are rejected.
 - [ ] **Step 2: Write failing two-profile tests.** Distinct authenticated endpoints receive only their own credentials for GET and probes; the second profile's selected route installs only its credential. Missing credentials cause zero requests to that profile. Keep a keyless loopback test.
 
   ```rust
@@ -126,9 +125,9 @@ Do not change knowledge/task provider contracts or vault code. Assign a Jira sto
 
 **Files:** Modify `apps/brain/src/tui/mod.rs`, `apps/brain/src/tui/view.rs`, `apps/brain/src/tui/runner.rs`, `apps/brain/tests/settings_editor.rs`, `docs/operations/local-setup.md`, and `docs/adr/ADR-022-nvidia-nim-first-provider.md`.
 
-- [ ] **Step 1: Write failing setup tests.** A user can enter any OpenAI-compatible API base, choose list or configured candidates, and enter model IDs when configured. A hosted API preset only pre-fills URL and ordinary profile fields; it invokes no vendor-specific runtime code and does not promise that a key alone discovers models.
+- [ ] **Step 1: Write failing setup tests.** A user can enter any OpenAI-compatible API base and see that the application dynamically lists and probes its models. A hosted API preset only pre-fills URL and ordinary profile fields; it invokes no vendor-specific runtime code and does not promise that a key alone discovers models.
 - [ ] **Step 2: Run `cargo nextest run -p brain --test settings_editor`; verify failures.**
-- [ ] **Step 3: Update settings UI and current setup docs.** Explain API base URLs, the two candidate sources, capability probing, typed token field, and the need for a model ID when listing is unavailable. Add a superseding note to ADR-022 without rewriting historical text.
+- [ ] **Step 3: Update settings UI and current setup docs.** Explain API base URLs, dynamic model discovery, capability probing, and the typed token field. Add a superseding note to ADR-022 without rewriting historical text.
 - [ ] **Step 4: Search production source for `NimConfig|NimDiscovery|NimTransport|ReqwestNimTransport`; require zero matches.** Retain a brand name only for an optional endpoint preset and historical docs.
 - [ ] **Step 5: Run `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked`, and `cargo nextest run --workspace`. Fix actual failures, commit, then report the exact Git and CI state before a PR.**
 - [ ] **Step 6: Before rollout to a hosted endpoint, verify the chosen model passes both probes using that profile's documented parameters.** If it lacks strict-schema output, report explicit degradation and seek a separate routing-policy decision; do not mark JSON mode as schema support.
