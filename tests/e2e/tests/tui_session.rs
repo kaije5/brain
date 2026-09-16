@@ -64,7 +64,8 @@ async fn tui_renders_real_daemon_state_and_degrades_without_a_model() {
 
     let mut app = App::new();
     if let cortexd::WireResult::Success { value } = listed.result {
-        let rows = value
+        // v2 lists are freshness-tagged envelopes of typed task rows.
+        let rows = value["tasks"]
             .as_array()
             .expect("task list array")
             .iter()
@@ -80,7 +81,7 @@ async fn tui_renders_real_daemon_state_and_degrades_without_a_model() {
     app.select_tab(Tab::Tasks);
     let screen = render_app(&app);
     assert!(
-        screen.contains("Drive the TUI end to end"),
+        screen.to_lowercase().contains("drive-the-tui-end-to-end"),
         "tasks tab must render canonical daemon state, got:\n{screen}"
     );
 

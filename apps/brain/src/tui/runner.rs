@@ -245,13 +245,15 @@ fn request_tasks(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
         )
         .await;
         let rows = result.map(|values| {
+            // v2 lists are freshness-tagged envelopes of typed task rows.
             values
                 .iter()
-                .filter_map(|value| {
+                .filter_map(|value| value.get("tasks")?.as_array())
+                .flatten()
+                .filter_map(|task| {
                     Some((
-                        value.get("title")?.as_str()?.to_owned(),
-                        value
-                            .get("status")
+                        task.get("title")?.as_str()?.to_owned(),
+                        task.get("status")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("unknown")
                             .to_owned(),

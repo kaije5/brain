@@ -58,6 +58,11 @@ impl SqliteDatabase {
     }
 
     #[must_use]
+    pub fn provider_operation_store(&self) -> crate::ProviderOperationStore {
+        crate::ProviderOperationStore::new(self.pool.clone())
+    }
+
+    #[must_use]
     pub fn model_routing_store(&self) -> SqliteModelRoutingStore {
         SqliteModelRoutingStore::new(self.pool.clone())
     }
@@ -114,6 +119,7 @@ mod tests {
             "search_document_fts",
             "embedding",
             "operation",
+            "provider_operation",
             "audit_event",
             "remote_enrollment",
         ];

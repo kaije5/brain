@@ -64,13 +64,15 @@ impl DaemonConfig {
     /// Creates deterministic test-only local configuration with fresh ownership IDs.
     #[must_use]
     pub fn for_test(directory: &Path) -> Self {
-        Self::with_fresh_pairing(
+        let mut config = Self::with_fresh_pairing(
             directory.join("cortex.db"),
             format!("cortexd-test-{}", uuid::Uuid::now_v7()),
             WorkspaceId::new(),
             PrincipalId::new(),
             directory.join("cortexd-discovery.json"),
-        )
+        );
+        config.vault = default_vault_config(&config.database_path);
+        config
     }
 
     fn with_fresh_pairing(
@@ -152,6 +154,7 @@ impl DaemonConfig {
         }
         let discovery_path = database_path.with_extension("cortexd-discovery.json");
         let pairing_key_path = pairing_key_path(&discovery_path);
+        let default_root = database_path.clone();
         if discovery_path.exists() {
             let bytes =
                 fs::read(&discovery_path).map_err(|_| crate::DaemonError::InvalidConfiguration)?;
@@ -180,7 +183,7 @@ impl DaemonConfig {
                 discovery_path,
                 bootstrap_grants: CapabilityCatalog::all().to_vec(),
                 remote_clients,
-                vault,
+                vault: vault.or_else(|| default_vault_config(default_root.as_path())),
             });
         }
         let mut config = Self::with_fresh_pairing(
@@ -193,7 +196,7 @@ impl DaemonConfig {
             PrincipalId::new(),
             discovery_path,
         );
-        config.vault = vault;
+        config.vault = vault.or_else(|| default_vault_config(&config.database_path));
         config.write_pairing_key()?;
         config.write_discovery()?;
         Ok(config)
@@ -432,6 +435,25 @@ impl DaemonConfig {
     fn write_pairing_key(&self) -> Result<(), crate::DaemonError> {
         write_private_bytes(&self.pairing_key_path, &self.pairing_signer.to_bytes())
     }
+}
+
+/// The default local vault root beside the daemon database, used when no
+/// settings configure one. The initial desktop deployment may use any safe
+/// local vault path (storage plan §4).
+fn default_vault_config(database_path: &Path) -> Option<VaultProviderConfig> {
+    let root = database_path.parent()?.join("vault");
+    fs::create_dir_all(&root).ok()?;
+    let mut scopes = std::collections::BTreeSet::new();
+    scopes.insert(crate::vault::VaultScope::new("knowledge").ok()?);
+    scopes.insert(crate::vault::VaultScope::new("task").ok()?);
+    VaultProviderConfig::new(
+        "markdown-vault",
+        root,
+        crate::vault::VaultProviderMode::ReadWrite,
+        scopes,
+        std::collections::BTreeSet::new(),
+    )
+    .ok()
 }
 
 fn environment_value(name: &str) -> Result<Option<String>, crate::DaemonError> {
