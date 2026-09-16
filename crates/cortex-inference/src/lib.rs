@@ -27,4 +27,4 @@ pub use routing::{
     ProfileTimeouts, ProviderProfile, ProviderProfileId, ProviderQuirks, RoleRoutingPolicy,
     RoutedModel,
 };
-pub use system_prompt::SystemPrompt;
+pub use system_prompt::{PromptLayers, SystemPrompt};

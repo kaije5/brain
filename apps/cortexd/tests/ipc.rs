@@ -816,3 +816,48 @@ async fn daemon_status_reports_the_configured_vault_identity() {
     assert_eq!(value["vault"]["configured"], true);
     assert_eq!(value["vault"]["provider_id"], "markdown-vault");
 }
+
+#[tokio::test]
+async fn layered_stable_prompt_composes_protected_global_and_profile_layers() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let mut profiles = std::collections::BTreeMap::new();
+    profiles.insert(
+        "nim".to_owned(),
+        "Prefer concise technical answers.".to_owned(),
+    );
+    let config =
+        DaemonConfig::for_test(directory.path()).with_prompt_config(cortexd::PromptConfig {
+            global_inline: Some("Always answer in the user's language.".to_owned()),
+            global_file: None,
+            profiles,
+        });
+    let daemon = LocalDaemon::start(config).await.expect("daemon starts");
+
+    // Deterministic order: protected, then global, then profile. The
+    // protected Cortex layer is always first and never absent.
+    let composed = daemon.composed_stable_prompt(Some("nim"));
+    assert!(composed.starts_with("You are Cortex, a local-first personal knowledge agent."));
+    assert!(composed.contains("Always answer in the user's language."));
+    assert!(composed.contains("Prefer concise technical answers."));
+    assert!(
+        composed.find("You are Cortex").expect("protected first")
+            < composed.find("Always answer").expect("global second")
+    );
+
+    // An unknown profile composes protected + global only.
+    let without_profile = daemon.composed_stable_prompt(Some("other"));
+    assert!(!without_profile.contains("Prefer concise"));
+
+    // No profile composes protected + global only.
+    assert_eq!(
+        daemon.composed_stable_prompt(None),
+        daemon.composed_stable_prompt(Some("other"))
+    );
+
+    // Composition is pure: repeated calls are byte-identical (SCRUM-79
+    // stable-prefix behavior).
+    assert_eq!(
+        daemon.composed_stable_prompt(Some("nim")),
+        daemon.composed_stable_prompt(Some("nim"))
+    );
+}

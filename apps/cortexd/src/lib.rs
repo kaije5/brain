@@ -14,7 +14,7 @@ mod vault_watcher;
 mod windows_security;
 
 pub use client::AuthenticatedIpcClient;
-pub use config::{DaemonConfig, InferenceBearer};
+pub use config::{DaemonConfig, InferenceBearer, PromptConfig};
 pub use cortex_application::SecretRef;
 pub use cortex_inference::ReqwestOpenAiTransport;
 pub use governed::GovernedVaultProvider;
@@ -24,8 +24,8 @@ pub use ipc::{
 };
 pub use platform_secret_store::PlatformSecretStore;
 pub use settings::{
-    LocalSettings, ModelResolution, SettingsError, data_directory, data_directory_for,
-    default_database_path, default_database_path_for, resolve_default_model,
+    BrainPromptSource, LocalSettings, ModelResolution, SettingsError, data_directory,
+    data_directory_for, default_database_path, default_database_path_for, resolve_default_model,
     resolve_default_model_with_lookup,
 };
 pub use vault::{

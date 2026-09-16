@@ -59,7 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 route,
                 bearer,
             } => {
-                resolve_daemon.install_resolved_model(config, bearer, models);
+                resolve_daemon.install_resolved_model(
+                    config,
+                    bearer,
+                    models,
+                    route.profile_id.as_str(),
+                );
                 // SCRUM-82: persist the typed {profile_id, model_id} decision
                 // for diagnostics; identifiers only, never secrets.
                 if let Err(error) = resolve_daemon
