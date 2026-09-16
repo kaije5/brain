@@ -130,6 +130,11 @@ impl FakeTaskProvider {
     pub fn set_fail_reads(&self, fail: bool) {
         *self.fail_reads.lock().expect("fail mutex") = fail;
     }
+
+    #[must_use]
+    pub fn task_count(&self) -> usize {
+        self.tasks.lock().expect("tasks mutex").len()
+    }
 }
 
 impl TaskProvider for FakeTaskProvider {

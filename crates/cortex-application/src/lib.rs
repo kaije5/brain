@@ -8,6 +8,7 @@ mod knowledge;
 mod planning;
 mod provider;
 mod query;
+mod review;
 mod search;
 mod secrets;
 mod service;
@@ -44,6 +45,7 @@ pub use query::{
     OperationIdentity, OperationResultRepository, RecordedOperation, SourceRepository,
     TaskRepository,
 };
+pub use review::{ReviewRunKind, ReviewRunLog, ReviewRunRecord, ReviewService};
 pub use search::{
     Embedding, EmbeddingProvider, EntityKind, IndexedVector, SearchCandidate, SearchIndex,
 };

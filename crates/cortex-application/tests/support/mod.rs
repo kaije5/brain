@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod knowledge_provider;
 pub mod task_provider;
 
 use std::{
