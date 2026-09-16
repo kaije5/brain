@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -58,6 +59,58 @@ pub struct DaemonConfig {
     pub(crate) bootstrap_grants: Vec<Capability>,
     pub(crate) remote_clients: Vec<RemoteClientConfig>,
     pub(crate) vault: Option<VaultProviderConfig>,
+    pub(crate) prompt: PromptConfig,
+}
+
+/// Operator-configured Brain prompt layers (SCRUM-147): a persistent global
+/// instruction (inline value or file reference, resolved at composition)
+/// plus optional per-profile instructions. Cortex's protected instructions
+/// are not configurable and live at the composition site.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PromptConfig {
+    /// Inline global Brain instructions; mutually exclusive with
+    /// `global_file`.
+    pub global_inline: Option<String>,
+    /// File reference for global Brain instructions, read once at
+    /// composition.
+    pub global_file: Option<PathBuf>,
+    /// Optional per-profile Brain instructions keyed by profile id.
+    pub profiles: BTreeMap<String, String>,
+}
+
+impl PromptConfig {
+    /// Resolves the configured prompt layers into concrete values, reading a
+    /// declared prompt file exactly once. Composition afterwards is pure, so
+    /// an unchanged configuration renders a byte-identical Stable prefix and
+    /// file edits take effect only at the next daemon start.
+    ///
+    /// # Errors
+    /// Returns a redacted configuration error when a declared prompt file is
+    /// missing, unreadable, or invalid.
+    pub fn resolve(self) -> Result<ResolvedPromptConfig, crate::DaemonError> {
+        let global = match (self.global_inline, self.global_file) {
+            (Some(inline), None) => Some(inline),
+            (None, Some(file)) => Some(
+                std::fs::read_to_string(&file)
+                    .map_err(|_| crate::DaemonError::InvalidConfiguration)?,
+            ),
+            (None, None) => None,
+            (Some(_), Some(_)) => return Err(crate::DaemonError::InvalidConfiguration),
+        };
+        Ok(ResolvedPromptConfig {
+            global,
+            profiles: self.profiles,
+        })
+    }
+}
+
+/// Resolved, immutable prompt configuration for one daemon process lifetime.
+/// Configuration changes apply at the next daemon start (SCRUM-147 refresh
+/// semantics) and never mutate in-flight requests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ResolvedPromptConfig {
+    pub(crate) global: Option<String>,
+    pub(crate) profiles: BTreeMap<String, String>,
 }
 
 impl DaemonConfig {
@@ -98,6 +151,7 @@ impl DaemonConfig {
             bootstrap_grants: CapabilityCatalog::all().to_vec(),
             remote_clients: Vec::new(),
             vault: None,
+            prompt: PromptConfig::default(),
         }
     }
 
@@ -119,6 +173,11 @@ impl DaemonConfig {
         database_path: PathBuf,
         settings: Option<&crate::settings::LocalSettings>,
     ) -> Result<Self, crate::DaemonError> {
+        let prompt = settings
+            .map(crate::settings::LocalSettings::prompt_config)
+            .transpose()
+            .map_err(|_| crate::DaemonError::InvalidConfiguration)?
+            .unwrap_or_default();
         let vault = match settings.map(crate::settings::LocalSettings::vault_config) {
             None => None,
             Some(Ok(vault)) => vault,
@@ -135,6 +194,7 @@ impl DaemonConfig {
             database_path,
             settings.and_then(crate::settings::LocalSettings::endpoint_override),
             vault,
+            prompt,
         )
     }
 
@@ -142,6 +202,7 @@ impl DaemonConfig {
         database_path: PathBuf,
         endpoint_override: Option<&str>,
         vault: Option<VaultProviderConfig>,
+        prompt: PromptConfig,
     ) -> Result<Self, crate::DaemonError> {
         if database_path.as_os_str().is_empty() {
             return Err(crate::DaemonError::InvalidConfiguration);
@@ -184,6 +245,7 @@ impl DaemonConfig {
                 bootstrap_grants: CapabilityCatalog::all().to_vec(),
                 remote_clients,
                 vault: vault.or_else(|| default_vault_config(default_root.as_path())),
+                prompt,
             });
         }
         let mut config = Self::with_fresh_pairing(
@@ -197,6 +259,7 @@ impl DaemonConfig {
             discovery_path,
         );
         config.vault = vault.or_else(|| default_vault_config(&config.database_path));
+        config.prompt = prompt;
         config.write_pairing_key()?;
         config.write_discovery()?;
         Ok(config)
@@ -286,6 +349,13 @@ impl DaemonConfig {
             .map_err(|_| crate::DaemonError::InvalidConfiguration)?;
         self.vault = Some(config);
         Ok(self)
+    }
+
+    /// Attaches the operator's prompt configuration (SCRUM-147).
+    #[must_use]
+    pub fn with_prompt_config(mut self, prompt: PromptConfig) -> Self {
+        self.prompt = prompt;
+        self
     }
 
     /// Returns the configured vault provider configuration, when present.

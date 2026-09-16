@@ -119,3 +119,13 @@ fn schemas_publish_wire_types_formats_bounds_and_closed_objects() {
         "uuid"
     );
 }
+
+#[test]
+fn memory_delete_arguments_decode() {
+    let decoded = cortex_mcp::decode_arguments(
+        "memory.delete",
+        serde_json::json!({"entity_id": uuid::Uuid::now_v7(), "expected_revision": 1}),
+    )
+    .expect("memory.delete decodes");
+    assert!(decoded["entity_id"].is_string());
+}

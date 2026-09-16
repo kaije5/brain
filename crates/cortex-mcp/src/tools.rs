@@ -345,6 +345,14 @@ struct MemoryEntity {
     expected_revision: NonZeroU64,
 }
 
+/// Decodes and validates one tool call's arguments for a normalized tool.
+///
+/// Unknown tool names and payloads that violate the tool schema (unknown
+/// fields, missing or oversized values) are rejected as invalid input.
+///
+/// # Errors
+/// Returns a redacted invalid-input error for unknown tools or invalid
+/// arguments.
 pub fn decode_arguments(name: &str, value: Value) -> Result<Value, McpError> {
     normalized(name).ok_or_else(McpError::invalid_input)?;
     match name {
