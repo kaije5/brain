@@ -80,6 +80,16 @@ pub enum AuthStrategy {
     SecretRef,
 }
 
+/// Explicit source for the profile's model candidates.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ModelSource {
+    /// Query the profile's OpenAI-compatible `GET /models` endpoint.
+    #[default]
+    List,
+    /// Probe only the operator-configured model identifiers.
+    Configured,
+}
+
 /// Bounded, per-profile timeouts. Every variant must be non-zero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProfileTimeouts {
@@ -170,6 +180,7 @@ pub struct ProviderProfile {
     auth: AuthStrategy,
     timeouts: ProfileTimeouts,
     quirks: ProviderQuirks,
+    model_source: ModelSource,
     declared_models: Vec<ModelId>,
 }
 
@@ -185,6 +196,7 @@ impl ProviderProfile {
             auth: AuthStrategy::default(),
             timeouts: ProfileTimeouts::default(),
             quirks: ProviderQuirks::default(),
+            model_source: ModelSource::default(),
             declared_models: Vec::new(),
         })
     }
@@ -216,6 +228,12 @@ impl ProviderProfile {
     #[must_use]
     pub const fn with_quirks(mut self, quirks: ProviderQuirks) -> Self {
         self.quirks = quirks;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_model_source(mut self, model_source: ModelSource) -> Self {
+        self.model_source = model_source;
         self
     }
 
@@ -258,6 +276,11 @@ impl ProviderProfile {
     #[must_use]
     pub const fn quirks(&self) -> ProviderQuirks {
         self.quirks
+    }
+
+    #[must_use]
+    pub const fn model_source(&self) -> ModelSource {
+        self.model_source
     }
 
     /// Models the operator declared as supported by this profile; empty means

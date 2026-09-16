@@ -3,10 +3,10 @@ use std::{collections::BTreeMap, fs, path::Path, time::Duration};
 use chrono::Utc;
 use cortex_application::{ApplicationError, SecretRef};
 use cortex_inference::{
-    ApiMode, AuthStrategy, DiscoveredModel, ModelCatalog, ModelId, ModelRouter,
-    OpenAiCompatibleConfig, OpenAiDiscoveryConfig, OpenAiModelDiscovery, OpenAiTransport,
-    ProfileTimeouts, ProviderLimits, ProviderProfile, ProviderProfileId, ProviderQuirks,
-    RoleRoutingPolicy, RoutedModel,
+    ApiMode, AuthStrategy, DiscoveredModel, ModelCandidates, ModelCatalog, ModelId, ModelRouter,
+    ModelSource, OpenAiCompatibleConfig, OpenAiDiscoveryConfig, OpenAiModelDiscovery,
+    OpenAiTransport, ProfileTimeouts, ProviderLimits, ProviderProfile, ProviderProfileId,
+    ProviderQuirks, RoleRoutingPolicy, RoutedModel,
 };
 use serde::Deserialize;
 
@@ -104,6 +104,14 @@ enum ConfigAuthType {
     SecretRef,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum ConfigModelSource {
+    #[default]
+    List,
+    Configured,
+}
+
 /// Typed, narrow OpenAI-compatibility quirks; no free-form escape hatch.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +139,8 @@ struct ModelProfileEntry {
     stale_stream_timeout_ms: Option<u64>,
     #[serde(default)]
     models: Vec<String>,
+    #[serde(default)]
+    model_source: ConfigModelSource,
     #[serde(default)]
     quirks: ConfigQuirks,
 }
@@ -314,6 +324,15 @@ impl LocalSettings {
                 .iter()
                 .map(|model| ModelId::new(model).map_err(SettingsError::from))
                 .collect::<Result<Vec<_>, _>>()?;
+            let model_source = match entry.model_source {
+                ConfigModelSource::List => ModelSource::List,
+                ConfigModelSource::Configured if declared_models.is_empty() => {
+                    return Err(SettingsError::Invalid {
+                        field: "configured_models",
+                    });
+                }
+                ConfigModelSource::Configured => ModelSource::Configured,
+            };
             let quirks =
                 ProviderQuirks::default().with_omit_tool_choice(entry.quirks.omit_tool_choice);
             profiles.push(
@@ -325,6 +344,7 @@ impl LocalSettings {
                     .with_auth_strategy(auth)
                     .with_timeouts(timeouts)
                     .with_quirks(quirks)
+                    .with_model_source(model_source)
                     .with_declared_models(declared_models),
             );
         }
@@ -615,11 +635,24 @@ async fn discover_enabled_profiles<T: OpenAiTransport + Clone>(
     let mut discovered = Vec::new();
     for profile in profiles.iter().filter(|profile| profile.enabled()) {
         let base_url = settings.endpoint_for(profile.id().as_str())?;
+        let candidates = match profile.model_source() {
+            ModelSource::List => ModelCandidates::List {
+                allowlist: profile.declared_models().to_vec(),
+            },
+            ModelSource::Configured => {
+                match ModelCandidates::configured(profile.declared_models().to_vec()) {
+                    Ok(candidates) => candidates,
+                    Err(_) if profile.id() == default_profile_id => return None,
+                    Err(_) => continue,
+                }
+            }
+        };
         let Ok(discovery_config) = OpenAiDiscoveryConfig::new(
             base_url,
             profile.secret_reference().cloned(),
             profile.timeouts().request(),
-        ) else {
+        )
+        .map(|config| config.with_candidates(candidates)) else {
             if profile.id() == default_profile_id {
                 return None;
             }
