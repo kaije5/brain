@@ -59,13 +59,14 @@ async fn stale_delete_is_rejected_and_leaves_newer_memory_active() -> Result<(),
             entity: "memory"
         })
     ));
-    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, memory.entity_id)
-        .await
-        .map_err(debug_error)?
-        .ok_or("newer memory missing")?;
-    assert_eq!(persisted.revision(), updated.revision);
-    assert_eq!(persisted.lifecycle(), Lifecycle::Active);
-    assert_eq!(persisted.statement(), "Updated");
+    let successor =
+        MemoryRepository::find_history(&fixture.state, fixture.workspace_id, updated.entity_id)
+            .await
+            .map_err(debug_error)?
+            .ok_or("newer memory missing")?;
+    assert_eq!(successor.revision(), updated.revision);
+    assert_eq!(successor.lifecycle(), Lifecycle::Active);
+    assert_eq!(successor.statement(), "Updated");
     Ok(())
 }
 
@@ -104,11 +105,13 @@ async fn repeated_operation_is_returned_before_revision_validation() -> Result<(
         .map_err(debug_error)?;
 
     assert_eq!(replay, first);
-    let persisted = MemoryRepository::find_history(&fixture.state, fixture.workspace_id, memory.entity_id)
-        .await
-        .map_err(debug_error)?
-        .ok_or("memory missing")?;
-    assert_eq!(persisted.statement(), "Updated");
+    // A correction supersedes: the successor carries the corrected statement.
+    let successor =
+        MemoryRepository::find_history(&fixture.state, fixture.workspace_id, first.entity_id)
+            .await
+            .map_err(debug_error)?
+            .ok_or("successor memory missing")?;
+    assert_eq!(successor.statement(), "Updated");
     Ok(())
 }
 
