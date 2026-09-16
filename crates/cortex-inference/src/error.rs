@@ -105,6 +105,13 @@ impl ProviderError {
         self.retry_after
     }
 
+    /// Returns the error with a `Retry-After` floor attached.
+    #[must_use]
+    pub fn with_retry_after(mut self, delay: Duration) -> Self {
+        self.retry_after = Some(delay);
+        self
+    }
+
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message

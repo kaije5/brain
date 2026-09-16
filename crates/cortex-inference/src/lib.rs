@@ -5,6 +5,7 @@ mod error;
 mod openai_compatible;
 mod openai_discovery;
 mod provider;
+mod retry;
 mod routing;
 mod system_prompt;
 
@@ -21,6 +22,10 @@ pub use openai_discovery::{OpenAiDiscoveryConfig, OpenAiModelDiscovery};
 pub use provider::{
     InferenceMessage, InferenceProvider, InferenceRequest, InferenceResponse, InferenceTool,
     ToolCall,
+};
+pub use retry::{
+    AttemptFailure, RetryAttempt, RetryClock, RetryJitter, RetryPolicy, RetryReport, RetrySleep,
+    decorrelated_jitter_ms, run_with_default_policy, run_with_retries,
 };
 pub use routing::{
     ApiMode, AuthStrategy, DiscoveredModel, ModelCapability, ModelCatalog, ModelId, ModelRouter,
