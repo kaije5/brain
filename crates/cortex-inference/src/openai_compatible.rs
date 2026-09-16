@@ -6,10 +6,8 @@ use serde_json::{Value, json};
 
 use crate::{
     InferenceMessage, InferenceProvider, InferenceRequest, InferenceResponse, ToolCall,
-    error::{
-        ProviderError, classify_http_response, classify_network_error, map_provider_error,
-        read_bounded_body,
-    },
+    error::{ProviderError, classify_http_response, classify_network_error, read_bounded_body},
+    retry::{AttemptFailure, RetryPolicy, RetryReport, run_with_default_policy},
     routing::ProviderQuirks,
 };
 
@@ -358,6 +356,7 @@ pub struct OpenAiCompatibleProvider<T = ReqwestOpenAiTransport> {
     config: OpenAiCompatibleConfig,
     bearer: Option<String>,
     transport: T,
+    retry_policy: RetryPolicy,
 }
 
 impl OpenAiCompatibleProvider<ReqwestOpenAiTransport> {
@@ -367,6 +366,7 @@ impl OpenAiCompatibleProvider<ReqwestOpenAiTransport> {
             config,
             bearer: None,
             transport: ReqwestOpenAiTransport::default(),
+            retry_policy: RetryPolicy::default(),
         }
     }
 }
@@ -378,7 +378,16 @@ impl<T> OpenAiCompatibleProvider<T> {
             config,
             bearer: None,
             transport,
+            retry_policy: RetryPolicy::DEFAULT,
         }
+    }
+
+    /// Overrides the bounded retry policy applied to transient transport
+    /// failures. Every attempt targets the same resolved selection (ADR-024).
+    #[must_use]
+    pub const fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 
     /// Attaches the resolved bearer credential for authenticated providers.
@@ -395,6 +404,34 @@ impl<T> OpenAiCompatibleProvider<T> {
         &self.config
     }
 
+    /// Runs one transport call under the bounded retry policy: retryable
+    /// categories (per the SCRUM-84 taxonomy) retry the identical request on
+    /// the same resolved selection with decorrelated-jitter backoff and
+    /// `Retry-After` floors; everything else surfaces immediately.
+    ///
+    /// # Errors
+    /// Returns the typed application error of the last attempt.
+    async fn post_json_with_retries(
+        &self,
+        endpoint: &str,
+        body: Value,
+    ) -> Result<(Vec<u8>, RetryReport), ApplicationError>
+    where
+        T: OpenAiTransport,
+    {
+        run_with_default_policy(|_attempt| {
+            let future = self.transport.post_json(
+                endpoint,
+                self.bearer(),
+                body.clone(),
+                self.config.timeout,
+                self.config.limits.response_bytes,
+            );
+            async move { future.await.map_err(AttemptFailure::classified) }
+        })
+        .await
+    }
+
     fn bearer(&self) -> Option<&str> {
         self.bearer.as_deref()
     }
@@ -409,17 +446,9 @@ where
         request: InferenceRequest,
     ) -> Result<InferenceResponse, ApplicationError> {
         let body = encode_request(&self.config.model, request, self.config.quirks)?;
-        let response = self
-            .transport
-            .post_json(
-                self.config.chat_endpoint(),
-                self.bearer(),
-                body,
-                self.config.timeout,
-                self.config.limits.response_bytes,
-            )
-            .await
-            .map_err(|error| map_provider_error(&error))?;
+        let (response, _report) = self
+            .post_json_with_retries(self.config.chat_endpoint(), body)
+            .await?;
         decode_response(&response)
     }
 }
@@ -434,20 +463,15 @@ where
                 field: "embedding_text",
             });
         }
-        let response = self
-            .transport
-            .post_json(
+        let (response, _report) = self
+            .post_json_with_retries(
                 self.config.embedding_endpoint(),
-                self.bearer(),
                 json!({
                     "model": self.config.model,
                     "input": text,
                 }),
-                self.config.timeout,
-                self.config.limits.response_bytes,
             )
-            .await
-            .map_err(|error| map_provider_error(&error))?;
+            .await?;
         decode_embedding(
             &self.config.model,
             &response,
