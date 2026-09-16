@@ -288,6 +288,71 @@ base_url = \"{model_base_url}\"
         self.source_id
     }
 
+    /// An authenticated owner IPC client: the surface TUI and other local
+    /// IPC clients share. Created per call; enrollment is durable.
+    pub fn ipc_client(&self) -> cortexd::AuthenticatedIpcClient {
+        cortexd::AuthenticatedIpcClient::from_database_path(&self.database_path)
+            .expect("owner IPC enrollment")
+    }
+
+    /// Sends one capability over the IPC surface as the paired owner.
+    pub async fn ipc_call(&self, capability: &str, payload: Value) -> CallResult {
+        let request = cortexd::DaemonRequest {
+            protocol_version: cortexd::PROTOCOL_VERSION,
+            request_id: Uuid::now_v7(),
+            principal_id: Uuid::now_v7(),
+            operation_id: Uuid::now_v7(),
+            capability: capability.to_owned(),
+            payload,
+        };
+        let response = self
+            .ipc_client()
+            .request(&request)
+            .await
+            .expect("IPC transport");
+        CallResult::from_daemon(response)
+    }
+
+    pub async fn ipc_task_list(&self) -> CallResult {
+        self.ipc_call("cortex_task_list", json!({"limit": 50}))
+            .await
+    }
+
+    pub async fn ipc_task_complete(&self, resource_id: &str, revision: &str) -> CallResult {
+        self.ipc_call(
+            "cortex_task_complete",
+            json!({"resource_id": resource_id, "expected_revision": revision}),
+        )
+        .await
+    }
+
+    pub async fn ipc_note_update(
+        &self,
+        resource_id: &str,
+        revision: &str,
+        title: &str,
+        content: &str,
+    ) -> CallResult {
+        self.ipc_call(
+            "cortex_note_update",
+            json!({
+                "resource_id": resource_id,
+                "expected_revision": revision,
+                "title": title,
+                "content": content
+            }),
+        )
+        .await
+    }
+
+    pub async fn ipc_note_delete(&self, resource_id: &str, revision: &str) -> CallResult {
+        self.ipc_call(
+            "cortex_note_delete",
+            json!({"resource_id": resource_id, "expected_revision": revision}),
+        )
+        .await
+    }
+
     pub async fn cli_remember(&self, statement: &str) -> CallResult {
         let source = Uuid::from(self.source_id).to_string();
         self.cli(&[
@@ -322,7 +387,8 @@ base_url = \"{model_base_url}\"
         assert!(stdout.contains(expected), "brain text output: {stdout}");
     }
 
-    async fn cli(&self, arguments: &[&str]) -> CallResult {
+    /// Runs the real Brain CLI binary with JSON output.
+    pub async fn cli(&self, arguments: &[&str]) -> CallResult {
         let mut process = Command::new(env!("CARGO_BIN_EXE_brain-e2e"));
         process
             .args(arguments.iter().skip(1))
@@ -356,6 +422,49 @@ base_url = \"{model_base_url}\"
             .await
             .assert_success_value();
         SearchResult(value)
+    }
+
+    pub async fn mcp_task_create(&self, title: &str) -> CallResult {
+        self.mcp_call("task.create", json!({"title": title})).await
+    }
+
+    pub async fn mcp_task_list(&self) -> CallResult {
+        self.mcp_call("task.list", json!({"limit": 50})).await
+    }
+
+    pub async fn mcp_task_complete(&self, resource_id: &str, revision: &str) -> CallResult {
+        self.mcp_call(
+            "task.complete",
+            json!({"resource_id": resource_id, "expected_revision": revision}),
+        )
+        .await
+    }
+
+    pub async fn mcp_knowledge_update(
+        &self,
+        resource_id: &str,
+        revision: &str,
+        title: &str,
+        content: &str,
+    ) -> CallResult {
+        self.mcp_call(
+            "knowledge.update",
+            json!({
+                "resource_id": resource_id,
+                "expected_revision": revision,
+                "title": title,
+                "content": content
+            }),
+        )
+        .await
+    }
+
+    pub async fn mcp_knowledge_delete(&self, resource_id: &str, revision: &str) -> CallResult {
+        self.mcp_call(
+            "knowledge.delete",
+            json!({"resource_id": resource_id, "expected_revision": revision}),
+        )
+        .await
     }
 
     pub async fn mcp_delete(&self, entity_id: EntityId, revision: u64) -> CallResult {
@@ -989,6 +1098,18 @@ pub struct CallResult {
 }
 
 impl CallResult {
+    /// The successful result data, when the call succeeded.
+    #[must_use]
+    pub fn data(&self) -> Option<&Value> {
+        self.value.as_ref()
+    }
+
+    /// The wire error code, when the call failed.
+    #[must_use]
+    pub fn error_code(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     fn success(value: Value, correlation_id: Uuid) -> Self {
         Self {
             value: Some(value),
@@ -1029,6 +1150,19 @@ impl CallResult {
                 envelope["error"]["code"].as_str().expect("CLI error code"),
                 Uuid::now_v7(),
             )
+        }
+    }
+
+    fn from_daemon(response: cortexd::DaemonResponse) -> Self {
+        match response.result {
+            cortexd::WireResult::Success { value } => {
+                let correlation_id = correlation_id(&value).unwrap_or_else(Uuid::now_v7);
+                Self::success(value, correlation_id)
+            }
+            cortexd::WireResult::Error { code } => {
+                let correlation = Uuid::now_v7();
+                Self::error(&code, correlation)
+            }
         }
     }
 
