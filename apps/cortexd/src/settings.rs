@@ -512,6 +512,7 @@ pub async fn resolve_default_model<T: OpenAiTransport + Clone>(
 
 /// Resolves model routing with a credential lookup scoped to each profile's
 /// opaque secret reference.
+#[allow(clippy::too_many_lines)] // Each early degraded return is a distinct typed routing boundary.
 pub async fn resolve_default_model_with_lookup<T, F>(
     settings: Option<&LocalSettings>,
     transport: T,

@@ -628,6 +628,7 @@ async fn start_fake_model_endpoint(
     let cancellation = CancellationToken::new();
     let service = Router::new()
         .route("/v1/models", get(fake_models))
+        .route("/models", get(fake_models))
         .route("/v1/embeddings", post(fake_embedding))
         .route("/v1/chat/completions", post(fake_chat))
         .route("/embeddings", post(fake_embedding))
@@ -659,6 +660,28 @@ async fn fake_embedding(State(state): State<FakeModelState>) -> Response {
 async fn fake_chat(State(state): State<FakeModelState>, Json(body): Json<Value>) -> Response {
     if !state.available.load(Ordering::SeqCst) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    // Discovery capability probes are single "ping" turns carrying the
+    // cortex_probe tool; answer with evidence the probes accept instead of
+    // running the agent-mutation script below.
+    let is_probe = body["messages"].as_array().is_some_and(|messages| {
+        messages.len() == 1 && messages[0]["role"] == "user" && messages[0]["content"] == "ping"
+    }) && body["tools"].as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "cortex_probe")
+    });
+    if is_probe {
+        return Json(json!({
+            "choices": [{"message": {
+                "content": "{}",
+                "tool_calls": [{
+                    "id": "probe-1",
+                    "function": {"name": "cortex_probe", "arguments": "{}"}
+                }]
+            }}]
+        }))
+        .into_response();
     }
     let has_tool_result = body["messages"]
         .as_array()

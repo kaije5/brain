@@ -66,7 +66,18 @@ impl cortex_inference::OpenAiTransport for FakeOpenAiTransport {
                 ProviderFailureCategory::Unavailable,
             ));
         }
-        Ok(b"{}".to_vec())
+        // Probe evidence: a cortex_probe tool call with parseable arguments
+        // plus JSON content so both capability probes succeed.
+        Ok(serde_json::to_vec(&json!({
+            "choices": [{"message": {
+                "content": "{}",
+                "tool_calls": [{
+                    "id": "probe-1",
+                    "function": {"name": "cortex_probe", "arguments": "{}"}
+                }]
+            }}]
+        }))
+        .expect("static JSON"))
     }
 }
 
@@ -212,7 +223,13 @@ impl cortex_inference::OpenAiTransport for SelectiveTransport {
             ));
         }
         Ok(serde_json::to_vec(&json!({
-            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            "choices": [{"message": {
+                "content": "{}",
+                "tool_calls": [{
+                    "id": "probe-1",
+                    "function": {"name": "cortex_probe", "arguments": "{}"}
+                }]
+            }}]
         }))
         .expect("static JSON"))
     }

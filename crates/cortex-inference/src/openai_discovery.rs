@@ -86,7 +86,7 @@ impl<T: OpenAiTransport> OpenAiModelDiscovery<T> {
         let response = self
             .transport
             .get_json(
-                &self.config.models_endpoint(),
+                self.config.models_endpoint(),
                 bearer,
                 self.config.timeout,
                 MAX_DISCOVERY_RESPONSE_BYTES,
@@ -173,7 +173,7 @@ impl<T: OpenAiTransport> OpenAiModelDiscovery<T> {
         match self
             .transport
             .post_json(
-                &self.config.chat_endpoint(),
+                self.config.chat_endpoint(),
                 bearer,
                 body,
                 self.config.timeout,
