@@ -1,59 +1,53 @@
-# OpenAI-Compatible Discovery and Probing Design
+# OpenAI-Compatible Model Connector Design
 
-## Purpose and scope
+## Goal and scope
 
-Replace the NIM-named discovery, probing, configuration, and transport path with an OpenAI-compatible path. Keep automatic model discovery, bounded capability probing, deterministic routing, explicit degradation, and the NVIDIA NIM settings preset. This is a change to the inference integration, not to the knowledge/task provider contracts.
+Replace the NIM-named inference discovery path with one connector for any configured OpenAI-compatible Chat Completions endpoint. A provider profile supplies an API base URL, authentication strategy, model candidate source, timeouts, and typed compatibility options. The connector lists or accepts candidate model IDs, probes capabilities, and passes normalized evidence to the existing router. NVIDIA's hosted API is one possible endpoint; this design does not target self-hosted NIM.
 
-All current model profiles use `api_mode = "openai_completions"`; unknown modes remain invalid. A profile is eligible only for its own discovered models and observed capabilities. No provider is selected by brand name.
+The knowledge and task provider contracts are outside this change. Other wire protocols, such as Anthropic Messages or OpenAI Responses, need separate connectors.
 
-## Decision
+## Why this approach
 
-Use one OpenAI-compatible JSON transport for `GET /models` and `POST /chat/completions`, one discovery/probing component, and the existing `OpenAiCompatibleProvider` for runtime inference. The component is parameterized by a validated profile endpoint, timeout, typed quirks, and an injected transport. Keep the router and normalized model types unchanged.
+The current `NimDiscovery` performs generic HTTP model listing and Chat Completions probes, while `OpenAiCompatibleProvider` handles actual inference. Keeping both as separate vendor-named transports duplicates request and security behavior. Renaming `nim.rs` alone would preserve that duplication. Removing discovery would lose dynamic routing. A single connector is the smallest design that retains both features.
 
-Alternatives considered:
+## Profile contract
 
-1. Rename `nim.rs` and its public types only. This leaves duplicate HTTP clients, different endpoint normalization, and the credential routing defect.
-2. Delete discovery and require configured model IDs. This drops automatic discovery and capability evidence, breaking routing requirements.
-3. Generalize the existing path and consolidate transport. This is the chosen approach because it preserves behavior while removing vendor coupling and duplicated HTTP code.
+- `base_url` is the **API base**, not merely the host. Join `models`, `chat/completions`, and existing embedding paths to this base. For example, `https://api.openai.com/v1` yields `/v1/models` and `/v1/chat/completions`; `https://example.test/custom/api` yields `/custom/api/models` and `/custom/api/chat/completions`. Do not add or strip `/v1` implicitly. Existing host-only URLs must be updated to the intended API base.
+- `api_mode = "openai_completions"` remains the only supported mode. Unknown modes remain invalid.
+- `model_source = "list"` calls `GET {base_url}/models` and parses bounded `data[*].id` entries. This is the default for existing profiles. A profile's existing `models` array filters listed IDs when present.
+- `model_source = "configured"` uses the profile's nonempty `models` array as candidate IDs and does not call `/models`. This is an explicit operator choice for endpoints without a documented list API; it is not an automatic fallback after a failed GET.
+- The existing `SecretRef` and `auth_type` remain profile-scoped. The daemon resolves each enabled profile's credential independently. A missing required credential excludes that profile before any request. The selected route carries only its own credential into runtime inference.
+- Typed quirks include `omit_tool_choice` and a probe token-limit field of `max_tokens` or `max_completion_tokens`. Existing profiles default to `max_tokens`; a profile requiring the newer field opts in explicitly. No arbitrary JSON escape hatch is added.
 
-## Boundaries and data flow
+## Discovery, probing, and routing
 
-1. `cortexd` reads validated provider profiles. The composition root resolves each enabled profile's `SecretRef` separately. A failed required resolution makes that profile unavailable; it never substitutes another profile's key or silently runs keyless.
-2. For each enabled OpenAI-compatible profile, discovery calls the profile's `/models` endpoint and validates the bounded `data[*].id` response. A root URL and a `/v1` URL both resolve to one `/v1/models` endpoint; nested deployment prefixes stay intact. This makes the implicit API version in root URLs explicit. Existing custom root URLs that served `/chat/completions` directly require review before migration; `/v1` URLs retain their path.
-3. Each admitted model receives bounded tool-calling and structured-output probes on that same profile's `/chat/completions` endpoint, using that profile's bearer and request timeout. The probe output budget is at most 128 tokens; this is a resource ceiling, not a guarantee that every model can finish. Profile quirks, including `omit_tool_choice` and a typed choice of `max_tokens` versus `max_completion_tokens`, apply to probes where relevant. The existing NIM profile uses `max_tokens` by default; an OpenAI reasoning-model profile can explicitly select `max_completion_tokens`.
-4. Capability evidence is recorded only after parsing a response that actually demonstrates the capability. The tool probe sends only the `cortex_probe` tool and requests it when the endpoint supports `tool_choice`; evidence requires a returned, valid call. The separate `StructuredOutput` probe sends no tools, uses `response_format.type = "json_schema"` with a small strict schema, and verifies the returned object against it; `json_object` alone does not establish this capability. This is observed evidence, not a guarantee of future model behavior. An HTTP 200, an unrelated message, `finish_reason = "length"` or `content_filter`, a pending response, or a malformed body creates no positive evidence. Authentication and billing failures degrade that profile.
-5. The existing router selects a `{profile_id, model_id}` pair from fresh evidence and the declared-model allowlist. The selected profile's endpoint and bearer are installed together for the agent turn. No other profile's credential reaches that endpoint.
+The connector validates candidate IDs and caps their count before probing. A model list is a candidate source, not evidence of chat or tool support. Both candidate sources use the same bounded probes against `{base_url}/chat/completions`.
 
-## Safety and failure behavior
+The tool probe supplies only a harmless `cortex_probe` function. It requests that function when the endpoint accepts `tool_choice`; a profile with `omit_tool_choice` omits that parameter. A positive result requires a complete response with a matching, parseable tool call. The separate structured-output probe supplies no tools, requests a small strict `json_schema`, and checks that the returned object matches it. `json_object` proves JSON mode only and does not count as `StructuredOutput`. The output-token budget is capped at 128; a response ending for length or content filtering is inconclusive, not positive evidence.
 
-- Preserve response-size, model-count, model-ID, probe-payload, timeout, HTTPS-for-remote, no-proxy, no-redirect, redacted-error, and no-silent-fallback protections.
-- Keep provider responses and raw credentials out of logs, SQLite, IPC, and `Debug` output. The route record stores IDs only.
-- Preserve explicit `Disabled` and `Degraded` outcomes. The default profile must be valid and discoverable before routing; other enabled profiles may fail independently without hiding eligible alternatives. Authentication failure on any profile must not cause its credential to be reused elsewhere.
-- A provider that lacks `/models` cannot participate in automatic routing under this refactor. Supporting declared-only catalogs would require a separate design.
-- A listing can contain non-chat model IDs. Discovery only creates candidates; successful probes decide eligibility. A model that rejects the bounded probe stays ineligible, and no model is inferred from the catalog name alone.
-- Models that support only JSON mode or reject the typed probe token-limit field may become ineligible under the stricter evidence rule. This can change model availability; expose it as explicit degradation and verify the NIM preset before rollout.
+The router keeps its existing deterministic selection, profile provenance, declared-model filter, fresh-evidence requirement, and explicit degraded state. Listing failure in `list` mode does not switch to configured candidates. A provider that supports only JSON mode or rejects a probe remains ineligible for the current agent role; this may reduce availability compared with the old HTTP-success-only probe.
 
-## Compatibility and cleanup
+## Safety and compatibility
 
-- Existing `cortexd.toml` profiles, including `[models.profiles.nim]`, remain valid. `nim` is a profile ID and UI preset, not an API mode.
-- Profiles with root-only `base_url` may need an explicit versioned API base to preserve a nonstandard unversioned endpoint. Document this migration in local setup instructions rather than guessing a different endpoint or silently retrying another path.
-- Remove public `NimConfig`, `NimDiscovery`, `NimTransport`, and `ReqwestNimTransport` after migrating in-repository callers and tests. No backward-compatibility aliases are needed for this clean cutover.
-- Update current operational documentation and add a short superseding note to ADR-022. Preserve ADR-022 and the Sprint 1 threat model as historical records.
+- Preserve HTTPS for remote endpoints, loopback HTTP support, no ambient proxy, no redirect following, bounded responses and probes, typed redacted errors, and no silent route fallback.
+- Treat HTTP 202 or any other non-final response as pending or unavailable, never as positive capability evidence. Polling is a separate feature.
+- Keep credentials and provider response bodies out of settings, logs, persisted route records, IPC, and `Debug` output.
+- Existing settings syntax remains readable. The new `model_source` defaults to `list`; `models` retains allowlist semantics there and becomes the explicit candidate list in `configured` mode. Host-only base URLs need a documented migration to an API base.
+- Remove production `NimConfig`, `NimDiscovery`, `NimTransport`, and `ReqwestNimTransport` types and their tests after migration. Keep an optional NVIDIA hosted API preset as a convenience for entering its URL; it uses exactly the same connector and must ask for a model ID if `configured` mode is selected.
+- Do not claim that NVIDIA's hosted API supports `GET /v1/models` without verifying that contract. A configured model ID plus probing works without that GET endpoint.
+- The current agent routing policy requires both `ToolCalling` and `StructuredOutput`. Before rollout, verify the chosen hosted model can pass the strict-schema probe; if it cannot, revisit that policy in a separate design rather than claiming capability from JSON mode.
 
 ## Acceptance criteria
 
-- A self-hosted NIM and a non-NVIDIA OpenAI-compatible test endpoint both discover and probe through the same implementation; root and `/v1` base URLs produce correct requests. Before claiming the NVIDIA hosted preset works, verify that its configured endpoint actually serves `GET /v1/models` with the expected shape. The official hosted reference checked below documents chat completions but does not establish that listing endpoint.
-- An endpoint returning HTTP 200 with `{}` or unrelated assistant content cannot gain tool-calling or structured-output evidence.
-- Two authenticated profiles with distinct secrets send only their own bearer on discovery, probes, and the selected inference route; a missing secret never sends a request or borrows another key.
-- The existing router continues to filter by profile provenance, enabled state, declared models, and fresh capability evidence. Unavailable providers yield an explicit degraded state without fallback.
-- No `Nim*` or `ReqwestNimTransport` production types remain. The NVIDIA preset and existing user configuration still work.
-- Focused tests pass, followed by `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked`, and `cargo nextest run --workspace` before any PR.
+1. A profile using `https://api.openai.com/v1` and a profile using a different OpenAI-compatible API base both use the same connector, with no brand-specific branch in routing or inference.
+2. `list` mode issues a bounded GET and probes listed candidates; `configured` mode issues no GET and probes declared candidates. A failed GET does not silently change modes.
+3. A 200 with `{}`, an unrelated assistant message, invalid tool arguments, invalid schema output, an incomplete finish, or a 202 response grants no capability evidence.
+4. Two authenticated profiles never exchange credentials during listing, probes, or selected inference. A missing key causes no request to its endpoint.
+5. Existing profile configuration parses, a versioned API base joins endpoints exactly once, and the optional NVIDIA preset uses the generic flow.
+6. Focused tests pass, followed by `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked`, and `cargo nextest run --workspace` before a PR.
 
-## Official documentation comparison (2026-09-16)
+## Official API references checked through Context7 (2026-09-16)
 
-- [NVIDIA self-hosted NIM reference](https://docs.nvidia.com/nim/nemo-retriever/text-embedding/latest/reference.html) documents `GET /v1/models` with `data[*].id`; [NIM operator guidance](https://docs.nvidia.com/nim-operator/latest/service.html) shows `POST /v1/chat/completions` on a local deployment. These support the generic endpoint and response parser. The model-list example is for an embedding NIM, so it does not prove every listed model supports chat.
-- [NVIDIA hosted model reference](https://docs.api.nvidia.com/nim/docs/models) documents `POST https://integrate.api.nvidia.com/v1/chat/completions`. The Context7 official sources inspected did not document `GET https://integrate.api.nvidia.com/v1/models`; hosted discovery remains a verification gate, not a confirmed contract.
-- [OpenAI model listing](https://developers.openai.com/api/reference/resources/models/methods/list) has the same `data[*].id` shape, while [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) documents `choices[*].message.tool_calls` and `finish_reason`. Model listing does not attest to tool or schema capability; this is an inference from the separate endpoints.
-- [OpenAI Structured Outputs guidance](https://developers.openai.com/api/docs/guides/structured-outputs) distinguishes JSON mode from schema adherence. The design therefore probes strict `json_schema` for `StructuredOutput` rather than treating a parseable `json_object` response as proof.
-- [OpenAI Chat Completions parameters](https://developers.openai.com/api/reference/python/resources/chat/subresources/completions/methods/create) mark `max_tokens` deprecated and incompatible with newer o-series models; NVIDIA's [model reference](https://docs.api.nvidia.com/nim/reference/meta-llama-3_2-1b-instruct-infer) still documents `max_tokens`. A typed per-profile token-limit field avoids guessing by brand.
-- Some [NVIDIA hosted model references](https://docs.api.nvidia.com/nim/reference/google-gemma-3-27b-it-infer) document HTTP 202 pending responses. A pending response is not capability evidence; polling is outside this refactor unless separately designed.
+- [OpenAI Models list](https://developers.openai.com/api/reference/resources/models/methods/list) documents `GET /v1/models` and `data[*].id`. [Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create) requires a model ID and documents tool-call responses. These are separate operations; the connector therefore does not require listing when IDs are configured explicitly.
+- [OpenAI Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs) distinguishes strict `json_schema` from `json_object` JSON mode. [Chat Completions parameters](https://developers.openai.com/api/reference/python/resources/chat/subresources/completions/methods/create) document `max_completion_tokens` and deprecate `max_tokens` for newer models.
+- [NVIDIA hosted API reference](https://docs.api.nvidia.com/nim/reference/nvidia-nemotron-3-ultra-550b-a55b-infer) shows the OpenAI client pointed at `https://integrate.api.nvidia.com/v1` with a bearer key, model ID, and Chat Completions. The official hosted references returned by Context7 did not establish `GET /v1/models`; configured IDs avoid relying on that unverified endpoint.
