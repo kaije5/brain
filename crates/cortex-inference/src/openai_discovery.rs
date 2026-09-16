@@ -15,47 +15,12 @@ const PROBE_CONCURRENCY: usize = 8;
 const MAX_DISCOVERY_RESPONSE_BYTES: usize = MAX_CONFIGURED_RESPONSE_BYTES;
 const PROBE_MAX_TOKENS: u32 = 1;
 
-/// Explicit source for one profile's model candidates.
-///
-/// Listing and configured candidates never fall back to each other.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ModelCandidates {
-    /// Fetch `GET /models`, optionally retaining only listed identifiers.
-    List { allowlist: Vec<ModelId> },
-    /// Probe exactly these operator-configured identifiers without a GET.
-    Configured(Vec<ModelId>),
-}
-
-impl Default for ModelCandidates {
-    fn default() -> Self {
-        Self::List {
-            allowlist: Vec::new(),
-        }
-    }
-}
-
-impl ModelCandidates {
-    /// Validates an explicit nonempty configured candidate set.
-    ///
-    /// # Errors
-    /// Returns a validation error for an empty configured source.
-    pub fn configured(models: Vec<ModelId>) -> Result<Self, ApplicationError> {
-        if models.is_empty() {
-            return Err(ApplicationError::Validation {
-                field: "configured_models",
-            });
-        }
-        Ok(Self::Configured(models))
-    }
-}
-
 /// Validated configuration for OpenAI-compatible model discovery and probes.
 #[derive(Clone, Debug)]
 pub struct OpenAiDiscoveryConfig {
     api_base: OpenAiApiBase,
     secret_reference: Option<SecretRef>,
     timeout: Duration,
-    candidates: ModelCandidates,
 }
 
 impl OpenAiDiscoveryConfig {
@@ -76,7 +41,6 @@ impl OpenAiDiscoveryConfig {
             api_base,
             secret_reference,
             timeout,
-            candidates: ModelCandidates::default(),
         })
     }
 
@@ -93,13 +57,6 @@ impl OpenAiDiscoveryConfig {
     #[must_use]
     pub const fn secret_reference(&self) -> Option<&SecretRef> {
         self.secret_reference.as_ref()
-    }
-
-    /// Selects this profile's explicit model candidate source.
-    #[must_use]
-    pub fn with_candidates(mut self, candidates: ModelCandidates) -> Self {
-        self.candidates = candidates;
-        self
     }
 }
 
@@ -126,12 +83,6 @@ impl<T: OpenAiTransport> OpenAiModelDiscovery<T> {
         &self,
         bearer: Option<&str>,
     ) -> Result<Vec<DiscoveredModel>, ApplicationError> {
-        let ModelCandidates::List { allowlist } = &self.config.candidates else {
-            let ModelCandidates::Configured(models) = &self.config.candidates else {
-                unreachable!("all model candidate variants are handled")
-            };
-            return Ok(models.iter().cloned().map(DiscoveredModel::new).collect());
-        };
         let response = self
             .transport
             .get_json(
@@ -165,9 +116,7 @@ impl<T: OpenAiTransport> OpenAiModelDiscovery<T> {
             let Ok(model_id) = ModelId::new(raw_id) else {
                 continue;
             };
-            if allowlist.is_empty() || allowlist.contains(&model_id) {
-                models.push(DiscoveredModel::new(model_id));
-            }
+            models.push(DiscoveredModel::new(model_id));
         }
         Ok(models)
     }

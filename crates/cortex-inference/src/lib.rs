@@ -17,14 +17,14 @@ pub use openai_compatible::{
     OpenAiApiBase, OpenAiCompatibleConfig, OpenAiCompatibleProvider, OpenAiTransport,
     ProviderLimits, ReqwestOpenAiTransport,
 };
-pub use openai_discovery::{ModelCandidates, OpenAiDiscoveryConfig, OpenAiModelDiscovery};
+pub use openai_discovery::{OpenAiDiscoveryConfig, OpenAiModelDiscovery};
 pub use provider::{
     InferenceMessage, InferenceProvider, InferenceRequest, InferenceResponse, InferenceTool,
     ToolCall,
 };
 pub use routing::{
     ApiMode, AuthStrategy, DiscoveredModel, ModelCapability, ModelCatalog, ModelId, ModelRouter,
-    ModelSource, ProfileTimeouts, ProviderProfile, ProviderProfileId, ProviderQuirks,
-    RoleRoutingPolicy, RoutedModel,
+    ProfileTimeouts, ProviderProfile, ProviderProfileId, ProviderQuirks, RoleRoutingPolicy,
+    RoutedModel,
 };
 pub use system_prompt::SystemPrompt;

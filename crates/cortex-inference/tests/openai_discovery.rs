@@ -2,9 +2,8 @@ use std::{sync::Mutex, time::Duration};
 
 use cortex_application::{ApplicationError, SecretRef};
 use cortex_inference::{
-    DiscoveredModel, ModelCandidates, ModelCapability, ModelId, OpenAiDiscoveryConfig,
-    OpenAiModelDiscovery, OpenAiTransport, ProviderError, ProviderFailureCategory,
-    ReqwestOpenAiTransport,
+    DiscoveredModel, ModelCapability, ModelId, OpenAiDiscoveryConfig, OpenAiModelDiscovery,
+    OpenAiTransport, ProviderError, ProviderFailureCategory, ReqwestOpenAiTransport,
 };
 
 fn provider_error(category: ProviderFailureCategory) -> ProviderError {
@@ -183,41 +182,6 @@ async fn keyless_discovery_omits_the_authorization_header() {
     discovery.discover(None).await.expect("keyless discovery");
 
     assert_eq!(fake.lock().get_requests[0].1, None);
-}
-
-#[tokio::test]
-async fn configured_candidates_skip_model_listing_and_probe_only_declared_models() {
-    let fake = transport(
-        Vec::new(),
-        vec![Ok(chat_response("ok")), Ok(chat_response("ok"))],
-    );
-    let config = config().with_candidates(
-        ModelCandidates::configured(vec![ModelId::new("configured-model").expect("valid id")])
-            .expect("configured candidates are valid"),
-    );
-    let discovery = OpenAiModelDiscovery::new(config, fake.clone());
-
-    let catalog = discovery
-        .refresh(Some("profile-token"))
-        .await
-        .expect("refresh");
-
-    let requests = fake.lock();
-    assert!(
-        requests.get_requests.is_empty(),
-        "configured mode must not list"
-    );
-    assert_eq!(requests.post_requests.len(), 2, "two capability probes");
-    assert!(
-        requests
-            .post_requests
-            .iter()
-            .all(
-                |(_, bearer, body)| bearer.as_deref() == Some("profile-token")
-                    && body["model"] == "configured-model"
-            )
-    );
-    assert_eq!(catalog.models().len(), 1);
 }
 
 #[tokio::test]

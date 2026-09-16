@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use cortex_inference::{ApiMode, AuthStrategy, ModelSource};
+use cortex_inference::{ApiMode, AuthStrategy};
 use cortexd::{LocalSettings, SettingsError};
 use tempfile::TempDir;
 
@@ -275,43 +275,4 @@ base_url = "http://127.0.0.1:8000/v1"
     assert_eq!(keyless.auth_strategy(), AuthStrategy::None);
     // Historical default timeout is preserved for legacy configurations.
     assert_eq!(nim.timeouts().request().as_secs(), 5);
-}
-
-#[test]
-fn configured_model_source_requires_models_and_is_preserved() {
-    let directory = TempDir::new().expect("temporary directory should be available");
-    let missing_models = write_settings(
-        directory.path(),
-        r#"
-[models.profiles.remote]
-base_url = "https://provider.example/v1"
-model_source = "configured"
-"#,
-    );
-    assert!(matches!(
-        LocalSettings::load(&missing_models)
-            .expect("parses")
-            .expect("present")
-            .provider_profiles(),
-        Err(SettingsError::Invalid {
-            field: "configured_models"
-        })
-    ));
-
-    let configured = write_settings(
-        directory.path(),
-        r#"
-[models.profiles.remote]
-base_url = "https://provider.example/v1"
-model_source = "configured"
-models = ["remote-model"]
-"#,
-    );
-    let profiles = LocalSettings::load(&configured)
-        .expect("parses")
-        .expect("present")
-        .provider_profiles()
-        .expect("valid profile");
-    assert_eq!(profiles[0].model_source(), ModelSource::Configured);
-    assert_eq!(profiles[0].declared_models()[0].as_str(), "remote-model");
 }
