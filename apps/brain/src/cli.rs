@@ -45,7 +45,29 @@ pub enum Command {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum NoteCommand {
-    Create { title: String, content: String },
+    Create {
+        title: String,
+        content: String,
+    },
+    /// Rewrites a vault note from the observed revision. The vault note
+    /// format has no partial merge: title and body are written as given.
+    Update {
+        /// The stable provider resource id (`path:`-prefixed).
+        resource_id: String,
+        #[arg(long)]
+        revision: String,
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        content: String,
+    },
+    /// Deletes a vault note from the observed revision.
+    Delete {
+        /// The stable provider resource id (`path:`-prefixed).
+        resource_id: String,
+        #[arg(long)]
+        revision: String,
+    },
     Search(SearchArgs),
 }
 
@@ -156,6 +178,29 @@ pub fn command_request(cli: &Cli) -> Result<CommandRequest, CliCommandError> {
         Command::Note(NoteCommand::Create { title, content }) => (
             "cortex_note_create",
             json!({"title": title, "content": content}),
+            true,
+        ),
+        Command::Note(NoteCommand::Update {
+            resource_id,
+            revision,
+            title,
+            content,
+        }) => (
+            "cortex_note_update",
+            json!({
+                "resource_id": resource_id,
+                "expected_revision": revision,
+                "title": title,
+                "content": content,
+            }),
+            true,
+        ),
+        Command::Note(NoteCommand::Delete {
+            resource_id,
+            revision,
+        }) => (
+            "cortex_note_delete",
+            json!({"resource_id": resource_id, "expected_revision": revision}),
             true,
         ),
         Command::Note(NoteCommand::Search(input)) => search("cortex_note_search", input)?,
