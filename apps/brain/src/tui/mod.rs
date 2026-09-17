@@ -35,6 +35,18 @@ pub enum ChatStatus {
     Degraded(String),
 }
 
+/// What the runner should do with the staged chat input (SCRUM-83).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InputCommand {
+    /// A normal agent prompt.
+    Agent(String),
+    /// `/model`: show the active model and the offered catalog.
+    ModelList,
+    /// `/model <id>`: switch the agent to another offered model for
+    /// subsequent turns.
+    ModelSelect(String),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsSummary {
     pub config_path: String,
@@ -488,6 +500,10 @@ pub struct App {
     transcript: Vec<(String, String)>,
     partial_reply: Option<String>,
     tasks: Vec<(String, String)>,
+    /// The model the agent currently resolves to (SCRUM-83).
+    active_model: Option<String>,
+    /// Models offered by routing for mid-session selection.
+    available_models: Vec<String>,
     /// Freshness tag of the last vault task list: `None` until one loads.
     task_freshness: Option<String>,
     /// Provider id of the daemon's configured vault, when present.
@@ -509,6 +525,8 @@ impl Default for App {
             transcript: Vec::new(),
             partial_reply: None,
             tasks: Vec::new(),
+            active_model: None,
+            available_models: Vec::new(),
             task_freshness: None,
             vault_provider: None,
             notes_query: String::new(),
@@ -573,16 +591,70 @@ impl App {
     /// Stages the current input as a user prompt. The runner performs the
     /// policy-checked `cortex_agent_run` request through the daemon.
     pub fn submit_prompt(&mut self) {
+        let _ = self.submit_input();
+    }
+
+    /// Classifies the staged input and stages it. `/model` interactions are
+    /// handled without entering the waiting state: an in-flight generation
+    /// cannot be interrupted by a selection attempt (SCRUM-83).
+    ///
+    /// Returns the command the runner should perform, or `None` when the
+    /// input was rejected (in-flight generation) or empty.
+    pub fn submit_input(&mut self) -> Option<InputCommand> {
         if self.chat_status == ChatStatus::Waiting {
-            return;
+            return None;
         }
-        let prompt = self.chat_input.trim().to_owned();
-        if prompt.is_empty() {
-            return;
+        let input = self.chat_input.trim().to_owned();
+        if input.is_empty() {
+            return None;
         }
         self.chat_input.clear();
-        self.transcript.push(("user".to_owned(), prompt));
+        if input == "/model" {
+            self.transcript.push(("user".to_owned(), input));
+            return Some(InputCommand::ModelList);
+        }
+        if let Some(model) = input.strip_prefix("/model ") {
+            let model = model.trim().to_owned();
+            if model.is_empty() {
+                self.transcript
+                    .push(("user".to_owned(), "/model".to_owned()));
+                return Some(InputCommand::ModelList);
+            }
+            self.transcript.push(("user".to_owned(), input));
+            return Some(InputCommand::ModelSelect(model));
+        }
+        self.transcript.push(("user".to_owned(), input));
         self.chat_status = ChatStatus::Waiting;
+        Some(InputCommand::Agent(
+            self.pending_prompt().unwrap_or_default(),
+        ))
+    }
+
+    /// Records the active model and the models offered by routing.
+    pub fn set_active_model(&mut self, active: Option<String>, models: Vec<String>) {
+        self.active_model = active;
+        self.available_models = models;
+    }
+
+    #[must_use]
+    pub fn active_model(&self) -> &str {
+        self.active_model.as_deref().unwrap_or("none resolved")
+    }
+
+    #[must_use]
+    pub fn available_models(&self) -> &[String] {
+        &self.available_models
+    }
+
+    /// Applies a successful mid-session model switch.
+    pub fn apply_model_switch(&mut self, model: String) {
+        self.active_model = Some(model);
+    }
+
+    /// Renders an assistant note into the transcript (model listings,
+    /// selection confirmations, and actionable errors).
+    pub fn push_assistant_note(&mut self, note: String) {
+        self.transcript.push(("assistant".to_owned(), note));
     }
 
     #[must_use]

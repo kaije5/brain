@@ -165,6 +165,20 @@ pub struct LocalDaemon {
     /// start and never mutate in-flight requests (SCRUM-147).
     prompt: ResolvedPromptConfig,
     resolved_profile: Arc<std::sync::RwLock<Option<String>>>,
+    /// The resolved model configuration, remembered so a mid-session model
+    /// selection can rebuild the provider for subsequent turns (SCRUM-83).
+    resolved_model: Arc<std::sync::RwLock<Option<ResolvedModelConfig>>>,
+}
+
+/// The resolved provider selection: everything needed to rebuild the
+/// inference provider when the user switches models mid-session.
+#[derive(Clone)]
+struct ResolvedModelConfig {
+    config: cortex_inference::OpenAiCompatibleConfig,
+    bearer: Option<String>,
+    models: Vec<String>,
+    #[allow(dead_code)] // retained for route/diagnostic symmetry (SCRUM-82/83)
+    profile_id: String,
 }
 
 #[derive(Clone)]
@@ -555,6 +569,7 @@ impl LocalDaemon {
             vault_index,
             prompt,
             resolved_profile: Arc::new(std::sync::RwLock::new(None)),
+            resolved_model: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -586,16 +601,63 @@ impl LocalDaemon {
         models: Vec<String>,
         profile_id: &str,
     ) {
-        self.embedding_provider
-            .install(DaemonEmbeddingProvider::Configured(Arc::new(
-                OpenAiCompatibleProvider::new(config).with_bearer(bearer),
-            )));
+        let provider = DaemonEmbeddingProvider::Configured(Arc::new(
+            OpenAiCompatibleProvider::new(config.clone()).with_bearer(bearer.clone()),
+        ));
+        self.embedding_provider.install(provider);
         if let Ok(mut catalog) = self.discovered_models.write() {
-            *catalog = models;
+            catalog.clone_from(&models);
         }
         if let Ok(mut resolved) = self.resolved_profile.write() {
             *resolved = Some(profile_id.to_owned());
         }
+        if let Ok(mut resolved_model) = self.resolved_model.write() {
+            *resolved_model = Some(ResolvedModelConfig {
+                config,
+                bearer,
+                models,
+                profile_id: profile_id.to_owned(),
+            });
+        }
+    }
+
+    /// The model the agent currently resolves to, if any (SCRUM-83).
+    #[must_use]
+    pub fn active_model(&self) -> Option<String> {
+        self.resolved_model
+            .read()
+            .ok()?
+            .as_ref()
+            .map(|resolved| resolved.config.model().to_owned())
+    }
+
+    /// Switches the agent to another model discovered from the same
+    /// provider/profile for subsequent turns. The in-flight turn is
+    /// unaffected: it holds a snapshot of the provider taken at turn start.
+    ///
+    /// # Errors
+    /// Returns a typed error when no resolved model exists or the requested
+    /// model is not in the discovered catalog.
+    pub fn select_model(&self, model: &str) -> Result<String, DaemonError> {
+        let resolved_guard = self
+            .resolved_model
+            .read()
+            .map_err(|_| DaemonError::InvalidConfiguration)?;
+        let Some(resolved) = resolved_guard.as_ref() else {
+            return Err(DaemonError::InvalidConfiguration);
+        };
+        if !resolved.models.iter().any(|candidate| candidate == model) {
+            return Err(DaemonError::NotFound);
+        }
+        let switched_config = resolved
+            .config
+            .with_model(model)
+            .map_err(|_| DaemonError::InvalidRequest)?;
+        let provider = DaemonEmbeddingProvider::Configured(Arc::new(
+            OpenAiCompatibleProvider::new(switched_config).with_bearer(resolved.bearer.clone()),
+        ));
+        self.embedding_provider.install(provider);
+        Ok(model.to_owned())
     }
 
     /// The composed Stable prompt tier for one resolved profile: Cortex's
@@ -712,6 +774,7 @@ impl LocalDaemon {
                 Ok(self.diagnostic_response(principal_id, correlation_id, "logs"))
             }
             "cortex_model_list" => Ok(self.model_list_response(correlation_id)),
+            "cortex_model_select" => self.select_model_response(request),
             "cortex_remote_enroll" => self.enroll_remote_principal(principal_id, request).await,
             "cortex_knowledge_search" | "cortex_memory_search" => {
                 self.search_knowledge(principal_id, request).await
@@ -1544,6 +1607,29 @@ impl LocalDaemon {
 
     /// The discovered model catalog for client-side model selection.
     /// Empty while background resolution is pending, disabled, or degraded.
+    /// Handles a mid-session model selection: validates the requested model
+    /// against the discovered catalog and swaps the agent provider for
+    /// subsequent turns. The in-flight generation is unaffected (SCRUM-83).
+    fn select_model_response(
+        &self,
+        request: &DaemonRequest,
+    ) -> Result<DaemonResponse, DaemonError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ModelSelectPayload {
+            model: String,
+        }
+        let payload: ModelSelectPayload = decode_payload(&request.payload)?;
+        let active = self.select_model(&payload.model)?;
+        Ok(DaemonResponse {
+            protocol_version: PROTOCOL_VERSION,
+            request_id: request.request_id,
+            result: WireResult::Success {
+                value: json!({ "active": active }),
+            },
+        })
+    }
+
     fn model_list_response(&self, request_id: Uuid) -> DaemonResponse {
         DaemonResponse {
             protocol_version: PROTOCOL_VERSION,
@@ -1551,6 +1637,12 @@ impl LocalDaemon {
             result: WireResult::Success {
                 value: json!({
                     "models": self.discovered_models(),
+                    "active": self.active_model(),
+                    "profile": self
+                        .resolved_profile
+                        .read()
+                        .ok()
+                        .and_then(|resolved| resolved.clone()),
                 }),
             },
         }
