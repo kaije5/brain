@@ -1,6 +1,5 @@
 //! Mid-session model switching and single-writer rendering (SCRUM-83).
 
-
 use brain::tui::{App, InputCommand};
 use brain::{Cli, command_request};
 use clap::Parser;

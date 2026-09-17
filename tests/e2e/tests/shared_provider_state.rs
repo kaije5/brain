@@ -5,7 +5,6 @@
 //! authority — the same stable resource identity and revision chain — and a
 //! conflicting write must never be reported as success.
 
-
 mod support;
 
 use serde_json::Value;

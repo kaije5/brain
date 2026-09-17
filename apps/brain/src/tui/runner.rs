@@ -386,8 +386,7 @@ fn request_model_catalog(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
     let client = client.clone();
     tokio::spawn(async move {
         let result = send_capability(&client, "cortex_model_list", serde_json::json!({})).await;
-        let value =
-            result.map(|values| values.first().cloned().unwrap_or(serde_json::Value::Null));
+        let value = result.map(|values| values.first().cloned().unwrap_or(serde_json::Value::Null));
         let _ = sender.send(Effect::ModelCatalog(value));
     });
 }
