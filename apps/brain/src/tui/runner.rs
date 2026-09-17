@@ -8,6 +8,36 @@ use super::{App, InputCommand, SettingsSummary, Tab};
 use crate::DaemonClient;
 use cortexd::{LocalSettings, data_directory};
 
+/// Builds the `/model` status note when the daemon has no active model
+/// (SCRUM-178): the daemon's coarse degraded reason becomes an actionable
+/// hint instead of a bare "no model resolved".
+fn degraded_model_note(value: &serde_json::Value) -> String {
+    let reason = value
+        .get("degraded_reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unresolved");
+    let hint = match reason {
+        "disabled" => "no [models] default_profile in cortexd.toml; add a provider in Settings",
+        "invalid_profiles" => "provider profiles failed to parse; check cortexd.toml for unknown or malformed keys",
+        "default_profile_missing_or_disabled" => {
+            "[models] default_profile points at a missing or disabled profile; fix it in Settings"
+        }
+        "provider_unavailable" => {
+            "the default profile's endpoint is unreachable; check base_url, the network and the stored API key"
+        }
+        "no_eligible_model" => {
+            "no model passed capability probing or the profile's models allowlist; see the available models above"
+        }
+        "routed_profile_credential_unavailable" => {
+            "the profile's secret_ref has no credential in the platform secret store; re-enter the API key in Settings"
+        }
+        "invalid_routing_policy" | "routed_profile_missing" | "invalid_provider_limits"
+        | "invalid_model_config" => "internal routing state invalid; check the daemon logs",
+        _ => "check cortexd.toml and the daemon logs",
+    };
+    format!("no model resolved (reason: {reason}) — {hint}")
+}
+
 /// Async daemon effects applied back onto the state machine by the loop.
 enum Effect {
     Tasks(Result<Vec<(String, String)>, String>),
@@ -279,7 +309,7 @@ fn apply_effect(app: &mut App, effect: Effect, client: &DaemonClient) {
                 .unwrap_or_default();
             let note = match &active {
                 Some(active) => format!("active model: {active}"),
-                None => "no model resolved".to_owned(),
+                None => degraded_model_note(&value),
             };
             app.push_assistant_note(note.clone());
             if !models.is_empty() {
@@ -573,6 +603,65 @@ mod tests {
             &DaemonClient::for_keyboard_tests(),
             sender,
         );
+    }
+
+    fn apply_catalog(app: &mut App, value: serde_json::Value) {
+        let (_sender, _receiver) = mpsc::channel::<Effect>();
+        apply_effect(
+            app,
+            Effect::ModelCatalog(Ok(value)),
+            &DaemonClient::for_keyboard_tests(),
+        );
+    }
+
+    #[test]
+    fn degraded_catalog_names_the_reason_and_a_recovery_hint() {
+        let mut app = App::new();
+        apply_catalog(
+            &mut app,
+            serde_json::json!({
+                "active": null,
+                "models": ["m-one"],
+                "degraded_reason": "routed_profile_credential_unavailable",
+            }),
+        );
+        let line = app.status_line();
+        assert!(
+            line.contains("reason: routed_profile_credential_unavailable"),
+            "status line must name the reason: {line}"
+        );
+        assert!(
+            line.contains("secret store"),
+            "status line must carry the recovery hint: {line}"
+        );
+        assert!(app
+            .transcript()
+            .iter()
+            .any(|(_, text)| text.contains("available models: m-one")));
+    }
+
+    #[test]
+    fn degraded_catalog_without_reason_stays_actionable() {
+        let mut app = App::new();
+        apply_catalog(
+            &mut app,
+            serde_json::json!({ "active": null, "models": [] }),
+        );
+        assert!(app.status_line().contains("reason: unresolved"));
+    }
+
+    #[test]
+    fn resolved_catalog_still_reports_the_active_model() {
+        let mut app = App::new();
+        apply_catalog(
+            &mut app,
+            serde_json::json!({
+                "active": "m-one",
+                "models": ["m-one", "m-two"],
+                "degraded_reason": null,
+            }),
+        );
+        assert_eq!(app.status_line(), "active model: m-one");
     }
 
     fn editor() -> App {
