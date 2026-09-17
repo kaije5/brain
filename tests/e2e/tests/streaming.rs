@@ -67,6 +67,18 @@ async fn agent_run_streams_frames_and_the_tui_renders_them_incrementally() {
         "at least one partial frame must arrive before the terminal frame"
     );
     assert!(streamed.iter().all(|chunk| !chunk.trim().is_empty()));
+    // SCRUM-80: true SSE delivers multiple ordered token-level deltas before
+    // the terminal frame — the fake model splits its reply into three.
+    assert_eq!(
+        streamed.len(),
+        3,
+        "expected three ordered SSE content deltas, got {streamed:?}"
+    );
+    let joined: String = streamed.concat();
+    assert_eq!(
+        joined, final_content,
+        "the deltas concatenate to the terminal content"
+    );
 
     let mut app = App::new();
     app.select_tab(Tab::Chat);

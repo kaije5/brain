@@ -58,4 +58,24 @@ pub trait InferenceProvider: Send + Sync {
         &self,
         request: InferenceRequest,
     ) -> Result<InferenceResponse, ApplicationError>;
+
+    /// True token-level streaming (SCRUM-80): forwards each user-visible
+    /// content delta to `on_delta` as it arrives from the provider, before
+    /// the full completion exists. The default implementation is the
+    /// non-streaming completion with its final content emitted once —
+    /// provider adapters override this with real SSE support.
+    ///
+    /// # Errors
+    /// Returns the typed inference failure of the underlying provider.
+    async fn complete_streaming(
+        &self,
+        request: InferenceRequest,
+        on_delta: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<InferenceResponse, ApplicationError> {
+        let response = self.complete(request).await?;
+        if let Some(content) = response.content.as_deref().filter(|c| !c.is_empty()) {
+            on_delta(content);
+        }
+        Ok(response)
+    }
 }
