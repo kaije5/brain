@@ -35,6 +35,7 @@ use uuid::{Uuid, Version};
 
 use crate::{
     DaemonConfig, MarkdownVaultProvider, config::MAX_REMOTE_CLIENTS, config::ResolvedPromptConfig,
+    vault::VaultProviderConfig,
 };
 
 /// The only supported local IPC protocol version. v2 carries provider
@@ -139,6 +140,38 @@ impl std::fmt::Display for DaemonError {
 
 impl std::error::Error for DaemonError {}
 
+/// Secret-free vault health facts for doctor/status diagnostics (SCRUM-133).
+/// Index counters come from the last full reconciliation; `fresh` is false
+/// when the last refresh failed or the vault root became inaccessible.
+#[derive(Clone, Debug, Default)]
+struct VaultHealth {
+    refreshed_at: Option<String>,
+    indexed: usize,
+    unchanged: usize,
+    removed: usize,
+    skipped: usize,
+    fresh: bool,
+    /// Observed at health-write time; never carries content or secrets.
+    root_accessible: bool,
+}
+
+impl VaultHealth {
+    fn from_report(
+        report: &crate::vault_watcher::ReconciliationReport,
+        root_accessible: bool,
+    ) -> Self {
+        Self {
+            refreshed_at: Some(chrono::Utc::now().to_rfc3339()),
+            indexed: report.indexed,
+            unchanged: report.unchanged,
+            removed: report.removed,
+            skipped: report.skipped,
+            fresh: true,
+            root_accessible,
+        }
+    }
+}
+
 /// State-owning Cortex daemon. `SQLite` is opened and migrated before this value is returned.
 #[derive(Clone)]
 pub struct LocalDaemon {
@@ -158,6 +191,10 @@ pub struct LocalDaemon {
     audit: SqliteAuditPort,
     authority: Option<Arc<DaemonAuthority>>,
     vault: Option<Arc<MarkdownVaultProvider>>,
+    /// Secret-free vault health snapshot for doctor/status diagnostics.
+    vault_health: Arc<std::sync::RwLock<VaultHealth>>,
+    /// The resolved vault configuration (root/scope facts only).
+    vault_config: Option<VaultProviderConfig>,
     /// Derived, rebuildable vault index backing fused knowledge retrieval.
     vault_index: Arc<std::sync::RwLock<DerivedVaultIndex>>,
     /// Resolved Brain prompt configuration: immutable for the process
@@ -526,7 +563,7 @@ impl LocalDaemon {
             .clone()
             .resolve()
             .map_err(|_| DaemonError::InvalidConfiguration)?;
-        let (authority, vault, vault_index) = match vault_config {
+        let (authority, vault, vault_index, vault_health) = match vault_config.as_ref() {
             Some(vault_config) => {
                 let opened = MarkdownVaultProvider::open(vault_config.clone(), config.workspace_id)
                     .map_err(|_| DaemonError::StartupFailed)?;
@@ -539,13 +576,17 @@ impl LocalDaemon {
                     database.audit_port(),
                 ));
                 let mut index = DerivedVaultIndex::new();
-                crate::vault_watcher::rebuild_vault(&vault, &mut index)
+                let report = crate::vault_watcher::rebuild_vault(&vault, &mut index)
                     .map_err(|_| DaemonError::StartupFailed)?;
-                (Some(authority), Some(vault), index)
+                let mut health =
+                    VaultHealth::from_report(&report, vault_config.validate_root_access().is_ok());
+                health.fresh = true;
+                (Some(authority), Some(vault), index, health)
             }
-            None => (None, None, DerivedVaultIndex::new()),
+            None => (None, None, DerivedVaultIndex::new(), VaultHealth::default()),
         };
         let vault_index = Arc::new(std::sync::RwLock::new(vault_index));
+        let vault_health = Arc::new(std::sync::RwLock::new(vault_health));
         Ok(Self {
             database,
             database_path,
@@ -566,6 +607,8 @@ impl LocalDaemon {
             audit,
             authority,
             vault,
+            vault_health,
+            vault_config: vault_config.clone(),
             vault_index,
             prompt,
             resolved_profile: Arc::new(std::sync::RwLock::new(None)),
@@ -573,9 +616,17 @@ impl LocalDaemon {
         })
     }
 
+    /// Test-only access to the derived index for exercising rebuild flows.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn vault_index_for_test(&self) -> &Arc<std::sync::RwLock<DerivedVaultIndex>> {
+        &self.vault_index
+    }
+
     /// Rebuilds the derived vault index from current vault content. Called
     /// after vault mutations and by the watcher so fused retrieval stays
-    /// current; fully rebuildable, so failure never corrupts state.
+    /// current; fully rebuildable, so failure never corrupts state. On
+    /// failure the previous index stays in place and health is marked stale.
     ///
     /// # Panics
     /// Panics if the derived index lock was poisoned by a prior panic.
@@ -584,11 +635,31 @@ impl LocalDaemon {
         let Some(vault) = &self.vault else {
             return false;
         };
+        let root_accessible = self
+            .vault_config
+            .as_ref()
+            .is_some_and(|config| config.validate_root_access().is_ok());
         let mut index = self
             .vault_index
             .write()
             .expect("vault index mutex poisoned");
-        crate::vault_watcher::rebuild_vault(vault, &mut index).is_ok()
+        if let Ok(report) = crate::vault_watcher::rebuild_vault(vault, &mut index) {
+            *self
+                .vault_health
+                .write()
+                .expect("vault health mutex poisoned") =
+                VaultHealth::from_report(&report, root_accessible);
+            true
+        } else {
+            let mut health = self
+                .vault_health
+                .write()
+                .expect("vault health mutex poisoned");
+            health.fresh = false;
+            health.refreshed_at = Some(chrono::Utc::now().to_rfc3339());
+            health.root_accessible = root_accessible;
+            false
+        }
     }
 
     /// Installs the resolved model provider and discovered catalog after
@@ -794,6 +865,12 @@ impl LocalDaemon {
             | "cortex_memory_delete"
             | "cortex_memory_restore" => {
                 let response = self.dispatch_mutation(principal_id, request).await?;
+                // Provider mutations changed vault content: refresh the
+                // derived index so retrieval and health stay current (the
+                // index lag for user surfaces is one mutation, not a scan
+                // interval). A failed refresh keeps the previous index and
+                // marks health stale; it never fails the mutation itself.
+                let _ = self.refresh_vault_index();
                 self.refresh_embedding(&response).await;
                 Ok(response)
             }
@@ -1664,16 +1741,65 @@ impl LocalDaemon {
                     "workspace_id": Uuid::from(self.workspace_id).to_string(),
                     "principal_id": Uuid::from(principal_id).to_string(),
                     "migrations_applied": self.migrations_applied,
-                    "vault": match &self.vault {
-                        Some(vault) => json!({
-                            "configured": true,
-                            "provider_id": vault.provider_reference_id().as_str(),
-                        }),
-                        None => json!({ "configured": false }),
-                    },
+                    "vault": self.vault_health_json(),
                 }),
             },
         }
+    }
+
+    /// Secret-free vault health for doctor/status: configuration facts
+    /// (root path, scopes, mode), accessibility, and derived-index state.
+    /// Never includes vault content, identities, or credentials.
+    fn vault_health_json(&self) -> Value {
+        let Some(config) = &self.vault_config else {
+            return json!({ "configured": false });
+        };
+        let health = self
+            .vault_health
+            .read()
+            .expect("vault health mutex poisoned")
+            .clone();
+        // Accessibility is evaluated live so a sync outage (mount loss,
+        // deleted root) is visible in diagnostics without waiting for the
+        // next refresh.
+        let root_accessible = config.validate_root_access().is_ok();
+        let fresh = health.fresh && root_accessible;
+        let mut scopes: Vec<&str> = config
+            .scopes()
+            .iter()
+            .map(|scope| match scope.resource_kind() {
+                cortex_domain::ProviderResourceKind::Knowledge => "knowledge",
+                cortex_domain::ProviderResourceKind::Task => "task",
+            })
+            .collect();
+        scopes.sort_unstable();
+        json!({
+            "configured": true,
+            "provider_id": self.vault.as_ref().map_or("", |v| v.provider_reference_id().as_str()),
+            "root": config.root().display().to_string(),
+            "mode": match config.mode() {
+                crate::vault::VaultProviderMode::ReadOnly => "read_only",
+                crate::vault::VaultProviderMode::ReadWrite => "read_write",
+            },
+            "scopes": scopes,
+            "root_accessible": root_accessible,
+            "fresh": fresh,
+            "index": {
+                "refreshed_at": health.refreshed_at,
+                "indexed": health.indexed,
+                "unchanged": health.unchanged,
+                "removed": health.removed,
+                "skipped": health.skipped,
+            },
+            "semantic": if self.embedding_available() { "available" } else { "degraded" },
+        })
+    }
+
+    fn embedding_available(&self) -> bool {
+        matches!(
+            self.embedding_provider.current(),
+            DaemonEmbeddingProvider::Configured(_)
+        )
     }
 
     /// Serves authenticated, per-user local IPC until `shutdown` is signalled.

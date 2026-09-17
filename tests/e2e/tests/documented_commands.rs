@@ -131,6 +131,7 @@ fn required_operation_guides_are_tracked_as_release_artifacts() {
         "docs/operations/chatgpt-mcp.md",
         "docs/operations/backup-restore.md",
         "docs/operations/diagnostics.md",
+        "docs/operations/linux-vault-topology.md",
         "docs/threat-model/cortex-v0.1.md",
     ] {
         assert!(
@@ -147,6 +148,21 @@ fn remote_pairing_guide_uses_the_owner_provisioning_command() {
     assert!(guide.contains("restart_required"));
 }
 
+#[test]
+fn linux_runbook_documents_the_replaceable_sync_topology() {
+    // SCRUM-135: the Linux process topology and the preferred Obsidian
+    // Headless Sync runbook are tracked release artifacts. The daemon is
+    // the single vault owner; sync is an external, replaceable unit and
+    // outages degrade with explicit freshness reporting.
+    let runbook = read("docs/operations/linux-vault-topology.md");
+    assert!(runbook.contains("cortexd.service"));
+    assert!(runbook.contains("obsidian-headless-sync.service"));
+    assert!(runbook.contains("Refresh=on-failure") || runbook.contains("Restart=on-failure"));
+    assert!(runbook.contains("single vault owner"));
+    assert!(runbook.contains("fresh"));
+    assert!(runbook.contains("reconcile_vault") || runbook.contains("reconciliation"));
+}
+
 fn all_documented_brain_commands() -> Vec<Vec<String>> {
     RELEASE_ARTIFACTS
         .iter()
@@ -154,10 +170,11 @@ fn all_documented_brain_commands() -> Vec<Vec<String>> {
         .collect()
 }
 
-const RELEASE_ARTIFACTS: [&str; 5] = [
+const RELEASE_ARTIFACTS: [&str; 6] = [
     "README.md",
     "docs/operations/local-setup.md",
     "docs/operations/chatgpt-mcp.md",
+    "docs/operations/linux-vault-topology.md",
     "docs/operations/backup-restore.md",
     "docs/operations/diagnostics.md",
 ];

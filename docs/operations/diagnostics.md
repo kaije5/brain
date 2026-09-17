@@ -53,6 +53,27 @@ Search output marks a semantic leg as degraded where applicable. Diagnose the
 provider by checking the configured base URL/model pair and opaque secret
 reference presence in the daemon environment, never by printing a secret.
 
+## Vault health in doctor and status
+
+`brain doctor` and `brain status` include a secret-free `vault` block
+(SCRUM-133). It reports configuration facts and derived-index state only —
+never vault content, principal identities, or credentials:
+
+- `configured`, `provider_id`, `root`, `mode`, `scopes`: the resolved vault
+  configuration exactly as the daemon opened it.
+- `root_accessible`: the configured root is present and usable right now.
+  `false` usually means a sync client owns a stale lock or the mount is gone.
+- `fresh`: the outcome of the last derived-index refresh. `false` means the
+  last rebuild failed — the previous index stays in place and remote state
+  must be treated as unknown until a refresh succeeds (see
+  `docs/operations/linux-vault-topology.md` for the sync-outage runbook).
+- `index`: counters from the last refresh — `refreshed_at`,
+  `indexed`/`unchanged`/`removed` (reconciler output) and `skipped`
+  (documents that failed bounded parsing; always a typed count, never a
+  crash).
+- `semantic`: `available` when a model embedding provider is configured,
+  `degraded` when retrieval runs lexical-only.
+
 ## Release evidence
 
 Run the documented-command contract and the wider release checks from the

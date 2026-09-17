@@ -74,6 +74,54 @@ fn confinement_accepts_ordinary_relative_paths() {
 }
 
 #[test]
+fn vault_relative_identity_is_platform_independent() {
+    // SCRUM-134: the same fixture must resolve to the same provider resource
+    // identity whether the caller (or a scan on another filesystem) hands the
+    // path over with `/` or the platform separator. Resource identity is
+    // always the canonical `/`-separated vault-relative path.
+    let directory = TempDir::new().expect("temp dir");
+    let provider = open_vault(directory.path());
+    let forward = provider
+        .confine("notes/2026/atlas.md", ProviderResourceKind::Knowledge)
+        .expect("forward-slash path confines");
+    // Callers address the provider with `/`-separated relative paths; the
+    // scanner applies exactly this normalization to platform walk output
+    // (see `indexable_paths`), so a document written on a Windows desktop
+    // and read on Linux addresses the same resource without domain changes.
+    let platform_relative = std::path::Path::new("notes")
+        .join("2026")
+        .join("atlas.md")
+        .to_str()
+        .expect("utf-8 path")
+        .replace('\\', "/");
+    let platform = provider
+        .confine(platform_relative.as_str(), ProviderResourceKind::Knowledge)
+        .expect("normalized platform path confines");
+    assert_eq!(platform.relative(), forward.relative());
+    assert_eq!(platform.absolute(), forward.absolute());
+
+    // The scanned walk yields `/`-separated identities on every platform, so
+    // documents written on a Windows desktop and read on Linux address the
+    // same resources without domain changes.
+    std::fs::create_dir_all(directory.path().join("notes").join("2026")).expect("notes directory");
+    std::fs::write(
+        directory.path().join("notes").join("2026").join("atlas.md"),
+        "# Atlas
+
+shared body
+",
+    )
+    .expect("seed note");
+    let scanned = provider.indexable_paths().expect("scan succeeds");
+    assert!(
+        scanned
+            .iter()
+            .any(|relative| relative == "notes/2026/atlas.md"),
+        "scanned identity matches the confined identity, got {scanned:?}"
+    );
+}
+
+#[test]
 fn traversal_and_absolute_paths_are_rejected() {
     let directory = TempDir::new().expect("temp dir");
     let provider = open_vault(directory.path());
