@@ -71,6 +71,12 @@ fn render_header(app: &App, area: Rect, buffer: &mut Buffer) {
         };
         spans.push(Span::styled(format!(" {label} "), style));
     }
+    // SCRUM-83: the active model is always visible in the header.
+    let model = app.active_model();
+    spans.push(Span::styled(
+        format!(" · {model}"),
+        Style::default().fg(Color::DarkGray),
+    ));
     Paragraph::new(Line::from(spans)).render(area, buffer);
 }
 

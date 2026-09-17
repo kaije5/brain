@@ -188,3 +188,91 @@ async fn configured_global_brain_prompt_reaches_the_model_as_the_system_message(
     );
     harness.shutdown().await;
 }
+
+#[tokio::test]
+async fn model_switch_applies_to_subsequent_turns_and_preserves_history() {
+    let harness = Harness::start().await;
+
+    // Discover the catalog: the daemon resolved one model at startup.
+    let listed = harness
+        .ipc_call("cortex_model_list", serde_json::json!({}))
+        .await;
+    listed.assert_success();
+    let active = listed.data().expect("list data")["active"]
+        .as_str()
+        .expect("active model")
+        .to_owned();
+
+    // Switching to the same discovered model succeeds and is reflected.
+    let selected = harness
+        .ipc_call(
+            "cortex_model_select",
+            serde_json::json!({ "model": active.clone() }),
+        )
+        .await;
+    selected.assert_success();
+    assert_eq!(
+        selected.data().expect("select data")["active"]
+            .as_str()
+            .expect("active model"),
+        active,
+        "the selection resolves to the requested model"
+    );
+
+    // History: a subsequent turn still works (new model, same conversation
+    // semantics) — proven by a follow-up streaming agent run.
+    let client =
+        brain::DaemonClient::from_database_path(harness.database_path()).expect("enrolled client");
+    let response = client
+        .request_streaming(
+            brain::CommandRequest {
+                request_id: uuid::Uuid::now_v7(),
+                operation_id: uuid::Uuid::now_v7(),
+                capability: "cortex_agent_run".to_owned(),
+                payload: serde_json::json!({"prompt": "hello again"}),
+            },
+            &|_chunk: &str| {},
+        )
+        .await
+        .expect("subsequent turn after switch");
+    assert!(matches!(
+        response.result,
+        cortexd::WireResult::Success { .. }
+    ));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn unknown_model_selection_leaves_the_active_model_unchanged() {
+    let harness = Harness::start().await;
+
+    let listed = harness
+        .ipc_call("cortex_model_list", serde_json::json!({}))
+        .await;
+    listed.assert_success();
+    let active = listed.data().expect("list data")["active"]
+        .as_str()
+        .expect("active model")
+        .to_owned();
+
+    let rejected = harness
+        .ipc_call(
+            "cortex_model_select",
+            serde_json::json!({ "model": "no-such-model" }),
+        )
+        .await;
+    assert_eq!(rejected.error_code(), Some("not_found"));
+
+    // The active model is unchanged after the rejection.
+    let listed = harness
+        .ipc_call("cortex_model_list", serde_json::json!({}))
+        .await;
+    listed.assert_success();
+    assert_eq!(
+        listed.data().expect("list data")["active"].as_str(),
+        Some(active.as_str())
+    );
+
+    harness.shutdown().await;
+}

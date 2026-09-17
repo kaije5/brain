@@ -156,6 +156,24 @@ pub struct OpenAiCompatibleConfig {
 }
 
 impl OpenAiCompatibleConfig {
+    /// Returns the config targeting another model on the same validated
+    /// endpoint/credential/timeout/limit settings (SCRUM-83 model switching).
+    ///
+    /// # Errors
+    /// Returns a validation error when the model identifier is invalid.
+    pub fn with_model(&self, model: impl Into<String>) -> Result<Self, ApplicationError> {
+        let model = model.into();
+        if model.trim().is_empty()
+            || model.len() > MAX_MODEL_NAME_BYTES
+            || model.chars().any(char::is_control)
+        {
+            return Err(ApplicationError::Validation { field: "model" });
+        }
+        let mut config = self.clone();
+        config.model = model;
+        Ok(config)
+    }
+
     /// Sets the stale-stream watchdog duration for SSE streams.
     #[must_use]
     pub fn with_stale_stream_timeout(mut self, stale_stream: Duration) -> Self {

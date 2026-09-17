@@ -17,3 +17,4 @@ pub use local_ops::{
     validate_profile_id,
 };
 pub use render::{CliEnvelope, error_hint, render_json, render_text};
+pub use tui::InputCommand;

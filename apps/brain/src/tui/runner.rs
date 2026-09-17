@@ -4,13 +4,17 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use super::{App, SettingsSummary, Tab};
+use super::{App, InputCommand, SettingsSummary, Tab};
 use crate::DaemonClient;
 use cortexd::{LocalSettings, data_directory};
 
 /// Async daemon effects applied back onto the state machine by the loop.
 enum Effect {
     Tasks(Result<Vec<(String, String)>, String>),
+    /// Active model + catalog snapshot from `cortex_model_list` (SCRUM-83).
+    ModelCatalog(Result<serde_json::Value, String>),
+    /// Newly active model after `cortex_model_select` (SCRUM-83).
+    ModelSelected(Result<String, String>),
     /// Freshness tag of the last vault task list (`current`/`stale`).
     VaultFreshness(Option<String>),
     /// Provider id of the daemon's configured vault, when present.
@@ -132,8 +136,18 @@ fn handle_key(
                 if app.chat_status() != &super::ChatStatus::Waiting
                     && !app.chat_input().trim().is_empty()
                 {
-                    app.submit_prompt();
-                    request_agent_reply(client, sender, app);
+                    match app.submit_input() {
+                        Some(InputCommand::Agent(_)) => {
+                            request_agent_reply(client, sender, app);
+                        }
+                        Some(InputCommand::ModelList) => {
+                            request_model_catalog(client, sender);
+                        }
+                        Some(InputCommand::ModelSelect(model)) => {
+                            request_model_select(client, sender, model);
+                        }
+                        None => {}
+                    }
                 }
             }
             Tab::Notes => {
@@ -246,6 +260,48 @@ fn apply_effect(app: &mut App, effect: Effect, client: &DaemonClient) {
             app.set_note_results(rows);
         }
         Effect::Notes(Err(code)) => app.set_status_line(format!("notes unavailable: {code}")),
+        Effect::ModelCatalog(Ok(value)) => {
+            // SCRUM-83: surface the active model and the offered catalog as
+            // assistant notes plus persistent header state.
+            let active = value
+                .get("active")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let models = value
+                .get("models")
+                .and_then(serde_json::Value::as_array)
+                .map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|model| model.as_str().map(str::to_owned))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let note = match &active {
+                Some(active) => format!("active model: {active}"),
+                None => "no model resolved".to_owned(),
+            };
+            app.push_assistant_note(note.clone());
+            if !models.is_empty() {
+                app.push_assistant_note(format!("available models: {}", models.join(", ")));
+            }
+            app.set_active_model(active, models);
+            app.set_status_line(note);
+        }
+        Effect::ModelCatalog(Err(code)) => {
+            app.set_status_line(format!("model catalog unavailable: {code}"));
+        }
+        Effect::ModelSelected(Ok(model)) => {
+            app.apply_model_switch(model.clone());
+            app.set_status_line(format!(
+                "switched to {model} for subsequent turns (history preserved)"
+            ));
+        }
+        Effect::ModelSelected(Err(code)) => {
+            app.set_status_line(format!(
+                "model switch rejected: {code} (active model unchanged)"
+            ));
+        }
         Effect::AgentChunk(chunk) => app.receive_agent_partial(&chunk),
         Effect::Agent(Ok(reply)) => app.receive_agent_reply(reply),
         Effect::Agent(Err(code)) => app.receive_agent_error(code),
@@ -322,6 +378,39 @@ fn request_notes(client: &DaemonClient, sender: mpsc::Sender<Effect>, query: Str
                 .collect()
         });
         let _ = sender.send(Effect::Notes(notes));
+    });
+}
+
+/// Fetches the active model and the discovered catalog (SCRUM-83).
+fn request_model_catalog(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        let result = send_capability(&client, "cortex_model_list", serde_json::json!({})).await;
+        let value = result.map(|values| values.first().cloned().unwrap_or(serde_json::Value::Null));
+        let _ = sender.send(Effect::ModelCatalog(value));
+    });
+}
+
+/// Selects a model for subsequent turns. The daemon rejects unknown models
+/// without touching the active selection (SCRUM-83).
+fn request_model_select(client: &DaemonClient, sender: mpsc::Sender<Effect>, model: String) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        let result = send_capability(
+            &client,
+            "cortex_model_select",
+            serde_json::json!({ "model": model }),
+        )
+        .await;
+        let value = result.map(|values| {
+            values
+                .first()
+                .and_then(|value| value.get("active"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        });
+        let _ = sender.send(Effect::ModelSelected(value));
     });
 }
 
