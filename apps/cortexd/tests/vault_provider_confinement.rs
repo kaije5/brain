@@ -103,8 +103,7 @@ fn vault_relative_identity_is_platform_independent() {
     // The scanned walk yields `/`-separated identities on every platform, so
     // documents written on a Windows desktop and read on Linux address the
     // same resources without domain changes.
-    std::fs::create_dir_all(directory.path().join("notes").join("2026"))
-        .expect("notes directory");
+    std::fs::create_dir_all(directory.path().join("notes").join("2026")).expect("notes directory");
     std::fs::write(
         directory.path().join("notes").join("2026").join("atlas.md"),
         "# Atlas
@@ -113,9 +112,7 @@ shared body
 ",
     )
     .expect("seed note");
-    let scanned = provider
-        .indexable_paths()
-        .expect("scan succeeds");
+    let scanned = provider.indexable_paths().expect("scan succeeds");
     assert!(
         scanned
             .iter()

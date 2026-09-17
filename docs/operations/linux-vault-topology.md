@@ -95,19 +95,20 @@ WantedBy=multi-user.target
   (debounced events + `reconcile_vault`); the derived index rebuilds from
   Markdown alone, so missed events cannot corrupt it.
 - Freshness is explicit: `brain doctor` / `brain status` report
-  `vault.fresh` (last index refresh outcome), `vault.root_accessible`,
+  `vault.fresh`, `vault.root_accessible` (live probe at diagnostics time),
   `vault.index.refreshed_at` and the per-refresh counters
   (`indexed`/`unchanged`/`removed`/`skipped`). `fresh: false` means the last
-  refresh failed — treat remote state as unknown until a refresh succeeds.
-- Conflicts are never merged silently: last-writer-wins per file with
-  revision checks; sync copies that duplicate a `brain_id` surface as typed
-  duplicate-identity errors (see `docs/operations/backup-restore.md` and the
-  adversarial vault tests).
+  refresh failed or the root is currently inaccessible — treat remote state
+  as unknown until a refresh succeeds.
+- Conflicts are never merged silently: writers perform revision checks and
+  conflicting updates fail with typed `conflict` errors; sync copies that
+  duplicate a `brain_id` surface as typed duplicate-identity errors (see
+  `docs/operations/backup-restore.md` and the adversarial vault tests).
 
 ## Backup and rebuild quick reference
 
-- Backup: stop nothing; copy the vault root and the SQLite database file while
-  `cortexd` is quiesced (`systemctl stop cortexd`), then restart. Full
+- Backup: quiesce the vault owner first (`systemctl stop cortexd`), copy the
+  vault root and the SQLite database file, then start the daemon again. Full
   procedure: `docs/operations/backup-restore.md`.
 - Index rebuild: `brain doctor` shows index state; a full rebuild is one
   daemon operation (`refresh_vault_index`), exercised by the

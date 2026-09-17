@@ -21,8 +21,11 @@ async fn vault_survives_adversarial_content_rebuild_and_reports_outage_health() 
 
     // Adversarial Markdown: a malformed frontmatter document and a
     // pathological unicode body must never crash ingestion.
-    std::fs::write(vault_root.join("broken.md"), "---\nnot: [closed\n---\nbody\n")
-        .expect("write malformed note");
+    std::fs::write(
+        vault_root.join("broken.md"),
+        "---\nnot: [closed\n---\nbody\n",
+    )
+    .expect("write malformed note");
     std::fs::write(
         vault_root.join("weird.md"),
         format!("# {}\n\nbody", "é".repeat(512)),
@@ -54,6 +57,10 @@ async fn vault_survives_adversarial_content_rebuild_and_reports_outage_health() 
     assert_eq!(vault["fresh"], serde_json::json!(true));
     let rendered = vault.to_string().to_lowercase();
     assert!(!rendered.contains("secret") && !rendered.contains("bearer"));
+    assert!(
+        !rendered.contains("probe body"),
+        "health output never carries vault content"
+    );
 
     // A sync outage removes the configured root: local operation continues
     // and health reports explicit staleness instead of failing silently.
@@ -71,6 +78,31 @@ async fn vault_survives_adversarial_content_rebuild_and_reports_outage_health() 
         serde_json::json!(false),
         "outage must be visible in diagnostics"
     );
+    assert_eq!(
+        vault["fresh"],
+        serde_json::json!(false),
+        "freshness must read stale/unknown while the root is gone"
+    );
+
+    // Recovery: the root returns and the next mutation restores full health.
+    std::fs::create_dir_all(&vault_root).expect("recreate vault root");
+    let recovered = harness
+        .ipc_call(
+            "cortex_note_create",
+            serde_json::json!({ "title": "recovery probe", "content": "recovered" }),
+        )
+        .await;
+    recovered.assert_success();
+    let vault = harness
+        .cli(&["brain", "doctor"])
+        .await
+        .data()
+        .expect("doctor data")
+        .get("vault")
+        .cloned()
+        .expect("vault health block");
+    assert_eq!(vault["root_accessible"], serde_json::json!(true));
+    assert_eq!(vault["fresh"], serde_json::json!(true));
 
     harness.shutdown().await;
 }

@@ -156,7 +156,10 @@ struct VaultHealth {
 }
 
 impl VaultHealth {
-    fn from_report(report: &crate::vault_watcher::ReconciliationReport, root_accessible: bool) -> Self {
+    fn from_report(
+        report: &crate::vault_watcher::ReconciliationReport,
+        root_accessible: bool,
+    ) -> Self {
         Self {
             refreshed_at: Some(chrono::Utc::now().to_rfc3339()),
             indexed: report.indexed,
@@ -561,19 +564,12 @@ impl LocalDaemon {
                 let mut index = DerivedVaultIndex::new();
                 let report = crate::vault_watcher::rebuild_vault(&vault, &mut index)
                     .map_err(|_| DaemonError::StartupFailed)?;
-                let mut health = VaultHealth::from_report(
-                    &report,
-                    vault_config.validate_root_access().is_ok(),
-                );
+                let mut health =
+                    VaultHealth::from_report(&report, vault_config.validate_root_access().is_ok());
                 health.fresh = true;
                 (Some(authority), Some(vault), index, health)
             }
-            None => (
-                None,
-                None,
-                DerivedVaultIndex::new(),
-                VaultHealth::default(),
-            ),
+            None => (None, None, DerivedVaultIndex::new(), VaultHealth::default()),
         };
         let vault_index = Arc::new(std::sync::RwLock::new(vault_index));
         let vault_health = Arc::new(std::sync::RwLock::new(vault_health));
@@ -642,8 +638,10 @@ impl LocalDaemon {
                 true
             }
             Err(_) => {
-                let mut health =
-                    self.vault_health.write().expect("vault health mutex poisoned");
+                let mut health = self
+                    .vault_health
+                    .write()
+                    .expect("vault health mutex poisoned");
                 health.fresh = false;
                 health.refreshed_at = Some(chrono::Utc::now().to_rfc3339());
                 health.root_accessible = root_accessible;
