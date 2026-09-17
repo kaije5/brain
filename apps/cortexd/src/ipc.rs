@@ -807,6 +807,12 @@ impl LocalDaemon {
             | "cortex_memory_delete"
             | "cortex_memory_restore" => {
                 let response = self.dispatch_mutation(principal_id, request).await?;
+                // Provider mutations changed vault content: refresh the
+                // derived index so retrieval and health stay current (the
+                // index lag for user surfaces is one mutation, not a scan
+                // interval). A failed refresh keeps the previous index and
+                // marks health stale; it never fails the mutation itself.
+                let _ = self.refresh_vault_index();
                 self.refresh_embedding(&response).await;
                 Ok(response)
             }
@@ -1664,7 +1670,13 @@ impl LocalDaemon {
         let health = self
             .vault_health
             .read()
-            .expect("vault health mutex poisoned");
+            .expect("vault health mutex poisoned")
+            .clone();
+        // Accessibility is evaluated live so a sync outage (mount loss,
+        // deleted root) is visible in diagnostics without waiting for the
+        // next refresh.
+        let root_accessible = config.validate_root_access().is_ok();
+        let fresh = health.fresh && root_accessible;
         let mut scopes: Vec<&str> = config
             .scopes()
             .iter()
@@ -1683,8 +1695,8 @@ impl LocalDaemon {
                 crate::vault::VaultProviderMode::ReadWrite => "read_write",
             },
             "scopes": scopes,
-            "root_accessible": health.root_accessible,
-            "fresh": health.fresh,
+            "root_accessible": root_accessible,
+            "fresh": fresh,
             "index": {
                 "refreshed_at": health.refreshed_at,
                 "indexed": health.indexed,
