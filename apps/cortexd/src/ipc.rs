@@ -628,25 +628,22 @@ impl LocalDaemon {
             .vault_index
             .write()
             .expect("vault index mutex poisoned");
-        match crate::vault_watcher::rebuild_vault(vault, &mut index) {
-            Ok(report) => {
-                *self
-                    .vault_health
-                    .write()
-                    .expect("vault health mutex poisoned") =
-                    VaultHealth::from_report(&report, root_accessible);
-                true
-            }
-            Err(_) => {
-                let mut health = self
-                    .vault_health
-                    .write()
-                    .expect("vault health mutex poisoned");
-                health.fresh = false;
-                health.refreshed_at = Some(chrono::Utc::now().to_rfc3339());
-                health.root_accessible = root_accessible;
-                false
-            }
+        if let Ok(report) = crate::vault_watcher::rebuild_vault(vault, &mut index) {
+            *self
+                .vault_health
+                .write()
+                .expect("vault health mutex poisoned") =
+                VaultHealth::from_report(&report, root_accessible);
+            true
+        } else {
+            let mut health = self
+                .vault_health
+                .write()
+                .expect("vault health mutex poisoned");
+            health.fresh = false;
+            health.refreshed_at = Some(chrono::Utc::now().to_rfc3339());
+            health.root_accessible = root_accessible;
+            false
         }
     }
 
