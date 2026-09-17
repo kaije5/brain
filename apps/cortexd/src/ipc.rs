@@ -205,6 +205,10 @@ pub struct LocalDaemon {
     /// The resolved model configuration, remembered so a mid-session model
     /// selection can rebuild the provider for subsequent turns (SCRUM-83).
     resolved_model: Arc<std::sync::RwLock<Option<ResolvedModelConfig>>>,
+    /// Coarse degradation reason from the last model-resolution attempt,
+    /// surfaced via `cortex_model_list` so clients can explain a missing
+    /// active model (SCRUM-178). Cleared when resolution succeeds.
+    model_degraded_reason: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 /// The resolved provider selection: everything needed to rebuild the
@@ -613,6 +617,7 @@ impl LocalDaemon {
             prompt,
             resolved_profile: Arc::new(std::sync::RwLock::new(None)),
             resolved_model: Arc::new(std::sync::RwLock::new(None)),
+            model_degraded_reason: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -690,6 +695,26 @@ impl LocalDaemon {
                 profile_id: profile_id.to_owned(),
             });
         }
+        if let Ok(mut reason) = self.model_degraded_reason.write() {
+            *reason = None;
+        }
+    }
+
+    /// Records why model inference is degraded so `cortex_model_list` can
+    /// report it; the reason is value-free by contract (SCRUM-178).
+    pub fn set_model_degraded_reason(&self, reason: &str) {
+        if let Ok(mut slot) = self.model_degraded_reason.write() {
+            *slot = Some(reason.to_owned());
+        }
+    }
+
+    /// The degradation reason from the last resolution attempt, if any.
+    #[must_use]
+    pub fn model_degraded_reason(&self) -> Option<String> {
+        self.model_degraded_reason
+            .read()
+            .ok()
+            .and_then(|reason| reason.clone())
     }
 
     /// The model the agent currently resolves to, if any (SCRUM-83).
@@ -1715,6 +1740,7 @@ impl LocalDaemon {
                 value: json!({
                     "models": self.discovered_models(),
                     "active": self.active_model(),
+                    "degraded_reason": self.model_degraded_reason(),
                     "profile": self
                         .resolved_profile
                         .read()
@@ -2487,6 +2513,50 @@ mod tests {
                 .expect("response JSON");
         serving.await.expect("server task").expect("wire request");
         response
+    }
+
+    #[tokio::test]
+    async fn model_list_reports_the_degraded_reason() {
+        let directory = TempDir::new().expect("temporary directory");
+        let daemon = LocalDaemon::start(DaemonConfig::for_test(directory.path()))
+            .await
+            .expect("daemon starts");
+        // Unresolved by default: the reason field is present and null.
+        let pending = daemon.model_list_response(Uuid::now_v7());
+        let WireResult::Success { value } = pending.result else {
+            panic!("model list must succeed");
+        };
+        assert_eq!(value["degraded_reason"], serde_json::Value::Null);
+        assert_eq!(value["active"], serde_json::Value::Null);
+
+        daemon.set_model_degraded_reason("provider_unavailable");
+        let degraded = daemon.model_list_response(Uuid::now_v7());
+        let WireResult::Success { value } = degraded.result else {
+            panic!("model list must succeed");
+        };
+        assert_eq!(value["degraded_reason"], json!("provider_unavailable"));
+
+        // A successful install clears the stale degradation.
+        daemon.set_model_degraded_reason("provider_unavailable");
+        daemon.install_resolved_model(
+            cortex_inference::OpenAiCompatibleConfig::new(
+                "http://127.0.0.1:9/v1",
+                "test-model",
+                None,
+                std::time::Duration::from_secs(5),
+                cortex_inference::ProviderLimits::new(1024, 1024, 8).expect("limits"),
+            )
+            .expect("config"),
+            None,
+            vec!["test-model".to_owned()],
+            "test-profile",
+        );
+        let installed = daemon.model_list_response(Uuid::now_v7());
+        let WireResult::Success { value } = installed.result else {
+            panic!("model list must succeed");
+        };
+        assert_eq!(value["degraded_reason"], serde_json::Value::Null);
+        assert_eq!(value["active"], json!("test-model"));
     }
 
     #[test]

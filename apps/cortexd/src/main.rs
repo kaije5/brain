@@ -76,6 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             ModelResolution::Degraded { reason, .. } => {
                 eprintln!("cortexd: model inference degraded: {reason}");
+                // SCRUM-178: publish the reason so clients can explain a
+                // missing active model instead of a bare failure.
+                resolve_daemon.set_model_degraded_reason(reason);
             }
         }
     });
