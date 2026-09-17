@@ -35,10 +35,31 @@ impl SqliteDatabase {
             .connect_with(options)
             .await
             .map_err(|_| storage_error("sqlite open failed"))?;
+        // Migration 6 renames legacy note grants. Older databases can already
+        // contain the replacement grant, so remove only redundant old rows.
+        let has_grants: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'capability_grant')",
+        )
+        .fetch_one(&pool)
+        .await
+        .map_err(|_| storage_error("sqlite grant preflight failed"))?;
+        if has_grants != 0 {
+            sqlx::query(include_str!("../sql/legacy_grant_preflight.sql"))
+                .execute(&pool)
+                .await
+                .map_err(|_| storage_error("sqlite grant preflight failed"))?;
+        }
         MIGRATOR
             .run(&pool)
             .await
             .map_err(|_| storage_error("sqlite migration failed"))?;
+        // Migration 6 also renamed the retired note restore grant, but there
+        // is no knowledge restore capability. Remove that unusable grant from
+        // databases upgraded earlier as well as databases upgraded here.
+        sqlx::query("DELETE FROM capability_grant WHERE capability = 'cortex_knowledge_restore'")
+            .execute(&pool)
+            .await
+            .map_err(|_| storage_error("sqlite grant cleanup failed"))?;
         Ok(Self { pool })
     }
 
