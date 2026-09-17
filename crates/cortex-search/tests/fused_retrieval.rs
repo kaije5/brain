@@ -4,11 +4,11 @@
 use std::num::NonZeroUsize;
 
 use cortex_domain::{
-    ContentHash, EntityId, ObservedRevision, ProviderId, ProviderProvenance, ProviderResourceId,
+    ContentHash, EntityId, ObservedRevision, ProviderId, ProviderResourceId,
     ProviderResourceKind, ProviderResourceRef, WorkspaceId,
 };
 use cortex_search::{
-    ChunkProvenance, ChunkReference, DerivedVaultIndex, FusedLeg, IndexedChunk, SearchHit,
+    ChunkProvenance, ChunkReference, DerivedVaultIndex, FusedLeg, SearchHit,
     fuse_with_memories, index_document,
 };
 
