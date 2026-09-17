@@ -75,6 +75,16 @@ pub const OFFICIAL_PROVIDERS: [ProviderPreset; 1] = [ProviderPreset {
     key_hint: "API key (nvapi-...) from build.nvidia.com",
 }];
 
+/// A saved enabled profile queued for a live connection check (SCRUM-179).
+/// Identifiers only — the raw API key never enters the draft or this target;
+/// the probe resolves the credential from the platform secret store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileProbe {
+    pub profile_id: String,
+    pub base_url: String,
+    pub secret_ref: Option<String>,
+}
+
 /// What a pending text edit is for inside the settings editor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TextPurpose {
@@ -512,6 +522,10 @@ pub struct App {
     note_results: Vec<String>,
     settings: Option<SettingsSummary>,
     editor: Option<SettingsEditor>,
+    /// Enabled profiles saved since the last drain, for live connection
+    /// verification (SCRUM-179). The runner drains this after each key so
+    /// network work never happens inside the state machine.
+    pending_probes: Vec<ProfileProbe>,
     status_line: String,
 }
 
@@ -533,6 +547,7 @@ impl Default for App {
             note_results: Vec::new(),
             settings: None,
             editor: None,
+            pending_probes: Vec::new(),
             status_line: String::new(),
         }
     }
@@ -884,6 +899,19 @@ impl App {
             .as_mut()
             .ok_or_else(|| "not editing".to_owned())?;
         editor.save(std::path::Path::new(&path))?;
+        // SCRUM-179: every enabled saved profile is queued for a live
+        // connection check; the runner drains the queue outside the state
+        // machine and reports the outcome back into the editor status.
+        self.pending_probes = editor
+            .profiles
+            .iter()
+            .filter(|profile| profile.enabled && !profile.base_url.is_empty())
+            .map(|profile| ProfileProbe {
+                profile_id: profile.id.clone(),
+                base_url: profile.base_url.clone(),
+                secret_ref: profile.secret_ref.clone(),
+            })
+            .collect();
         if let Some(summary) = self.settings.as_mut() {
             summary.default_profile.clone_from(&editor.default_profile);
             summary.profiles = editor
@@ -894,6 +922,29 @@ impl App {
         }
         "Settings saved; restart the daemon to apply.".clone_into(&mut self.status_line);
         Ok(())
+    }
+
+    /// Takes the profiles queued for connection verification since the last
+    /// save. Returns an empty vector when nothing was saved.
+    #[must_use]
+    pub fn take_pending_probes(&mut self) -> Vec<ProfileProbe> {
+        std::mem::take(&mut self.pending_probes)
+    }
+
+    /// Routes a completed connection check into the settings editor status
+    /// while the editor is open, or the global status line otherwise.
+    pub fn apply_probe_outcome(&mut self, profile_id: &str, outcome: Result<String, String>) {
+        let message = match outcome {
+            Ok(detail) => format!("connection verified for `{profile_id}`: {detail}"),
+            Err(error) => {
+                format!("connection check failed for `{profile_id}`: {error} (settings kept)")
+            }
+        };
+        if let Some(editor) = self.editor.as_mut() {
+            editor.status = Some(message);
+        } else {
+            self.status_line = message;
+        }
     }
 
     pub fn set_status_line(&mut self, text: String) {
