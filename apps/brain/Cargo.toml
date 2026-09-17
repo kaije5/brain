@@ -11,6 +11,8 @@ workspace = true
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.5", features = ["derive"] }
+cortex-application = { path = "../../crates/cortex-application" }
+cortex-inference = { path = "../../crates/cortex-inference" }
 cortexd = { path = "../cortexd" }
 crossterm = "0.29"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }

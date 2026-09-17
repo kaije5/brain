@@ -4,9 +4,13 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use super::{App, InputCommand, SettingsSummary, Tab};
+use super::{App, InputCommand, ProfileProbe, SettingsSummary, Tab};
 use crate::DaemonClient;
-use cortexd::{LocalSettings, data_directory};
+use cortex_application::ApplicationError;
+use cortex_inference::{OpenAiDiscoveryConfig, OpenAiModelDiscovery};
+use cortexd::{
+    LocalSettings, PlatformSecretStore, ReqwestOpenAiTransport, SecretRef, data_directory,
+};
 
 /// Builds the `/model` status note when the daemon has no active model
 /// (SCRUM-178): the daemon's coarse degraded reason becomes an actionable
@@ -18,7 +22,9 @@ fn degraded_model_note(value: &serde_json::Value) -> String {
         .unwrap_or("unresolved");
     let hint = match reason {
         "disabled" => "no [models] default_profile in cortexd.toml; add a provider in Settings",
-        "invalid_profiles" => "provider profiles failed to parse; check cortexd.toml for unknown or malformed keys",
+        "invalid_profiles" => {
+            "provider profiles failed to parse; check cortexd.toml for unknown or malformed keys"
+        }
         "default_profile_missing_or_disabled" => {
             "[models] default_profile points at a missing or disabled profile; fix it in Settings"
         }
@@ -31,7 +37,9 @@ fn degraded_model_note(value: &serde_json::Value) -> String {
         "routed_profile_credential_unavailable" => {
             "the profile's secret_ref has no credential in the platform secret store; re-enter the API key in Settings"
         }
-        "invalid_routing_policy" | "routed_profile_missing" | "invalid_provider_limits"
+        "invalid_routing_policy"
+        | "routed_profile_missing"
+        | "invalid_provider_limits"
         | "invalid_model_config" => "internal routing state invalid; check the daemon logs",
         _ => "check cortexd.toml and the daemon logs",
     };
@@ -50,6 +58,11 @@ enum Effect {
     /// Provider id of the daemon's configured vault, when present.
     VaultProvider(Option<String>),
     Notes(Result<Vec<String>, String>),
+    /// Outcome of the live provider connection check after a save (SCRUM-179).
+    ProfileVerified {
+        profile: String,
+        outcome: Result<String, String>,
+    },
     AgentChunk(String),
     Agent(Result<String, String>),
 }
@@ -76,6 +89,12 @@ pub async fn run_interactive() -> Result<(), String> {
             && key.kind == KeyEventKind::Press
         {
             handle_key(&mut app, key.code, key.modifiers, &client, sender.clone());
+        }
+        // SCRUM-179: a save queues enabled profiles for live connection
+        // verification; the loop drains them so network work stays outside
+        // the keyboard state machine (and out of its tests).
+        for probe in app.take_pending_probes() {
+            request_profile_verification(probe, sender.clone());
         }
         while let Ok(effect) = receiver.try_recv() {
             apply_effect(&mut app, effect, &client);
@@ -290,6 +309,9 @@ fn apply_effect(app: &mut App, effect: Effect, client: &DaemonClient) {
             app.set_note_results(rows);
         }
         Effect::Notes(Err(code)) => app.set_status_line(format!("notes unavailable: {code}")),
+        Effect::ProfileVerified { profile, outcome } => {
+            app.apply_probe_outcome(&profile, outcome);
+        }
         Effect::ModelCatalog(Ok(value)) => {
             // SCRUM-83: surface the active model and the offered catalog as
             // assistant notes plus persistent header state.
@@ -418,6 +440,69 @@ fn request_model_catalog(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
         let result = send_capability(&client, "cortex_model_list", serde_json::json!({})).await;
         let value = result.map(|values| values.first().cloned().unwrap_or(serde_json::Value::Null));
         let _ = sender.send(Effect::ModelCatalog(value));
+    });
+}
+
+/// Value-free, user-safe text for a typed inference failure (SCRUM-179).
+fn describe_inference_error(error: &ApplicationError) -> String {
+    match error {
+        ApplicationError::InferenceUnavailable => "provider unreachable".to_owned(),
+        ApplicationError::InferenceTimeout => "provider timed out".to_owned(),
+        ApplicationError::AuthenticationFailed => {
+            "credential rejected; re-check the stored API key".to_owned()
+        }
+        ApplicationError::RateLimited { .. } => "provider rate limited".to_owned(),
+        ApplicationError::QuotaExceeded => "provider quota exceeded".to_owned(),
+        ApplicationError::MalformedModelOutput { .. } => {
+            "response was not an OpenAI-compatible model list".to_owned()
+        }
+        _ => "provider request failed".to_owned(),
+    }
+}
+
+/// Verifies a saved profile against its provider live (SCRUM-179): discovery
+/// runs from the TUI process straight against the configured endpoint, the
+/// credential is resolved from the platform secret store and crosses only
+/// this transport boundary. The outcome lands back in the editor status.
+fn request_profile_verification(probe: ProfileProbe, sender: mpsc::Sender<Effect>) {
+    tokio::spawn(async move {
+        let outcome = async {
+            let secret_ref = match &probe.secret_ref {
+                Some(reference) => Some(
+                    SecretRef::new(reference.clone())
+                        .map_err(|_| "the stored secret reference is malformed".to_owned())?,
+                ),
+                None => None,
+            };
+            let bearer = secret_ref.as_ref().and_then(|reference| {
+                PlatformSecretStore
+                    .resolve_value(reference)
+                    .ok()
+                    .map(|value| value.as_str().to_owned())
+            });
+            if probe.secret_ref.is_some() && bearer.is_none() {
+                return Err(
+                    "no credential in the platform secret store; re-enter the API key".to_owned(),
+                );
+            }
+            let config = OpenAiDiscoveryConfig::new(
+                probe.base_url.clone(),
+                secret_ref,
+                Duration::from_secs(15),
+            )
+            .map_err(|error| format!("endpoint rejected: {}", describe_inference_error(&error)))?;
+            let discovery = OpenAiModelDiscovery::new(config, ReqwestOpenAiTransport::default());
+            let models = discovery
+                .discover(bearer.as_deref())
+                .await
+                .map_err(|error| describe_inference_error(&error))?;
+            Ok(format!("{} models offered", models.len()))
+        }
+        .await;
+        let _ = sender.send(Effect::ProfileVerified {
+            profile: probe.profile_id,
+            outcome,
+        });
     });
 }
 
@@ -634,10 +719,11 @@ mod tests {
             line.contains("secret store"),
             "status line must carry the recovery hint: {line}"
         );
-        assert!(app
-            .transcript()
-            .iter()
-            .any(|(_, text)| text.contains("available models: m-one")));
+        assert!(
+            app.transcript()
+                .iter()
+                .any(|(_, text)| text.contains("available models: m-one"))
+        );
     }
 
     #[test]
@@ -662,6 +748,55 @@ mod tests {
             }),
         );
         assert_eq!(app.status_line(), "active model: m-one");
+    }
+
+    #[test]
+    fn saving_queues_enabled_profiles_for_connection_verification() {
+        let directory = tempfile::TempDir::new().expect("temporary directory");
+        let mut app = App::new();
+        app.select_tab(Tab::Settings);
+        app.set_settings_summary(SettingsSummary {
+            config_path: directory
+                .path()
+                .join("cortexd.toml")
+                .to_string_lossy()
+                .into_owned(),
+            default_profile: Some("nim".to_owned()),
+            profiles: vec![
+                ("nim".to_owned(), "https://example.com/v1".to_owned(), true),
+                ("off".to_owned(), "https://example.com/v1".to_owned(), false),
+            ],
+            model_status: "ready".to_owned(),
+        });
+        app.start_settings_edit();
+        app.save_settings().expect("save succeeds");
+        let probes = app.take_pending_probes();
+        assert_eq!(probes.len(), 1, "only the enabled profile is probed");
+        assert_eq!(probes[0].profile_id, "nim");
+        assert_eq!(probes[0].base_url, "https://example.com/v1");
+        // A second save re-queues; draining empties the queue exactly once.
+        assert!(app.take_pending_probes().is_empty());
+    }
+
+    #[test]
+    fn probe_outcomes_land_in_the_editor_while_it_is_open() {
+        let mut app = editor();
+        app.apply_probe_outcome("nim", Ok("3 models offered".to_owned()));
+        assert_eq!(
+            app.settings_editor().unwrap().status(),
+            Some("connection verified for `nim`: 3 models offered")
+        );
+    }
+
+    #[test]
+    fn probe_failures_fall_back_to_the_status_line() {
+        let mut app = App::new();
+        app.apply_probe_outcome("nim", Err("provider unreachable".to_owned()));
+        assert!(
+            app.status_line()
+                .contains("connection check failed for `nim`")
+        );
+        assert!(app.status_line().contains("settings kept"));
     }
 
     fn editor() -> App {
