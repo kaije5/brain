@@ -1,4 +1,4 @@
-use brain::tui::{App, ChatStatus, Tab};
+use brain::tui::{App, ChatStatus, GrantRow, SettingsSection, Tab};
 use ratatui::{Terminal, backend::TestBackend};
 
 fn render_app(app: &App) -> String {
@@ -18,15 +18,30 @@ fn render_app(app: &App) -> String {
     text
 }
 
+fn settings_app() -> App {
+    let mut app = App::new();
+    app.select_tab(Tab::Settings);
+    app.set_settings_summary(brain::tui::SettingsSummary {
+        config_path: "C:\\data\\cortexd.toml".to_owned(),
+        default_profile: Some("nim".to_owned()),
+        profiles: vec![
+            ("nim".to_owned(), "https://nim.example/v1/".to_owned(), true),
+            (
+                "local".to_owned(),
+                "http://127.0.0.1:8000/v1/".to_owned(),
+                false,
+            ),
+        ],
+        model_status: "degraded: provider_unavailable".to_owned(),
+    });
+    app
+}
+
 #[test]
 fn chat_is_the_default_tab_and_tabs_switch() {
     let app = App::new();
     assert_eq!(app.tab, Tab::Chat);
     let mut app = app;
-    app.next_tab();
-    assert_eq!(app.tab, Tab::Tasks);
-    app.next_tab();
-    assert_eq!(app.tab, Tab::Notes);
     app.next_tab();
     assert_eq!(app.tab, Tab::Settings);
     app.next_tab();
@@ -87,60 +102,94 @@ fn unavailable_model_shows_an_explicit_degraded_state() {
 }
 
 #[test]
-fn tasks_tab_renders_fetched_rows_without_db_access() {
-    let mut app = App::new();
-    app.tab = Tab::Tasks;
-    app.set_tasks(vec![
-        ("Write the TUI".to_owned(), "open".to_owned()),
-        ("Ship SCRUM-67".to_owned(), "open".to_owned()),
+fn settings_menu_lists_navigable_sections() {
+    let app = settings_app();
+    let screen = render_app(&app);
+    assert!(screen.contains("Models"));
+    assert!(screen.contains("Permissions"));
+    assert!(screen.contains("Daemon"));
+}
+
+#[test]
+fn models_section_renders_profiles_through_the_editor() {
+    let mut app = settings_app();
+    app.open_settings_section();
+    assert!(app.settings_editor().is_some());
+    let screen = render_app(&app);
+    assert!(screen.contains("cortexd.toml") || screen.contains("Default profile"));
+    assert!(screen.contains("nim"));
+}
+
+#[test]
+fn permissions_section_lists_grants_and_flags_destructive_ones() {
+    let mut app = settings_app();
+    app.settings_menu_down();
+    app.open_settings_section();
+    app.set_grants(vec![
+        GrantRow {
+            name: "cortex_task_list".to_owned(),
+            description: "List tasks".to_owned(),
+            destructive: false,
+        },
+        GrantRow {
+            name: "cortex_knowledge_delete".to_owned(),
+            description: "Delete knowledge".to_owned(),
+            destructive: true,
+        },
     ]);
     let screen = render_app(&app);
-    assert!(screen.contains("Write the TUI"));
-    assert!(screen.contains("Ship SCRUM-67"));
+    assert!(screen.contains("cortex_task_list"));
+    assert!(screen.contains("List tasks"));
+    assert!(screen.contains("cortex_knowledge_delete"));
+    assert!(screen.contains("[destructive]"));
+    assert!(screen.contains("Read-only"));
 }
 
 #[test]
-fn notes_tab_renders_search_results() {
-    let mut app = App::new();
-    app.tab = Tab::Notes;
-    app.set_note_results(vec!["Cortex keeps canonical state".to_owned()]);
+fn daemon_section_renders_vault_and_config_location() {
+    let mut app = settings_app();
+    app.set_vault_provider(Some("markdown-vault".to_owned()));
+    app.settings_menu_down();
+    app.settings_menu_down();
+    app.open_settings_section();
     let screen = render_app(&app);
-    assert!(screen.contains("Cortex keeps canonical state"));
-}
+    assert!(screen.contains("vault: markdown-vault (configured)"));
+    assert!(screen.contains("C:\\data\\cortexd.toml"));
 
-#[test]
-fn settings_tab_renders_non_secret_config_and_profile() {
-    let mut app = App::new();
-    app.tab = Tab::Settings;
-    app.set_settings_summary(brain::tui::SettingsSummary {
-        config_path: "C:\\data\\cortexd.toml".to_owned(),
-        default_profile: Some("nim".to_owned()),
-        profiles: vec![
-            ("nim".to_owned(), "https://nim.example/v1/".to_owned(), true),
-            (
-                "local".to_owned(),
-                "http://127.0.0.1:8000/v1/".to_owned(),
-                false,
-            ),
-        ],
-        model_status: "degraded: provider_unavailable".to_owned(),
-    });
+    let mut app = settings_app();
+    app.settings_menu_down();
+    app.settings_menu_down();
+    app.open_settings_section();
     let screen = render_app(&app);
-    assert!(screen.contains("cortexd.toml"));
-    assert!(screen.contains("nim"));
-    assert!(screen.contains("degraded"));
+    assert!(screen.contains("vault: not configured"));
 }
 
 #[test]
 fn tiny_and_offset_viewports_do_not_panic() {
-    for tab in [Tab::Chat, Tab::Tasks, Tab::Notes, Tab::Settings] {
-        let mut app = App::new();
-        app.select_tab(tab);
-        for width in [0, 1, 12, 40, 80] {
-            for height in [0, 1, 2, 3, 6, 24] {
-                let area = ratatui::layout::Rect::new(2, 3, width, height);
-                let mut buffer = ratatui::buffer::Buffer::empty(area);
-                brain::tui::render(&app, area, &mut buffer);
+    for tab in [Tab::Chat, Tab::Settings] {
+        for menu in [
+            None,
+            Some(SettingsSection::Models),
+            Some(SettingsSection::Permissions),
+            Some(SettingsSection::Daemon),
+        ] {
+            let mut app = App::new();
+            app.select_tab(tab);
+            if menu.is_some() {
+                app.set_settings_summary(brain::tui::SettingsSummary {
+                    config_path: "unused".to_owned(),
+                    default_profile: None,
+                    profiles: Vec::new(),
+                    model_status: "ready".to_owned(),
+                });
+                app.open_settings_section();
+            }
+            for width in [0, 1, 12, 40, 80] {
+                for height in [0, 1, 2, 3, 6, 24] {
+                    let area = ratatui::layout::Rect::new(2, 3, width, height);
+                    let mut buffer = ratatui::buffer::Buffer::empty(area);
+                    brain::tui::render(&app, area, &mut buffer);
+                }
             }
         }
     }
@@ -148,17 +197,11 @@ fn tiny_and_offset_viewports_do_not_panic() {
 
 #[test]
 fn empty_screens_explain_the_next_step_and_quit_shortcut() {
-    for (tab, message) in [
-        (Tab::Chat, "Start a conversation"),
-        (Tab::Tasks, "No tasks"),
-        (Tab::Notes, "Type at least 2 characters"),
-    ] {
-        let mut app = App::new();
-        app.select_tab(tab);
-        let screen = render_app(&app);
-        assert!(screen.contains(message), "{screen}");
-        assert!(screen.contains("Ctrl+C"));
-    }
+    let mut app = App::new();
+    app.select_tab(Tab::Chat);
+    let screen = render_app(&app);
+    assert!(screen.contains("Start a conversation"), "{screen}");
+    assert!(screen.contains("Ctrl+C"));
 }
 
 #[test]
@@ -208,83 +251,12 @@ fn wrapped_history_keeps_latest_reply_and_failure_visible() {
 }
 
 #[test]
-fn loaded_status_does_not_replace_contextual_shortcuts() {
+fn settings_without_a_loaded_summary_say_so_instead_of_panicking() {
     let mut app = App::new();
-    app.select_tab(Tab::Tasks);
-    app.set_tasks(vec![("A task".to_owned(), "open".to_owned())]);
-    app.set_status_line("1 tasks loaded".to_owned());
-    assert!(render_app(&app).contains("r: refresh"));
-}
-
-#[test]
-fn stale_task_index_renders_the_degraded_banner_above_rows() {
-    let mut app = App::new();
-    app.tab = Tab::Tasks;
-    app.set_task_freshness(Some("stale".to_owned()));
-    app.set_tasks(vec![("Write the TUI".to_owned(), "open".to_owned())]);
+    app.select_tab(Tab::Settings);
     let screen = render_app(&app);
-    assert!(screen.contains("vault index is stale"));
-    assert!(screen.contains("(degraded)"));
-    // Rows remain visible below the banner.
-    assert!(screen.contains("Write the TUI"));
-}
-
-#[test]
-fn current_task_index_renders_without_the_degraded_banner() {
-    let mut app = App::new();
-    app.tab = Tab::Tasks;
-    app.set_task_freshness(Some("current".to_owned()));
-    app.set_tasks(vec![("Write the TUI".to_owned(), "open".to_owned())]);
-    let screen = render_app(&app);
-    assert!(!screen.contains("vault index is stale"));
-    assert!(screen.contains("Write the TUI"));
-}
-
-#[test]
-fn empty_tasks_with_a_stale_index_still_explain_the_degraded_state() {
-    let mut app = App::new();
-    app.tab = Tab::Tasks;
-    app.set_task_freshness(Some("stale".to_owned()));
-    let screen = render_app(&app);
-    assert!(screen.contains("vault index is stale"));
-    assert!(screen.contains("No tasks to show"));
-}
-
-#[test]
-fn conflict_recovery_is_visible_in_the_status_line() {
-    let mut app = App::new();
-    app.set_status_line("tasks unavailable: conflict (vault changed; refreshing)".to_owned());
-    let screen = render_app(&app);
-    assert!(screen.contains("conflict"));
-    assert!(screen.contains("refreshing"));
-    assert!(screen.contains("tasks unavailable"));
-}
-
-#[test]
-fn settings_tab_shows_the_configured_vault_and_index_state() {
-    let mut app = App::new();
-    app.tab = Tab::Settings;
-    app.set_vault_provider(Some("markdown-vault".to_owned()));
-    app.set_task_freshness(Some("stale".to_owned()));
-    app.set_settings_summary(brain::tui::SettingsSummary {
-        config_path: "C:/data/cortexd.toml".to_owned(),
-        default_profile: None,
-        profiles: Vec::new(),
-        model_status: "ready".to_owned(),
-    });
-    let screen = render_app(&app);
-    assert!(screen.contains("vault: markdown-vault (configured)"));
-    assert!(screen.contains("task index: stale (degraded)"));
-
-    let mut app = App::new();
-    app.tab = Tab::Settings;
-    app.set_settings_summary(brain::tui::SettingsSummary {
-        config_path: "C:/data/cortexd.toml".to_owned(),
-        default_profile: None,
-        profiles: Vec::new(),
-        model_status: "ready".to_owned(),
-    });
-    let screen = render_app(&app);
-    assert!(screen.contains("vault: not configured"));
-    assert!(screen.contains("task index: current"));
+    assert!(screen.contains("Settings unavailable"));
+    // Opening a section is refused while nothing loaded.
+    assert!(!app.open_settings_section());
+    assert_eq!(app.settings_menu(), None);
 }

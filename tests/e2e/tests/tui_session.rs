@@ -42,9 +42,9 @@ fn request(capability: &str, payload: serde_json::Value) -> DaemonRequest {
 }
 
 /// Drives the TUI state machine non-interactively against a real daemon:
-/// a task write goes through the policy-checked IPC path, the tasks tab
-/// renders the canonical state, and the chat tab degrades explicitly when
-/// the fake model endpoint is stopped.
+/// a task write goes through the policy-checked IPC path, the permissions
+/// section renders the grants `cortex_daemon_status` reports, and the chat
+/// tab degrades explicitly when the fake model endpoint is stopped.
 #[tokio::test]
 async fn tui_renders_real_daemon_state_and_degrades_without_a_model() {
     let harness = Harness::start().await;
@@ -57,32 +57,41 @@ async fn tui_renders_real_daemon_state_and_degrades_without_a_model() {
         ))
         .await
         .expect("policy-checked task write through cortexd");
-    let listed = client
-        .request(&request("cortex_task_list", json!({"limit": 20})))
+    let status = client
+        .request(&request("cortex_daemon_status", json!({})))
         .await
-        .expect("task list through cortexd");
+        .expect("daemon status through cortexd");
 
     let mut app = App::new();
-    if let cortexd::WireResult::Success { value } = listed.result {
-        // v2 lists are freshness-tagged envelopes of typed task rows.
-        let rows = value["tasks"]
+    if let cortexd::WireResult::Success { value } = status.result {
+        let grants = value["grants"]
             .as_array()
-            .expect("task list array")
+            .expect("grants array")
             .iter()
-            .filter_map(|task| {
-                Some((
-                    task.get("title")?.as_str()?.to_owned(),
-                    task.get("status")?.as_str()?.to_owned(),
-                ))
+            .filter_map(|grant| grant.as_str())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert!(
+            grants.contains(&"cortex_task_create".to_owned()),
+            "the owner principal must hold the task.create grant"
+        );
+        app.select_tab(Tab::Settings);
+        app.settings_menu_down();
+        app.open_settings_section();
+        let rows = grants
+            .into_iter()
+            .map(|name| brain::tui::GrantRow {
+                destructive: name.ends_with("_delete"),
+                name,
+                description: String::new(),
             })
             .collect();
-        app.set_tasks(rows);
+        app.set_grants(rows);
     }
-    app.select_tab(Tab::Tasks);
     let screen = render_app(&app);
     assert!(
-        screen.to_lowercase().contains("drive-the-tui-end-to-end"),
-        "tasks tab must render canonical daemon state, got:\n{screen}"
+        screen.contains("cortex_task_create") && screen.contains("[destructive]"),
+        "permissions section must render daemon grants, got:\n{screen}"
     );
 
     // Stopping the fake model endpoint leaves deterministic tabs working

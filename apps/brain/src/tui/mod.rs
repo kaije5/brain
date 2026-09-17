@@ -9,21 +9,57 @@ use ratatui::Terminal;
 
 /// Top-level TUI tabs. Chat is the default view; everything is a view over
 /// the same typed daemon capabilities the one-shot CLI uses — the TUI holds
-/// no direct database access.
+/// no direct database access. Settings is a menu over user-configurable
+/// sections (SCRUM-180); vault task and note overviews live on the CLI and
+/// MCP surfaces, not the TUI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tab {
     Chat,
-    Tasks,
-    Notes,
     Settings,
 }
 
-pub const TAB_LABELS: [(&str, Tab); 4] = [
-    ("Chat", Tab::Chat),
-    ("Tasks", Tab::Tasks),
-    ("Notes", Tab::Notes),
-    ("Settings", Tab::Settings),
+pub const TAB_LABELS: [(&str, Tab); 2] = [("Chat", Tab::Chat), ("Settings", Tab::Settings)];
+
+/// One navigable section of the settings tab (SCRUM-180). Enter opens a
+/// section from the menu, Esc returns to it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SettingsSection {
+    /// Provider profiles, the default model and keyring credentials.
+    Models,
+    /// Capabilities the daemon granted to the local principal (read-only).
+    Permissions,
+    /// Vault, model status and config location.
+    Daemon,
+}
+
+/// Menu entries in display order.
+pub const SETTINGS_SECTIONS: [(SettingsSection, &str, &str); 3] = [
+    (
+        SettingsSection::Models,
+        "Models",
+        "provider profiles, default model and API keys",
+    ),
+    (
+        SettingsSection::Permissions,
+        "Permissions",
+        "capabilities granted to this TUI",
+    ),
+    (
+        SettingsSection::Daemon,
+        "Daemon",
+        "vault, model status and config location",
+    ),
 ];
+
+/// One granted capability as shown in the permissions section: the stable
+/// mcp name, its documented purpose, and whether it can mutate or destroy
+/// vault state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrantRow {
+    pub name: String,
+    pub description: String,
+    pub destructive: bool,
+}
 
 /// Chat readiness. `Degraded` is explicit: when no eligible model is
 /// configured or the provider is unavailable, the chat tab says so while the
@@ -499,18 +535,19 @@ pub struct App {
     chat_status: ChatStatus,
     transcript: Vec<(String, String)>,
     partial_reply: Option<String>,
-    tasks: Vec<(String, String)>,
     /// The model the agent currently resolves to (SCRUM-83).
     active_model: Option<String>,
     /// Models offered by routing for mid-session selection.
     available_models: Vec<String>,
-    /// Freshness tag of the last vault task list: `None` until one loads.
-    task_freshness: Option<String>,
     /// Provider id of the daemon's configured vault, when present.
     vault_provider: Option<String>,
-    notes_query: String,
-    note_results: Vec<String>,
+    /// Capabilities granted to the local principal, from `cortex_daemon_status`.
+    grants: Vec<GrantRow>,
     settings: Option<SettingsSummary>,
+    /// The settings section currently open; `None` shows the menu.
+    settings_menu: Option<SettingsSection>,
+    /// Highlighted row of the settings menu.
+    settings_cursor: usize,
     editor: Option<SettingsEditor>,
     status_line: String,
 }
@@ -524,14 +561,13 @@ impl Default for App {
             chat_status: ChatStatus::Ready,
             transcript: Vec::new(),
             partial_reply: None,
-            tasks: Vec::new(),
             active_model: None,
             available_models: Vec::new(),
-            task_freshness: None,
             vault_provider: None,
-            notes_query: String::new(),
-            note_results: Vec::new(),
+            grants: Vec::new(),
             settings: None,
+            settings_menu: None,
+            settings_cursor: 0,
             editor: None,
             status_line: String::new(),
         }
@@ -555,20 +591,13 @@ impl App {
 
     pub fn next_tab(&mut self) {
         self.tab = match self.tab {
-            Tab::Chat => Tab::Tasks,
-            Tab::Tasks => Tab::Notes,
-            Tab::Notes => Tab::Settings,
+            Tab::Chat => Tab::Settings,
             Tab::Settings => Tab::Chat,
         };
     }
 
     pub fn previous_tab(&mut self) {
-        self.tab = match self.tab {
-            Tab::Chat => Tab::Settings,
-            Tab::Tasks => Tab::Chat,
-            Tab::Notes => Tab::Tasks,
-            Tab::Settings => Tab::Notes,
-        };
+        self.next_tab();
     }
 
     pub fn select_tab(&mut self, tab: Tab) {
@@ -705,21 +734,6 @@ impl App {
         self.partial_reply.as_deref()
     }
 
-    pub fn set_tasks(&mut self, rows: Vec<(String, String)>) {
-        self.tasks = rows;
-    }
-
-    /// Records the freshness tag of the last vault task list.
-    pub fn set_task_freshness(&mut self, freshness: Option<String>) {
-        self.task_freshness = freshness;
-    }
-
-    /// Whether the last vault task list reported a stale (degraded) index.
-    #[must_use]
-    pub fn task_index_stale(&self) -> bool {
-        self.task_freshness.as_deref() == Some("stale")
-    }
-
     /// Records the provider id of the daemon's configured vault, if any.
     pub fn set_vault_provider(&mut self, provider_id: Option<String>) {
         self.vault_provider = provider_id;
@@ -730,37 +744,60 @@ impl App {
         self.vault_provider.as_deref()
     }
 
-    #[must_use]
-    pub fn tasks(&self) -> &[(String, String)] {
-        &self.tasks
-    }
-
-    pub fn push_note_query(&mut self, character: char) {
-        self.notes_query.push(character);
-    }
-
-    pub fn backspace_note_query(&mut self) {
-        self.notes_query.pop();
+    /// Replaces the granted-capability rows shown in the permissions section.
+    pub fn set_grants(&mut self, grants: Vec<GrantRow>) {
+        self.grants = grants;
     }
 
     #[must_use]
-    pub fn note_query(&self) -> &str {
-        &self.notes_query
-    }
-
-    /// Consumes the staged note query for the runner's search request.
-    pub fn take_note_query(&mut self) -> Option<String> {
-        let query = self.notes_query.trim().to_owned();
-        (query.len() >= 2).then_some(query)
-    }
-
-    pub fn set_note_results(&mut self, results: Vec<String>) {
-        self.note_results = results;
+    pub fn grants(&self) -> &[GrantRow] {
+        &self.grants
     }
 
     #[must_use]
-    pub fn note_results(&self) -> &[String] {
-        &self.note_results
+    pub const fn settings_menu(&self) -> Option<SettingsSection> {
+        self.settings_menu
+    }
+
+    #[must_use]
+    pub const fn settings_cursor(&self) -> usize {
+        self.settings_cursor
+    }
+
+    pub fn settings_menu_up(&mut self) {
+        self.settings_cursor = self.settings_cursor.saturating_sub(1);
+    }
+
+    pub fn settings_menu_down(&mut self) {
+        if self.settings_cursor + 1 < SETTINGS_SECTIONS.len() {
+            self.settings_cursor += 1;
+        }
+    }
+
+    /// Opens the highlighted settings section. Models needs the loaded
+    /// summary to draft from; without it the section stays closed and the
+    /// status line explains why.
+    pub fn open_settings_section(&mut self) -> bool {
+        let Some((section, _, _)) = SETTINGS_SECTIONS.get(self.settings_cursor) else {
+            return false;
+        };
+        if *section == SettingsSection::Models && self.settings.is_none() {
+            "settings unavailable: config could not be loaded".clone_into(&mut self.status_line);
+            return false;
+        }
+        if *section == SettingsSection::Models {
+            self.start_settings_edit();
+        }
+        self.settings_menu = Some(*section);
+        true
+    }
+
+    /// Returns from a section to the settings menu.
+    pub fn close_settings_section(&mut self) {
+        self.settings_menu = None;
+        if self.settings_cursor >= SETTINGS_SECTIONS.len() {
+            self.settings_cursor = SETTINGS_SECTIONS.len().saturating_sub(1);
+        }
     }
 
     pub fn set_settings_summary(&mut self, summary: SettingsSummary) {
@@ -884,6 +921,7 @@ impl App {
             .as_mut()
             .ok_or_else(|| "not editing".to_owned())?;
         editor.save(std::path::Path::new(&path))?;
+        self.settings_menu = Some(SettingsSection::Models);
         if let Some(summary) = self.settings.as_mut() {
             summary.default_profile.clone_from(&editor.default_profile);
             summary.profiles = editor

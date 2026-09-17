@@ -1,4 +1,7 @@
-use super::{App, ChatStatus, SettingsEditor, TAB_LABELS, Tab, TextPurpose};
+use super::{
+    App, ChatStatus, GrantRow, SETTINGS_SECTIONS, SettingsEditor, SettingsSection, TAB_LABELS, Tab,
+    TextPurpose,
+};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
@@ -47,8 +50,6 @@ pub fn render(app: &App, area: Rect, buffer: &mut Buffer) {
     render_header(app, header, buffer);
     match app.tab {
         Tab::Chat => render_chat(app, body, buffer),
-        Tab::Tasks => render_tasks(app, body, buffer),
-        Tab::Notes => render_notes(app, body, buffer),
         Tab::Settings => render_settings(app, body, buffer),
     }
     render_footer(app, footer, buffer);
@@ -136,16 +137,14 @@ fn render_chat(app: &App, area: Rect, buffer: &mut Buffer) {
             lines.push(Line::styled("▌", Style::default().fg(Color::Green)));
         } else {
             lines.push(Line::styled(
-                "Thinking... You can browse the other tabs while waiting.",
+                "Thinking... You can browse Settings while waiting.",
                 Style::default().fg(Color::Yellow),
             ));
         }
     }
     if let ChatStatus::Degraded(code) = &app.chat_status {
         lines.push(Line::styled(
-            format!(
-                "DEGRADED: {code}. Open Settings to check your model. Tasks and notes still work."
-            ),
+            format!("DEGRADED: {code}. Open Settings to check your model."),
             Style::default().fg(Color::Yellow),
         ));
     }
@@ -161,124 +160,107 @@ fn render_chat(app: &App, area: Rect, buffer: &mut Buffer) {
     input(&app.chat_input, " Message · Enter to send ", prompt, buffer);
 }
 
-fn render_tasks(app: &App, area: Rect, buffer: &mut Buffer) {
-    // The degraded state is always visible before task content: a stale
-    // index means rows may lag recent vault edits.
-    if app.task_index_stale() {
-        let [banner, rest] =
-            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
-        paragraph(
-            vec![Line::styled(
-                "!! vault index is stale - results may lag recent edits (degraded)",
-                Style::default().fg(Color::Red),
-            )],
-            " Tasks ",
-            banner,
-            buffer,
-        );
-        render_task_rows(app, rest, buffer);
-        return;
-    }
-    render_task_rows(app, area, buffer);
-}
-
-fn render_task_rows(app: &App, area: Rect, buffer: &mut Buffer) {
-    if app.tasks.is_empty() {
-        paragraph(
-            vec![
-                Line::styled("No tasks to show", accent()),
-                Line::from("Your tasks appear here when loaded. Press r to refresh."),
-            ],
-            " Tasks ",
-            area,
-            buffer,
-        );
-        return;
-    }
-    let items: Vec<_> = app
-        .tasks
-        .iter()
-        .map(|(title, status)| {
-            let color = match status.as_str() {
-                "done" | "completed" => Color::Green,
-                "blocked" => Color::Red,
-                _ => Color::Yellow,
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("[{status}] "), Style::default().fg(color)),
-                Span::raw(title),
-            ]))
-        })
-        .collect();
-    List::new(items)
-        .block(panel(" Tasks "))
-        .render(area, buffer);
-}
-
-fn render_notes(app: &App, area: Rect, buffer: &mut Buffer) {
-    let [query, results] =
-        Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(area);
-    input(
-        &app.notes_query,
-        " Search · Enter to search ",
-        query,
-        buffer,
-    );
-    let lines = if app.note_results.is_empty() {
-        vec![Line::from(
-            "Type at least 2 characters and press Enter to search your notes.",
-        )]
-    } else {
-        app.note_results
-            .iter()
-            .flat_map(|snippet| [Line::from(snippet.as_str()), Line::default()])
-            .collect()
-    };
-    paragraph(lines, " Notes and memories ", results, buffer);
-}
-
+/// The settings tab is a menu (SCRUM-180): Enter opens a section, Esc goes
+/// back one level. The models editor keeps its full-screen layout once open.
 fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
     if let Some(editor) = app.settings_editor() {
         render_editor(editor, area, buffer);
         return;
     }
-    let mut lines = vec![Line::styled(
-        "e: edit settings · Enter: edit settings",
-        accent(),
-    )];
-    if let Some(summary) = &app.settings {
-        if summary.profiles.is_empty() {
-            lines.push(Line::styled("Set up your first model", accent()));
-            lines.push(Line::from("Press a to add the official NVIDIA NIM adapter — you only supply an API key from build.nvidia.com. Or press Enter, then n for a custom profile and endpoint."));
-        }
-        lines.extend([
-            Line::from(format!(
-                "default profile: {}",
-                summary
-                    .default_profile
-                    .as_deref()
-                    .unwrap_or("(none configured)")
-            )),
-            Line::from(format!("model status: {}", summary.model_status)),
-            Line::default(),
-        ]);
-        for (id, url, enabled) in &summary.profiles {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("{} ", if *enabled { "[enabled]" } else { "[disabled]" }),
-                    Style::default().fg(if *enabled {
-                        Color::Green
-                    } else {
-                        Color::Yellow
-                    }),
-                ),
-                Span::raw(format!("{id} @ {url}")),
-            ]));
-        }
-        lines.push(Line::default());
-        // The configured vault authority and the last observed task-index
-        // freshness are surfaced so degradation is visible without leaving
-        // the TUI.
+    match app.settings_menu() {
+        Some(SettingsSection::Permissions) => render_permissions(app, area, buffer),
+        Some(SettingsSection::Daemon) => render_daemon(app, area, buffer),
+        // Models renders through the editor; the bare section is reachable
+        // only when no config summary loaded, which the editor needs.
+        Some(SettingsSection::Models) | None => render_settings_menu(app, area, buffer),
+    }
+}
+
+fn render_settings_menu(app: &App, area: Rect, buffer: &mut Buffer) {
+    if app.settings_summary().is_none() {
+        paragraph(
+            vec![Line::styled(
+                "Settings unavailable",
+                Style::default().fg(Color::Yellow),
+            )],
+            " Settings ",
+            area,
+            buffer,
+        );
+        return;
+    }
+    let items: Vec<ListItem<'_>> = SETTINGS_SECTIONS
+        .iter()
+        .map(|(_, title, description)| {
+            ListItem::new(vec![
+                Line::from(Span::styled(*title, accent())),
+                Line::from(Span::styled(
+                    *description,
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+        })
+        .collect();
+    let mut state = ListState::default().with_selected(Some(app.settings_cursor()));
+    ratatui::widgets::StatefulWidget::render(
+        List::new(items)
+            .block(panel(" Settings "))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› "),
+        area,
+        buffer,
+        &mut state,
+    );
+}
+
+fn render_permissions(app: &App, area: Rect, buffer: &mut Buffer) {
+    let mut lines = vec![Line::from("Capabilities the daemon granted to this TUI:")];
+    if app.grants().is_empty() {
+        lines.push(Line::styled(
+            "Loading granted capabilities...",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    for grant in app.grants() {
+        lines.push(render_grant_line(grant));
+        lines.push(Line::from(Span::styled(
+            format!("    {}", grant.description),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled(
+        "Read-only: grants change at daemon bootstrap or remote enrollment, not here.",
+        Style::default().fg(Color::DarkGray),
+    ));
+    paragraph(lines, " Settings · Permissions ", area, buffer);
+}
+
+fn render_grant_line(grant: &GrantRow) -> Line<'_> {
+    if grant.destructive {
+        Line::from(vec![
+            Span::styled("[destructive] ", Style::default().fg(Color::Red)),
+            Span::raw(grant.name.clone()),
+        ])
+    } else {
+        Line::from(Span::raw(grant.name.clone()))
+    }
+}
+
+fn render_daemon(app: &App, area: Rect, buffer: &mut Buffer) {
+    let mut lines = Vec::new();
+    if let Some(summary) = app.settings_summary() {
+        lines.push(Line::from(format!(
+            "model status: {}",
+            summary.model_status
+        )));
+        // The configured vault authority is surfaced so degradation is
+        // visible without leaving the TUI.
         lines.push(Line::from(vec![
             Span::styled("vault: ", accent()),
             Span::raw(match app.vault_provider() {
@@ -286,14 +268,6 @@ fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
                 None => "not configured".to_owned(),
             }),
         ]));
-        lines.push(Line::from(format!(
-            "task index: {}",
-            if app.task_index_stale() {
-                "stale (degraded)"
-            } else {
-                "current"
-            }
-        )));
         lines.push(Line::default());
         lines.push(Line::from(format!("config: {}", summary.config_path)));
         lines.push(Line::from(
@@ -305,14 +279,14 @@ fn render_settings(app: &App, area: Rect, buffer: &mut Buffer) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    paragraph(lines, " Settings ", area, buffer);
+    paragraph(lines, " Settings · Daemon ", area, buffer);
 }
 
 fn render_editor(editor: &SettingsEditor, area: Rect, buffer: &mut Buffer) {
     let title = if editor.dirty {
-        " Settings · unsaved changes "
+        " Settings · Models · unsaved changes "
     } else {
-        " Settings editor "
+        " Settings · Models "
     };
     let block = panel(title);
     let inner = block.inner(area);
@@ -476,17 +450,24 @@ fn render_editor_details(editor: &SettingsEditor, area: Rect, buffer: &mut Buffe
 fn render_footer(app: &App, area: Rect, buffer: &mut Buffer) {
     let context = match app.tab {
         Tab::Chat => "Enter: send · Esc: stay in Chat",
-        Tab::Tasks => "r: refresh · Esc: Chat",
-        Tab::Notes => "Enter: search · Esc: Chat",
-        Tab::Settings => "Enter: edit/confirm · Esc: back/cancel",
+        Tab::Settings => {
+            if app.settings_editor().is_some() {
+                "Enter: edit/confirm · Esc: back to the menu"
+            } else if app.settings_menu().is_some() {
+                "Esc: back to the menu"
+            } else {
+                "Enter: open section · e: Models · Esc: Chat"
+            }
+        }
     };
-    let navigation = if app.tab == Tab::Settings
+    let prompt_active = app.tab == Tab::Settings
         && app.settings_editor().is_some_and(|e| {
             e.input.is_some()
                 || e.confirm_delete.is_some()
                 || e.confirm_discard
                 || e.provider_picker().is_some()
-        }) {
+        });
+    let navigation = if prompt_active {
         "Enter: confirm · Esc: cancel · Ctrl+C: quit"
     } else {
         "Tab/Shift+Tab: switch · Ctrl+C: quit"

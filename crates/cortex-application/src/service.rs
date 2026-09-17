@@ -33,6 +33,24 @@ impl CapabilityGrant {
             capability,
         }
     }
+
+    /// The workspace the grant is scoped to.
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    /// The granted principal.
+    #[must_use]
+    pub const fn principal_id(&self) -> PrincipalId {
+        self.principal_id
+    }
+
+    /// The granted capability.
+    #[must_use]
+    pub const fn capability(&self) -> Capability {
+        self.capability
+    }
 }
 
 /// The policy boundary evaluated by Cortex before every capability invocation.

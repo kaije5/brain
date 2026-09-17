@@ -4,22 +4,21 @@ use std::time::Duration;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use super::{App, InputCommand, SettingsSummary, Tab};
+use super::{App, GrantRow, InputCommand, SettingsSummary, Tab};
 use crate::DaemonClient;
-use cortexd::{LocalSettings, data_directory};
+use cortexd::{Capability, LocalSettings, data_directory};
 
 /// Async daemon effects applied back onto the state machine by the loop.
 enum Effect {
-    Tasks(Result<Vec<(String, String)>, String>),
     /// Active model + catalog snapshot from `cortex_model_list` (SCRUM-83).
     ModelCatalog(Result<serde_json::Value, String>),
     /// Newly active model after `cortex_model_select` (SCRUM-83).
     ModelSelected(Result<String, String>),
-    /// Freshness tag of the last vault task list (`current`/`stale`).
-    VaultFreshness(Option<String>),
-    /// Provider id of the daemon's configured vault, when present.
-    VaultProvider(Option<String>),
-    Notes(Result<Vec<String>, String>),
+    /// Vault identity and granted capabilities from `cortex_daemon_status`.
+    VaultStatus {
+        provider: Option<String>,
+        grants: Vec<GrantRow>,
+    },
     AgentChunk(String),
     Agent(Result<String, String>),
 }
@@ -36,7 +35,6 @@ pub async fn run_interactive() -> Result<(), String> {
     let mut terminal = enable_terminal().map_err(|error| error.to_string())?;
     let (sender, receiver) = mpsc::channel::<Effect>();
     let mut app = App::new();
-    request_tasks(&client, sender.clone());
     request_vault_status(&client, sender.clone());
     request_settings(&mut app);
 
@@ -79,16 +77,9 @@ fn handle_key(
         if !text_modifiers(modifiers) {
             return;
         }
-        match app.tab {
-            Tab::Chat => {
-                app.push_chat_input(c);
-                return;
-            }
-            Tab::Notes => {
-                app.push_note_query(c);
-                return;
-            }
-            _ => {}
+        if app.tab == Tab::Chat {
+            app.push_chat_input(c);
+            return;
         }
     }
     match code {
@@ -101,6 +92,8 @@ fn handle_key(
                         app.cancel_settings_edit();
                     }
                 }
+            } else if app.tab == Tab::Settings && app.settings_menu().is_some() {
+                app.close_settings_section();
             } else {
                 app.select_tab(Tab::Chat);
             }
@@ -109,18 +102,11 @@ fn handle_key(
         KeyCode::Tab if modifiers.contains(KeyModifiers::SHIFT) => app.previous_tab(),
         KeyCode::Tab => app.next_tab(),
         KeyCode::Char('1') => app.select_tab(Tab::Chat),
-        KeyCode::Char('2') => app.select_tab(Tab::Tasks),
-        KeyCode::Char('3') => app.select_tab(Tab::Notes),
-        KeyCode::Char('4') => app.select_tab(Tab::Settings),
-        KeyCode::Up => app.editor_up(),
-        KeyCode::Down => app.editor_down(),
-        KeyCode::Char('r') if app.tab == Tab::Tasks => {
-            app.set_status_line("Refreshing tasks...".to_owned());
-            request_tasks(client, sender);
-        }
+        KeyCode::Char('2') => app.select_tab(Tab::Settings),
+        KeyCode::Up => move_cursor_up(app),
+        KeyCode::Down => move_cursor_down(app),
         KeyCode::Backspace => match app.tab {
             Tab::Chat => app.backspace_chat_input(),
-            Tab::Notes => app.backspace_note_query(),
             Tab::Settings => {
                 if let Some(editor) = app.settings_editor()
                     && editor.pending_purpose().is_some()
@@ -128,7 +114,6 @@ fn handle_key(
                     app.editor_text_backspace();
                 }
             }
-            Tab::Tasks => {}
         },
         KeyCode::Enter => match app.tab {
             Tab::Settings => handle_settings_enter(app),
@@ -150,29 +135,42 @@ fn handle_key(
                     }
                 }
             }
-            Tab::Notes => {
-                if let Some(query) = app.take_note_query() {
-                    app.set_status_line("Searching notes...".to_owned());
-                    request_notes(client, sender, query);
-                } else {
-                    app.set_status_line("Type at least 2 characters to search.".to_owned());
-                }
-            }
-            Tab::Tasks => {}
         },
         KeyCode::Char(character) => match app.tab {
             Tab::Chat => app.push_chat_input(character),
-            Tab::Notes => app.push_note_query(character),
             Tab::Settings => handle_settings_char(app, character),
-            Tab::Tasks => {}
         },
         _ => {}
     }
 }
 
+/// Up/Down move the active settings list: the editor rows while editing,
+/// otherwise the section menu.
+fn move_cursor_up(app: &mut App) {
+    if app.tab != Tab::Settings {
+        return;
+    }
+    if app.settings_editor().is_some() {
+        app.editor_up();
+    } else if app.settings_menu().is_none() {
+        app.settings_menu_up();
+    }
+}
+
+fn move_cursor_down(app: &mut App) {
+    if app.tab != Tab::Settings {
+        return;
+    }
+    if app.settings_editor().is_some() {
+        app.editor_down();
+    } else if app.settings_menu().is_none() {
+        app.settings_menu_down();
+    }
+}
+
 fn handle_settings_enter(app: &mut App) {
     let Some(editor) = app.settings_editor() else {
-        app.start_settings_edit();
+        app.open_settings_section();
         return;
     };
     if editor.pending_purpose().is_some() || editor.pending_confirm().is_some() {
@@ -207,7 +205,8 @@ fn handle_settings_enter(app: &mut App) {
 fn handle_settings_char(app: &mut App, character: char) {
     let Some(editor) = app.settings_editor() else {
         if character == 'e' {
-            app.start_settings_edit();
+            app.settings_cursor = 0;
+            app.open_settings_section();
         }
         return;
     };
@@ -237,29 +236,10 @@ fn handle_settings_char(app: &mut App, character: char) {
 
 fn apply_effect(app: &mut App, effect: Effect, client: &DaemonClient) {
     match effect {
-        Effect::Tasks(Ok(rows)) => {
-            app.set_status_line(format!("{} tasks loaded", rows.len()));
-            app.set_tasks(rows);
+        Effect::VaultStatus { provider, grants } => {
+            app.set_vault_provider(provider);
+            app.set_grants(grants);
         }
-        Effect::Tasks(Err(code)) => {
-            // Typed provider errors surface with actionable recovery text;
-            // the raw code stays machine-parseable in parentheses.
-            let recovery = match code.as_str() {
-                "conflict" => "vault changed; refreshing",
-                "not_found" => "a task vanished; refreshing",
-                "permission_denied" => "this principal lacks the task.list grant",
-                _ => "check the daemon and vault configuration",
-            };
-            app.set_status_line(format!("tasks unavailable: {code} ({recovery})"));
-            app.set_tasks(Vec::new());
-        }
-        Effect::VaultFreshness(freshness) => app.set_task_freshness(freshness),
-        Effect::VaultProvider(provider) => app.set_vault_provider(provider),
-        Effect::Notes(Ok(rows)) => {
-            app.set_status_line(format!("{} notes found", rows.len()));
-            app.set_note_results(rows);
-        }
-        Effect::Notes(Err(code)) => app.set_status_line(format!("notes unavailable: {code}")),
         Effect::ModelCatalog(Ok(value)) => {
             // SCRUM-83: surface the active model and the offered catalog as
             // assistant notes plus persistent header state.
@@ -277,16 +257,14 @@ fn apply_effect(app: &mut App, effect: Effect, client: &DaemonClient) {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let note = match &active {
-                Some(active) => format!("active model: {active}"),
-                None => "no model resolved".to_owned(),
-            };
-            app.push_assistant_note(note.clone());
+            app.push_assistant_note(format!(
+                "active model: {}",
+                active.as_deref().unwrap_or("(none)")
+            ));
             if !models.is_empty() {
                 app.push_assistant_note(format!("available models: {}", models.join(", ")));
             }
             app.set_active_model(active, models);
-            app.set_status_line(note);
         }
         Effect::ModelCatalog(Err(code)) => {
             app.set_status_line(format!("model catalog unavailable: {code}"));
@@ -309,75 +287,48 @@ fn apply_effect(app: &mut App, effect: Effect, client: &DaemonClient) {
     let _ = client;
 }
 
-fn request_tasks(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
-    let client = client.clone();
-    tokio::spawn(async move {
-        let result = send_capability(
-            &client,
-            "cortex_task_list",
-            serde_json::json!({ "limit": 50 }),
-        )
-        .await;
-        let mut freshness = None;
-        let rows = result.map(|values| {
-            // v2 lists are freshness-tagged envelopes of typed task rows; the
-            // tag drives the degraded-state banner in the Tasks tab.
-            values
-                .iter()
-                .filter_map(|value| {
-                    freshness = value
-                        .get("freshness")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned);
-                    value.get("tasks")?.as_array()
-                })
-                .flatten()
-                .filter_map(|task| {
-                    Some((
-                        task.get("title")?.as_str()?.to_owned(),
-                        task.get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("unknown")
-                            .to_owned(),
-                    ))
-                })
-                .collect()
-        });
-        let _ = sender.send(Effect::VaultFreshness(freshness));
-        let _ = sender.send(Effect::Tasks(rows));
-    });
-}
-
-/// Fetches the daemon's configured vault identity for the Settings tab.
+/// Fetches the daemon's configured vault identity and the capabilities
+/// granted to the local principal (SCRUM-180) for the settings sections.
 fn request_vault_status(client: &DaemonClient, sender: mpsc::Sender<Effect>) {
     let client = client.clone();
     tokio::spawn(async move {
         let result = send_capability(&client, "cortex_daemon_status", serde_json::json!({})).await;
-        let provider = result.ok().and_then(|values| {
-            values.first().and_then(|status| {
-                status["vault"]["configured"]
-                    .as_bool()
-                    .filter(|configured| *configured)
-                    .and_then(|_| status["vault"]["provider_id"].as_str().map(str::to_owned))
+        let status = result.ok().and_then(|values| values.first().cloned());
+        let provider = status.as_ref().and_then(|status| {
+            status["vault"]["configured"]
+                .as_bool()
+                .filter(|configured| *configured)
+                .and_then(|_| status["vault"]["provider_id"].as_str().map(str::to_owned))
+        });
+        let grants = status
+            .as_ref()
+            .and_then(|status| status["grants"].as_array())
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_owned))
+                    .map(|name| {
+                        let metadata = Capability::from_mcp_name(&name).map(|capability| {
+                            let metadata = capability.metadata();
+                            (metadata.mcp_description.to_owned(), metadata.destructive)
+                        });
+                        match metadata {
+                            Some((description, destructive)) => GrantRow {
+                                name,
+                                description,
+                                destructive,
+                            },
+                            None => GrantRow {
+                                name,
+                                description: "undocumented capability".to_owned(),
+                                destructive: false,
+                            },
+                        }
+                    })
+                    .collect()
             })
-        });
-        let _ = sender.send(Effect::VaultProvider(provider));
-    });
-}
-
-fn request_notes(client: &DaemonClient, sender: mpsc::Sender<Effect>, query: String) {
-    let client = client.clone();
-    tokio::spawn(async move {
-        let payload = serde_json::json!({"query": query, "limit": 20});
-        let result = send_capability(&client, "cortex_knowledge_search", payload.clone()).await;
-        let notes = result.map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.get("snippet").and_then(serde_json::Value::as_str))
-                .map(str::to_owned)
-                .collect()
-        });
-        let _ = sender.send(Effect::Notes(notes));
+            .unwrap_or_default();
+        let _ = sender.send(Effect::VaultStatus { provider, grants });
     });
 }
 
@@ -562,7 +513,7 @@ fn handle_settings_prompt(app: &mut App, code: KeyCode, modifiers: KeyModifiers)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::TextPurpose;
+    use crate::tui::{SettingsSection, TextPurpose};
 
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         let (sender, _receiver) = mpsc::channel();
@@ -575,6 +526,33 @@ mod tests {
         );
     }
 
+    fn apply_catalog(app: &mut App, value: serde_json::Value) {
+        apply_effect(
+            app,
+            Effect::ModelCatalog(Ok(value)),
+            &DaemonClient::for_keyboard_tests(),
+        );
+    }
+
+    #[test]
+    fn resolved_catalog_reports_the_active_model_and_catalog() {
+        let mut app = App::new();
+        apply_catalog(
+            &mut app,
+            serde_json::json!({
+                "active": "m-one",
+                "models": ["m-one", "m-two"],
+            }),
+        );
+        assert_eq!(app.active_model(), "m-one");
+        assert_eq!(app.available_models(), ["m-one", "m-two"]);
+        assert!(
+            app.transcript()
+                .iter()
+                .any(|(_, text)| text.contains("available models: m-one, m-two"))
+        );
+    }
+
     fn editor() -> App {
         let mut app = App::new();
         app.select_tab(Tab::Settings);
@@ -584,13 +562,15 @@ mod tests {
             profiles: vec![("nim".to_owned(), "https://example.com/v1".to_owned(), true)],
             model_status: "ready".to_owned(),
         });
-        app.start_settings_edit();
+        // Opening the Models section through the menu is how the editor is
+        // reached in the real flow.
+        app.open_settings_section();
         app
     }
 
     #[test]
     fn text_fields_receive_q_digits_and_shifted_characters() {
-        for tab in [Tab::Chat, Tab::Notes, Tab::Settings] {
+        for tab in [Tab::Chat, Tab::Settings] {
             let mut app = editor();
             app.select_tab(tab);
             if tab == Tab::Settings {
@@ -611,8 +591,7 @@ mod tests {
             assert_eq!(app.tab, tab);
             let text = match tab {
                 Tab::Chat => app.chat_input(),
-                Tab::Notes => app.note_query(),
-                _ => app.settings_editor().unwrap().pending_text().unwrap(),
+                Tab::Settings => app.settings_editor().unwrap().pending_text().unwrap(),
             };
             assert_eq!(text, "q1234Q!");
             if tab == Tab::Settings {
@@ -801,5 +780,73 @@ mod tests {
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.settings_editor().is_none());
         assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn closing_the_editor_returns_to_the_settings_menu() {
+        let mut app = editor();
+        assert_eq!(app.settings_menu(), Some(SettingsSection::Models));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.settings_editor().is_none());
+        assert_eq!(app.settings_menu(), Some(SettingsSection::Models));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.settings_menu(), None);
+        assert_eq!(app.tab, Tab::Settings);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.tab, Tab::Chat);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn enter_opens_the_highlighted_section_and_esc_returns() {
+        let mut app = App::new();
+        app.select_tab(Tab::Settings);
+        app.set_settings_summary(SettingsSummary {
+            config_path: "unused".to_owned(),
+            default_profile: None,
+            profiles: Vec::new(),
+            model_status: "ready".to_owned(),
+        });
+        // Down twice highlights Daemon.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.settings_menu(), Some(SettingsSection::Daemon));
+        assert!(app.settings_editor().is_none());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.settings_menu(), None);
+        // The cursor stays where the user left it.
+        assert_eq!(app.settings_cursor(), 2);
+    }
+
+    #[test]
+    fn permissions_section_is_reachable_and_read_only() {
+        let mut app = App::new();
+        app.select_tab(Tab::Settings);
+        app.set_settings_summary(SettingsSummary {
+            config_path: "unused".to_owned(),
+            default_profile: None,
+            profiles: Vec::new(),
+            model_status: "ready".to_owned(),
+        });
+        app.settings_menu_down();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.settings_menu(), Some(SettingsSection::Permissions));
+        apply_effect(
+            &mut app,
+            Effect::VaultStatus {
+                provider: Some("markdown-vault".to_owned()),
+                grants: vec![GrantRow {
+                    name: "cortex_task_delete".to_owned(),
+                    description: "Delete a task".to_owned(),
+                    destructive: true,
+                }],
+            },
+            &DaemonClient::for_keyboard_tests(),
+        );
+        let screen = crate::tui::render_to_string(&app, 100, 30);
+        assert!(screen.contains("cortex_task_delete"));
+        assert!(screen.contains("[destructive]"));
+        assert!(screen.contains("Read-only"));
     }
 }

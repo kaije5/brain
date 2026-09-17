@@ -1742,9 +1742,26 @@ impl LocalDaemon {
                     "principal_id": Uuid::from(principal_id).to_string(),
                     "migrations_applied": self.migrations_applied,
                     "vault": self.vault_health_json(),
+                    "grants": self.principal_grants_json(principal_id),
                 }),
             },
         }
+    }
+
+    /// Read-only mcp names of the capabilities granted to one principal.
+    /// Diagnostic surface only: changing grants happens at daemon bootstrap
+    /// or remote enrollment, never through this response.
+    fn principal_grants_json(&self, principal_id: PrincipalId) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .grants
+            .iter()
+            .filter(|grant| {
+                grant.workspace_id() == self.workspace_id && grant.principal_id() == principal_id
+            })
+            .map(|grant| grant.capability().metadata().mcp_name)
+            .collect();
+        names.sort_unstable();
+        names
     }
 
     /// Secret-free vault health for doctor/status: configuration facts

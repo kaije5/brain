@@ -15,7 +15,7 @@ mod windows_security;
 
 pub use client::AuthenticatedIpcClient;
 pub use config::{DaemonConfig, InferenceBearer, PromptConfig};
-pub use cortex_application::SecretRef;
+pub use cortex_application::{Capability, CapabilityCatalog, SecretRef};
 pub use cortex_inference::ReqwestOpenAiTransport;
 pub use governed::GovernedVaultProvider;
 pub use ipc::{
