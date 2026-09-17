@@ -12,7 +12,6 @@ members = [
     "apps/cortex-mcp-gateway",
     "crates/cortex-mcp",
     "tests/e2e",
-    "fuzz",
 ]
 resolver = "3"
 
