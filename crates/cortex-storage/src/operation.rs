@@ -4,8 +4,8 @@ use cortex_application::{
     RecordedOperation,
 };
 use cortex_domain::{
-    AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion, Note, OperationId,
-    PolicyDecision, PrincipalId, ResourceTarget, Revision, Source, Task, WorkspaceId,
+    AuditEvent, AuditEventId, AuditResult, EntityId, Lifecycle, MemoryAssertion, OperationId,
+    PolicyDecision, PrincipalId, ResourceTarget, Revision, Source, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,10 +15,7 @@ use uuid::Uuid;
 use crate::{
     audit::{decode_target, encode_target, insert_event_in_transaction},
     database::storage_error,
-    repositories::{
-        decode_lifecycle, encode_lifecycle, encode_memory_status, encode_task_status, id_text,
-        parse_id,
-    },
+    repositories::{decode_lifecycle, encode_lifecycle, encode_memory_status, id_text, parse_id},
 };
 
 #[derive(Clone)]
@@ -492,14 +489,6 @@ async fn sync_search_document(
     change: &AggregateChange,
 ) -> Result<(), ApplicationError> {
     let entity = match change {
-        AggregateChange::InsertNote(note) => Some(("note", note.id())),
-        AggregateChange::ReplaceNote { entity_id, .. }
-        | AggregateChange::DeleteNote { entity_id, .. }
-        | AggregateChange::RestoreNote { entity_id, .. } => Some(("note", *entity_id)),
-        AggregateChange::InsertTask(task) => Some(("task", task.id())),
-        AggregateChange::ReplaceTask { entity_id, .. }
-        | AggregateChange::DeleteTask { entity_id, .. }
-        | AggregateChange::RestoreTask { entity_id, .. } => Some(("task", *entity_id)),
         AggregateChange::InsertMemory(memory) => Some(("memory", memory.id())),
         AggregateChange::ReplaceMemory { entity_id, .. }
         | AggregateChange::DeleteMemory { entity_id, .. }
@@ -547,14 +536,6 @@ async fn active_search_snippet(
     kind: &str,
 ) -> Result<Option<String>, ApplicationError> {
     let query = match kind {
-        "note" => {
-            "SELECT title || char(10) || content FROM note \
-             WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'"
-        }
-        "task" => {
-            "SELECT title FROM task \
-             WHERE workspace_id = ? AND id = ? AND lifecycle = 'active'"
-        }
         "memory" => {
             "SELECT statement FROM memory_assertion \
              WHERE workspace_id = ? AND id = ? AND lifecycle = 'active' AND status = 'active'"
@@ -579,18 +560,6 @@ async fn apply_change(
     change: &AggregateChange,
 ) -> Result<(), ApplicationError> {
     match change {
-        AggregateChange::InsertNote(_)
-        | AggregateChange::ReplaceNote { .. }
-        | AggregateChange::DeleteNote { .. }
-        | AggregateChange::RestoreNote { .. } => {
-            apply_note_change(transaction, workspace_id, change).await
-        }
-        AggregateChange::InsertTask(_)
-        | AggregateChange::ReplaceTask { .. }
-        | AggregateChange::DeleteTask { .. }
-        | AggregateChange::RestoreTask { .. } => {
-            apply_task_change(transaction, workspace_id, change).await
-        }
         AggregateChange::InsertMemory(_)
         | AggregateChange::ReplaceMemory { .. }
         | AggregateChange::DeleteMemory { .. }
@@ -604,112 +573,6 @@ async fn apply_change(
             memory_id,
             source_id,
         } => insert_memory_source(transaction, workspace_id, *memory_id, *source_id).await,
-    }
-}
-
-async fn apply_note_change(
-    transaction: &mut Transaction<'_, Sqlite>,
-    workspace_id: WorkspaceId,
-    change: &AggregateChange,
-) -> Result<(), ApplicationError> {
-    match change {
-        AggregateChange::InsertNote(note) => insert_note(transaction, workspace_id, note).await,
-        AggregateChange::ReplaceNote {
-            entity_id,
-            expected_revision,
-            note,
-        } => {
-            replace_note(
-                transaction,
-                workspace_id,
-                *entity_id,
-                *expected_revision,
-                note,
-            )
-            .await
-        }
-        AggregateChange::DeleteNote {
-            entity_id,
-            expected_revision,
-        } => {
-            set_lifecycle(
-                transaction,
-                "note",
-                workspace_id,
-                *entity_id,
-                *expected_revision,
-                Lifecycle::Deleted,
-            )
-            .await
-        }
-        AggregateChange::RestoreNote {
-            entity_id,
-            expected_revision,
-        } => {
-            set_lifecycle(
-                transaction,
-                "note",
-                workspace_id,
-                *entity_id,
-                *expected_revision,
-                Lifecycle::Active,
-            )
-            .await
-        }
-        _ => Err(ApplicationError::Internal),
-    }
-}
-
-async fn apply_task_change(
-    transaction: &mut Transaction<'_, Sqlite>,
-    workspace_id: WorkspaceId,
-    change: &AggregateChange,
-) -> Result<(), ApplicationError> {
-    match change {
-        AggregateChange::InsertTask(task) => insert_task(transaction, workspace_id, task).await,
-        AggregateChange::ReplaceTask {
-            entity_id,
-            expected_revision,
-            task,
-        } => {
-            replace_task(
-                transaction,
-                workspace_id,
-                *entity_id,
-                *expected_revision,
-                task,
-            )
-            .await
-        }
-        AggregateChange::DeleteTask {
-            entity_id,
-            expected_revision,
-        } => {
-            set_lifecycle(
-                transaction,
-                "task",
-                workspace_id,
-                *entity_id,
-                *expected_revision,
-                Lifecycle::Deleted,
-            )
-            .await
-        }
-        AggregateChange::RestoreTask {
-            entity_id,
-            expected_revision,
-        } => {
-            set_lifecycle(
-                transaction,
-                "task",
-                workspace_id,
-                *entity_id,
-                *expected_revision,
-                Lifecycle::Active,
-            )
-            .await
-        }
-        _ => Err(ApplicationError::Internal),
     }
 }
 
@@ -766,116 +629,6 @@ async fn apply_memory_change(
         }
         _ => Err(ApplicationError::Internal),
     }
-}
-
-async fn insert_note(
-    transaction: &mut Transaction<'_, Sqlite>,
-    workspace_id: WorkspaceId,
-    note: &Note,
-) -> Result<(), ApplicationError> {
-    ensure_workspace(workspace_id, note.workspace_id())?;
-    sqlx::query(
-        "INSERT INTO note (id, workspace_id, title, content, revision, lifecycle) \
-         VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind(id_text(note.id()))
-    .bind(id_text(workspace_id))
-    .bind(note.title())
-    .bind(note.content())
-    .bind(revision_i64(note.revision())?)
-    .bind(encode_lifecycle(note.lifecycle()))
-    .execute(&mut **transaction)
-    .await
-    .map_err(|_| storage_error("note insert failed"))?;
-    Ok(())
-}
-
-async fn replace_note(
-    transaction: &mut Transaction<'_, Sqlite>,
-    workspace_id: WorkspaceId,
-    entity_id: EntityId,
-    expected_revision: Revision,
-    note: &Note,
-) -> Result<(), ApplicationError> {
-    ensure_replacement(
-        workspace_id,
-        entity_id,
-        expected_revision,
-        note.workspace_id(),
-        note.id(),
-        note.revision(),
-    )?;
-    let result = sqlx::query(
-        "UPDATE note SET title = ?, content = ?, revision = ?, lifecycle = ?, \
-         updated_at = CURRENT_TIMESTAMP WHERE workspace_id = ? AND id = ? AND revision = ?",
-    )
-    .bind(note.title())
-    .bind(note.content())
-    .bind(revision_i64(note.revision())?)
-    .bind(encode_lifecycle(note.lifecycle()))
-    .bind(id_text(workspace_id))
-    .bind(id_text(entity_id))
-    .bind(revision_i64(expected_revision)?)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|_| storage_error("note replace failed"))?;
-    require_updated(result.rows_affected(), "note")
-}
-
-async fn insert_task(
-    transaction: &mut Transaction<'_, Sqlite>,
-    workspace_id: WorkspaceId,
-    task: &Task,
-) -> Result<(), ApplicationError> {
-    ensure_workspace(workspace_id, task.workspace_id())?;
-    sqlx::query(
-        "INSERT INTO task (id, workspace_id, title, due_at, status, revision, lifecycle) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(id_text(task.id()))
-    .bind(id_text(workspace_id))
-    .bind(task.title())
-    .bind(task.due_at().map(|value| value.to_rfc3339()))
-    .bind(encode_task_status(task.status()))
-    .bind(revision_i64(task.revision())?)
-    .bind(encode_lifecycle(task.lifecycle()))
-    .execute(&mut **transaction)
-    .await
-    .map_err(|_| storage_error("task insert failed"))?;
-    Ok(())
-}
-
-async fn replace_task(
-    transaction: &mut Transaction<'_, Sqlite>,
-    workspace_id: WorkspaceId,
-    entity_id: EntityId,
-    expected_revision: Revision,
-    task: &Task,
-) -> Result<(), ApplicationError> {
-    ensure_replacement(
-        workspace_id,
-        entity_id,
-        expected_revision,
-        task.workspace_id(),
-        task.id(),
-        task.revision(),
-    )?;
-    let result = sqlx::query(
-        "UPDATE task SET title = ?, due_at = ?, status = ?, revision = ?, lifecycle = ?, \
-         updated_at = CURRENT_TIMESTAMP WHERE workspace_id = ? AND id = ? AND revision = ?",
-    )
-    .bind(task.title())
-    .bind(task.due_at().map(|value| value.to_rfc3339()))
-    .bind(encode_task_status(task.status()))
-    .bind(revision_i64(task.revision())?)
-    .bind(encode_lifecycle(task.lifecycle()))
-    .bind(id_text(workspace_id))
-    .bind(id_text(entity_id))
-    .bind(revision_i64(expected_revision)?)
-    .execute(&mut **transaction)
-    .await
-    .map_err(|_| storage_error("task replace failed"))?;
-    require_updated(result.rows_affected(), "task")
 }
 
 async fn insert_source(
@@ -1003,14 +756,6 @@ async fn set_lifecycle(
 ) -> Result<(), ApplicationError> {
     let new_revision = expected_revision.next().map_err(ApplicationError::from)?;
     let query = match table {
-        "note" => {
-            "UPDATE note SET lifecycle = ?, revision = ?, updated_at = CURRENT_TIMESTAMP \
-             WHERE workspace_id = ? AND id = ? AND revision = ?"
-        }
-        "task" => {
-            "UPDATE task SET lifecycle = ?, revision = ?, updated_at = CURRENT_TIMESTAMP \
-             WHERE workspace_id = ? AND id = ? AND revision = ?"
-        }
         "memory_assertion" => {
             "UPDATE memory_assertion SET lifecycle = ?, revision = ?, updated_at = CURRENT_TIMESTAMP \
              WHERE workspace_id = ? AND id = ? AND revision = ?"

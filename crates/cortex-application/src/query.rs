@@ -1,52 +1,9 @@
 use cortex_domain::{
-    AuditEvent, EntityId, MemoryAssertion, Note, OperationId, ResourceTarget, Revision, Source,
-    Task, WorkspaceId,
+    AuditEvent, EntityId, MemoryAssertion, OperationId, ResourceTarget, Revision, Source,
+    WorkspaceId,
 };
 
 use crate::{ApplicationError, Capability, MutationResult};
-
-/// Application-owned persistence port for note aggregates.
-#[allow(async_fn_in_trait)]
-pub trait NoteRepository: Send + Sync {
-    /// Loads only an active note for ordinary query paths.
-    async fn find(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Note>, ApplicationError>;
-
-    /// Explicit history access used by lifecycle commands and future history APIs.
-    async fn find_history(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Note>, ApplicationError>;
-}
-
-/// Application-owned persistence port for task aggregates.
-#[allow(async_fn_in_trait)]
-pub trait TaskRepository: Send + Sync {
-    /// Lists active tasks in a workspace, bounded by the adapter-provided page limit.
-    async fn list_active(
-        &self,
-        workspace_id: WorkspaceId,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<Vec<Task>, ApplicationError>;
-
-    /// Loads only an active task for ordinary query paths.
-    async fn find(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Task>, ApplicationError>;
-
-    /// Explicit history access used by lifecycle commands and future history APIs.
-    async fn find_history(
-        &self,
-        workspace_id: WorkspaceId,
-        entity_id: EntityId,
-    ) -> Result<Option<Task>, ApplicationError>;
-}
 
 /// Application-owned persistence port for memory assertion aggregates.
 #[allow(async_fn_in_trait)]
@@ -127,34 +84,6 @@ pub struct RecordedOperation {
 /// One aggregate change staged for a single atomic mutation transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AggregateChange {
-    InsertNote(Note),
-    ReplaceNote {
-        entity_id: EntityId,
-        expected_revision: Revision,
-        note: Note,
-    },
-    DeleteNote {
-        entity_id: EntityId,
-        expected_revision: Revision,
-    },
-    RestoreNote {
-        entity_id: EntityId,
-        expected_revision: Revision,
-    },
-    InsertTask(Task),
-    ReplaceTask {
-        entity_id: EntityId,
-        expected_revision: Revision,
-        task: Task,
-    },
-    DeleteTask {
-        entity_id: EntityId,
-        expected_revision: Revision,
-    },
-    RestoreTask {
-        entity_id: EntityId,
-        expected_revision: Revision,
-    },
     InsertMemory(MemoryAssertion),
     ReplaceMemory {
         entity_id: EntityId,

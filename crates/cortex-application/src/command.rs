@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use cortex_domain::{
     EntityId, Lifecycle, OperationId, PrincipalId, Revision, SourceRef, WorkspaceId,
 };
@@ -40,34 +39,6 @@ pub struct MutationResult {
     pub revision: Revision,
     pub lifecycle: Lifecycle,
     pub audit_correlation_id: Uuid,
-}
-
-/// Client-safe fields required to create a note in the authenticated workspace.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NoteCreateInput {
-    pub title: String,
-    pub content: String,
-}
-
-/// Replacement note fields; identity and concurrency data are separate command arguments.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NoteUpdateInput {
-    pub title: String,
-    pub content: String,
-}
-
-/// Client-safe fields required to create a task in the authenticated workspace.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskCreateInput {
-    pub title: String,
-    pub due_at: Option<DateTime<Utc>>,
-}
-
-/// Replacement task fields; identity and concurrency data are separate command arguments.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskUpdateInput {
-    pub title: String,
-    pub due_at: Option<DateTime<Utc>>,
 }
 
 /// Client-safe fields required to create a sourced memory assertion.

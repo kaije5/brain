@@ -102,7 +102,7 @@ async fn tool_arguments_cannot_inject_identity_or_authorization() {
     for injection in [
         json!({"query": "x", "workspace_id": "attacker"}),
         json!({"query": "x", "principal_id": "attacker"}),
-        json!({"query": "x", "grants": ["cortex_note_delete"]}),
+        json!({"query": "x", "grants": ["cortex_knowledge_delete"]}),
     ] {
         let rejected = server
             .call_tool_as(&principal, "knowledge.retrieve", injection)

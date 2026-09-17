@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::{
-    DomainError, EntityId, Lifecycle, Revision, SourceRef, WorkspaceId, note::validate_text,
-};
+use crate::text::validate_text;
+use crate::{DomainError, EntityId, Lifecycle, Revision, SourceRef, WorkspaceId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryStatus {

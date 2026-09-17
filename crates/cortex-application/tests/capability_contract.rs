@@ -4,47 +4,7 @@ use cortex_application::{
 use cortex_domain::{EntityId, Lifecycle, Revision};
 use uuid::Uuid;
 
-const EXPECTED_CATALOG: [(Capability, &str, &str, &str, bool, bool); 18] = [
-    (
-        Capability::NoteCreate,
-        "cortex_note_create",
-        "NoteCreateInput",
-        "MutationResult",
-        true,
-        false,
-    ),
-    (
-        Capability::NoteUpdate,
-        "cortex_note_update",
-        "NoteUpdateInput",
-        "MutationResult",
-        true,
-        false,
-    ),
-    (
-        Capability::NoteDelete,
-        "cortex_note_delete",
-        "NoteDeleteInput",
-        "MutationResult",
-        true,
-        true,
-    ),
-    (
-        Capability::NoteRestore,
-        "cortex_note_restore",
-        "NoteRestoreInput",
-        "MutationResult",
-        true,
-        false,
-    ),
-    (
-        Capability::NoteSearch,
-        "cortex_note_search",
-        "NoteSearchRequest",
-        "NoteSearchResultList",
-        false,
-        false,
-    ),
+const EXPECTED_CATALOG: [(Capability, &str, &str, &str, bool, bool); 16] = [
     (
         Capability::TaskCreate,
         "cortex_task_create",
@@ -140,6 +100,30 @@ const EXPECTED_CATALOG: [(Capability, &str, &str, &str, bool, bool); 18] = [
         "KnowledgeSearchResultList",
         false,
         false,
+    ),
+    (
+        Capability::KnowledgeCreate,
+        "cortex_knowledge_create",
+        "KnowledgeCreateInput",
+        "MutationResult",
+        true,
+        false,
+    ),
+    (
+        Capability::KnowledgeUpdate,
+        "cortex_knowledge_update",
+        "KnowledgeUpdateInput",
+        "MutationResult",
+        true,
+        false,
+    ),
+    (
+        Capability::KnowledgeDelete,
+        "cortex_knowledge_delete",
+        "KnowledgeDeleteInput",
+        "MutationResult",
+        true,
+        true,
     ),
     (
         Capability::AgentRun,

@@ -1,6 +1,6 @@
 use cortex_domain::{
-    DomainError, EntityId, Lifecycle, MemoryAssertion, MemoryStatus, Note, Revision, Source,
-    SourceRef, Task, TaskStatus, WorkspaceId,
+    DomainError, EntityId, Lifecycle, MemoryAssertion, MemoryStatus, Revision, Source, SourceRef,
+    WorkspaceId,
 };
 use uuid::Uuid;
 
@@ -35,44 +35,6 @@ fn persisted_revision_rejects_zero() {
             field: "revision",
             ..
         })
-    ));
-}
-
-#[test]
-fn note_rehydration_revalidates_text() {
-    let result = Note::rehydrate(
-        EntityId::new(),
-        WorkspaceId::new(),
-        "persisted title".to_owned(),
-        "  ".to_owned(),
-        Revision::initial(),
-        Lifecycle::Active,
-    );
-
-    assert!(matches!(
-        result,
-        Err(DomainError::Validation {
-            field: "content",
-            ..
-        })
-    ));
-}
-
-#[test]
-fn task_rehydration_revalidates_text() {
-    let result = Task::rehydrate(
-        EntityId::new(),
-        WorkspaceId::new(),
-        String::new(),
-        None,
-        TaskStatus::Open,
-        Revision::initial(),
-        Lifecycle::Active,
-    );
-
-    assert!(matches!(
-        result,
-        Err(DomainError::Validation { field: "title", .. })
     ));
 }
 

@@ -6,8 +6,6 @@ use crate::ApplicationError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntityKind {
-    Note,
-    Task,
     Memory,
     Source,
 }
@@ -16,8 +14,6 @@ impl EntityKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Note => "note",
-            Self::Task => "task",
             Self::Memory => "memory",
             Self::Source => "source",
         }
@@ -26,8 +22,6 @@ impl EntityKind {
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "note" => Some(Self::Note),
-            "task" => Some(Self::Task),
             "memory" => Some(Self::Memory),
             "source" => Some(Self::Source),
             _ => None,

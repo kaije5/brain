@@ -186,7 +186,6 @@ There is no irreversible purge in v0.1.
 The shipped `brain` CLI currently exposes note creation/search, task creation,
 listing/completion, memory creation/search, and diagnostics; it deliberately
 does **not** expose lifecycle delete/restore subcommands. A paired MCP client
-can invoke the separately authorized `cortex_note_delete`/
-`cortex_note_restore`, `cortex_task_delete`/`cortex_task_restore`, and
-`cortex_memory_delete`/`cortex_memory_restore` capabilities with canonical
-entity ID and revision. Do not simulate deletion by editing SQLite directly.
+can invoke the separately authorized `cortex_knowledge_delete`,
+`cortex_task_delete`/`cortex_task_restore`, and `cortex_memory_delete`/
+`cortex_memory_restore` capabilities with canonical resource ID and revision. Do not simulate deletion by editing SQLite directly.

@@ -32,7 +32,7 @@ async fn audit_port_round_trips_only_redacted_evidence_and_is_append_only() -> R
         principal_id,
         operation_id: OperationId::new(),
         correlation_id: Uuid::now_v7(),
-        capability: "cortex_note_search",
+        capability: "cortex_knowledge_search",
         target: None,
         provider_metadata: None,
         policy_decision: PolicyDecision::Allow,
@@ -90,7 +90,7 @@ async fn audit_port_round_trips_provider_targets_and_revision_metadata() -> Resu
         principal_id,
         operation_id: OperationId::new(),
         correlation_id: Uuid::now_v7(),
-        capability: "cortex_note_search",
+        capability: "cortex_knowledge_search",
         target: Some(ResourceTarget::ProviderResource(resource)),
         provider_metadata: Some(ProviderAuditMetadata::new(
             Some(ObservedRevision::new("rev-before").map_err(debug_error)?),
@@ -119,7 +119,7 @@ async fn audit_port_round_trips_provider_targets_and_revision_metadata() -> Resu
         principal_id,
         operation_id: OperationId::new(),
         correlation_id: Uuid::now_v7(),
-        capability: "cortex_note_create",
+        capability: "cortex_knowledge_create",
         target: Some(ResourceTarget::ProviderScope {
             provider_id: ProviderId::new("primary-vault").map_err(debug_error)?,
             workspace_id,
@@ -177,7 +177,7 @@ async fn audit_rows_with_plain_entity_targets_still_decode() -> Result<(), Strin
         principal_id,
         operation_id: OperationId::new(),
         correlation_id: Uuid::now_v7(),
-        capability: "cortex_note_search",
+        capability: "cortex_knowledge_search",
         target: Some(ResourceTarget::CortexEntity(entity_id)),
         provider_metadata: None,
         policy_decision: PolicyDecision::Allow,
@@ -193,7 +193,7 @@ async fn audit_rows_with_plain_entity_targets_still_decode() -> Result<(), Strin
     .bind(Uuid::from(principal_id).to_string())
     .bind(Uuid::from(legacy_event.operation_id).to_string())
     .bind(legacy_event.correlation_id.to_string())
-    .bind("cortex_note_search")
+    .bind("cortex_knowledge_search")
     .bind(Uuid::from(entity_id).to_string())
     .execute(&raw_pool)
     .await

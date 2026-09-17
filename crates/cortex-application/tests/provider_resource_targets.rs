@@ -1,8 +1,8 @@
 mod support;
 
 use cortex_application::{
-    ApplicationError, Capability, CapabilityGrant, CommandContext, GrantPolicy, NoteCreateInput,
-    NoteUpdateInput, PolicyDecision, PolicyPort,
+    ApplicationError, Capability, CapabilityGrant, CommandContext, GrantPolicy, MemoryCreateInput,
+    PolicyDecision, PolicyPort,
 };
 use cortex_domain::{
     AuditResult, OperationId, PolicyDeny, ProviderId, ProviderResourceId, ProviderResourceKind,
@@ -28,7 +28,7 @@ fn grant_policy_denies_provider_targets_outside_the_authenticated_workspace() {
     let policy = GrantPolicy::new([CapabilityGrant::new(
         workspace_id,
         principal_id,
-        Capability::NoteSearch,
+        Capability::MemorySearch,
     )]);
     let context = context(workspace_id, principal_id);
     let provider_id = ProviderId::new("primary-vault").unwrap();
@@ -43,7 +43,7 @@ fn grant_policy_denies_provider_targets_outside_the_authenticated_workspace() {
         GrantPolicy::evaluate(
             &policy,
             &context,
-            Capability::NoteSearch,
+            Capability::MemorySearch,
             Some(&ResourceTarget::ProviderResource(local_resource)),
         ),
         PolicyDecision::Allow
@@ -59,7 +59,7 @@ fn grant_policy_denies_provider_targets_outside_the_authenticated_workspace() {
         GrantPolicy::evaluate(
             &policy,
             &context,
-            Capability::NoteSearch,
+            Capability::MemorySearch,
             Some(&ResourceTarget::ProviderResource(foreign_resource)),
         ),
         PolicyDecision::Deny(PolicyDeny::TargetOutsideWorkspace)
@@ -74,7 +74,7 @@ fn grant_policy_denies_provider_targets_outside_the_authenticated_workspace() {
         GrantPolicy::evaluate(
             &policy,
             &context,
-            Capability::NoteCreate,
+            Capability::MemoryCreate,
             Some(&foreign_scope),
         ),
         PolicyDecision::Deny(PolicyDeny::TargetOutsideWorkspace)
@@ -84,56 +84,58 @@ fn grant_policy_denies_provider_targets_outside_the_authenticated_workspace() {
 #[tokio::test]
 async fn replaying_an_operation_against_a_different_target_conflicts() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
+    let memory_input = MemoryCreateInput {
+        statement: "First".to_owned(),
+        normalized_subject: "subject".to_owned(),
+        normalized_predicate: "predicate".to_owned(),
+        normalized_object: "object".to_owned(),
+        sources: vec![cortex_domain::SourceRef { source_id }],
+    };
     let first = fixture
         .service
-        .create_note(
-            fixture.context(),
-            NoteCreateInput {
-                title: "First".to_owned(),
-                content: "first body".to_owned(),
-            },
-        )
+        .create_memory(fixture.context(), memory_input.clone())
         .await
         .map_err(debug_error)?;
     let second = fixture
         .service
-        .create_note(
-            fixture.context(),
-            NoteCreateInput {
-                title: "Second".to_owned(),
-                content: "second body".to_owned(),
-            },
-        )
+        .create_memory(fixture.context(), memory_input)
         .await
         .map_err(debug_error)?;
 
-    // Record operation `update_operation` against the first note.
+    // Record operation `update_operation` against the first memory.
     let update_operation = OperationId::new();
     fixture
         .service
-        .update_note(
+        .correct_memory(
             fixture.context_for(update_operation),
             first.entity_id,
             first.revision,
-            NoteUpdateInput {
-                title: "First".to_owned(),
-                content: "first body updated".to_owned(),
+            cortex_application::MemoryCorrectInput {
+                statement: "First corrected".to_owned(),
+                normalized_subject: "subject".to_owned(),
+                normalized_predicate: "predicate".to_owned(),
+                normalized_object: "object".to_owned(),
+                sources: vec![cortex_domain::SourceRef { source_id }],
             },
         )
         .await
         .map_err(debug_error)?;
 
     // The same operation ID against a different target must conflict, not
-    // return the recorded result or mutate the second note.
+    // return the recorded result or mutate the second memory.
     let conflicted = fixture
         .service
-        .update_note(
+        .correct_memory(
             fixture.context_for(update_operation),
             second.entity_id,
             second.revision,
-            NoteUpdateInput {
-                title: "Second".to_owned(),
-                content: "second body updated".to_owned(),
+            cortex_application::MemoryCorrectInput {
+                statement: "Second corrected".to_owned(),
+                normalized_subject: "subject".to_owned(),
+                normalized_predicate: "predicate".to_owned(),
+                normalized_object: "object".to_owned(),
+                sources: vec![cortex_domain::SourceRef { source_id }],
             },
         )
         .await;
@@ -150,22 +152,26 @@ async fn replaying_an_operation_against_a_different_target_conflicts() -> Result
 }
 
 #[tokio::test]
-async fn provider_audit_targets_are_recorded_without_content() -> Result<(), String> {
+async fn memory_audit_targets_are_recorded_without_content() -> Result<(), String> {
     let fixture = Fixture::all_mutations();
+    let source_id = fixture.seed_source("seed")?;
     let created = fixture
         .service
-        .create_note(
+        .create_memory(
             fixture.context(),
-            NoteCreateInput {
-                title: "Secret Title".to_owned(),
-                content: "secret body".to_owned(),
+            MemoryCreateInput {
+                statement: "Secret statement".to_owned(),
+                normalized_subject: "subject".to_owned(),
+                normalized_predicate: "predicate".to_owned(),
+                normalized_object: "object".to_owned(),
+                sources: vec![cortex_domain::SourceRef { source_id }],
             },
         )
         .await
         .map_err(debug_error)?;
     let deleted = fixture
         .service
-        .delete_note(fixture.context(), created.entity_id, created.revision)
+        .delete_memory(fixture.context(), created.entity_id, created.revision)
         .await
         .map_err(debug_error)?;
     assert_eq!(deleted.lifecycle, cortex_domain::Lifecycle::Deleted);
@@ -179,7 +185,6 @@ async fn provider_audit_targets_are_recorded_without_content() -> Result<(), Str
     );
     assert_eq!(last.provider_metadata, None);
     let rendered = format!("{audits:?}");
-    assert!(!rendered.contains("Secret Title"));
-    assert!(!rendered.contains("secret body"));
+    assert!(!rendered.contains("Secret statement"));
     Ok(())
 }

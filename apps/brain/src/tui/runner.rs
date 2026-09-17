@@ -313,7 +313,7 @@ fn request_notes(client: &DaemonClient, sender: mpsc::Sender<Effect>, query: Str
     let client = client.clone();
     tokio::spawn(async move {
         let payload = serde_json::json!({"query": query, "limit": 20});
-        let result = send_capability(&client, "cortex_note_search", payload.clone()).await;
+        let result = send_capability(&client, "cortex_knowledge_search", payload.clone()).await;
         let notes = result.map(|values| {
             values
                 .iter()

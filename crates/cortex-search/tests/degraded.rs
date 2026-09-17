@@ -47,7 +47,7 @@ async fn available_embeddings_add_semantic_candidates_and_fuse_ranks() -> Result
     let lexical = candidate("Cortex uses Nemotron as its local AI.");
     let semantic_only = SearchCandidate {
         entity_id: EntityId::new(),
-        kind: EntityKind::Note,
+        kind: EntityKind::Memory,
         snippet: "Nemotron runs locally.".to_owned(),
         sources: Vec::new(),
     };

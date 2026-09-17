@@ -32,19 +32,19 @@ struct NormalizedTool {
 const SUPPORTED: &[NormalizedTool] = &[
     NormalizedTool {
         name: "knowledge.create",
-        capability: Capability::NoteCreate,
+        capability: Capability::KnowledgeCreate,
     },
     NormalizedTool {
         name: "knowledge.update",
-        capability: Capability::NoteUpdate,
+        capability: Capability::KnowledgeUpdate,
     },
     NormalizedTool {
         name: "knowledge.delete",
-        capability: Capability::NoteDelete,
+        capability: Capability::KnowledgeDelete,
     },
     NormalizedTool {
         name: "knowledge.retrieve",
-        capability: Capability::NoteSearch,
+        capability: Capability::KnowledgeRetrieve,
     },
     NormalizedTool {
         name: "task.create",

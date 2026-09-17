@@ -26,15 +26,18 @@ fn granted(
 #[test]
 fn resolver_derives_the_exact_authorized_subset_from_policy() {
     let context = context();
-    let policy = granted(&context, [Capability::NoteSearch, Capability::TaskList]);
+    let policy = granted(
+        &context,
+        [Capability::KnowledgeRetrieve, Capability::TaskList],
+    );
 
     let authorized = AuthorizedCapabilities::resolve(
         &context,
         &policy,
         [
-            Capability::NoteSearch,
+            Capability::KnowledgeRetrieve,
             Capability::TaskList,
-            Capability::NoteDelete,
+            Capability::KnowledgeDelete,
             Capability::MemoryCreate,
         ],
     )
@@ -48,14 +51,14 @@ fn resolver_derives_the_exact_authorized_subset_from_policy() {
         .map(|tool| tool.name)
         .collect();
     assert_eq!(tools.len(), 2);
-    assert!(tools.contains(&"cortex_note_search".to_owned()));
+    assert!(tools.contains(&"cortex_knowledge_search".to_owned()));
     assert!(tools.contains(&"cortex_task_list".to_owned()));
 }
 
 #[test]
 fn unauthorized_capabilities_are_absent_not_merely_rejected_at_selection() {
     let context = context();
-    let policy = granted(&context, [Capability::NoteSearch]);
+    let policy = granted(&context, [Capability::KnowledgeRetrieve]);
 
     let authorized = AuthorizedCapabilities::resolve(
         &context,
@@ -69,7 +72,7 @@ fn unauthorized_capabilities_are_absent_not_merely_rejected_at_selection() {
         .into_iter()
         .map(|tool| tool.name)
         .collect();
-    assert_eq!(tools, vec!["cortex_note_search".to_owned()]);
+    assert_eq!(tools, vec!["cortex_knowledge_search".to_owned()]);
 }
 
 #[test]
@@ -80,7 +83,7 @@ fn all_denied_capability_requests_resolve_to_an_empty_subset() {
     let authorized = AuthorizedCapabilities::resolve(
         &context,
         &policy,
-        [Capability::NoteDelete, Capability::MemoryCreate],
+        [Capability::KnowledgeDelete, Capability::MemoryCreate],
     )
     .expect("an empty authorized subset is a valid degraded turn");
 
@@ -95,7 +98,7 @@ fn provider_content_cannot_expand_the_authorized_capability_set() {
     let context = context();
     let policy = granted(&context, [Capability::TaskList]);
     let injected_candidates = [
-        Capability::NoteDelete,
+        Capability::KnowledgeDelete,
         Capability::MemoryDelete,
         Capability::TaskDelete,
         Capability::TaskList,

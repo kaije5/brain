@@ -25,7 +25,7 @@ async fn forged_remote_manifest_cannot_bootstrap_principal_or_remote_access() {
             "clients": [{
                 "principal_id": Uuid::from(forged_principal),
                 "pairing_verifier": forged_signer.verifying_key().to_bytes(),
-                "bootstrap_grants": ["cortex_note_create"],
+                "bootstrap_grants": ["cortex_knowledge_create"],
                 "subject": "forged-subject"
             }]
         }))
@@ -79,7 +79,7 @@ async fn durable_remote_enrollment_commits_before_artifact_reconciliation_and_re
         correlation_id,
         subject: "recovery-subject".to_owned(),
         principal_id,
-        grants: vec![Capability::NoteCreate],
+        grants: vec![Capability::KnowledgeCreate],
         pairing_verifier: config
             .derived_remote_signing_key(principal_id)
             .verifying_key()
@@ -157,7 +157,7 @@ async fn remote_enrollment_canonicalizes_reordered_duplicate_grants_before_repla
         correlation_id,
         subject: "canonical-grants-subject".to_owned(),
         principal_id,
-        grants: vec![Capability::NoteCreate, Capability::MemorySearch],
+        grants: vec![Capability::KnowledgeCreate, Capability::MemorySearch],
         pairing_verifier: config
             .derived_remote_signing_key(principal_id)
             .verifying_key()
@@ -174,7 +174,7 @@ async fn remote_enrollment_canonicalizes_reordered_duplicate_grants_before_repla
         .enroll_remote_once(RemoteEnrollmentRequest {
             grants: vec![
                 Capability::MemorySearch,
-                Capability::NoteCreate,
+                Capability::KnowledgeCreate,
                 Capability::MemorySearch,
             ],
             ..canonical
@@ -218,7 +218,7 @@ async fn concurrent_remote_enrollment_converges_on_one_canonical_identity_and_au
         correlation_id: first_correlation,
         subject: "concurrent-subject".to_owned(),
         principal_id: first_principal,
-        grants: vec![Capability::NoteCreate],
+        grants: vec![Capability::KnowledgeCreate],
         pairing_verifier: config
             .derived_remote_signing_key(first_principal)
             .verifying_key()
@@ -232,7 +232,7 @@ async fn concurrent_remote_enrollment_converges_on_one_canonical_identity_and_au
         correlation_id: second_correlation,
         subject: "concurrent-subject".to_owned(),
         principal_id: second_principal,
-        grants: vec![Capability::NoteCreate],
+        grants: vec![Capability::KnowledgeCreate],
         pairing_verifier: config
             .derived_remote_signing_key(second_principal)
             .verifying_key()
@@ -286,7 +286,7 @@ async fn remote_enrollment_keeps_identity_grants_and_audit_distinct_across_resta
             correlation_id: Uuid::now_v7(),
             subject: "restart-remote-subject".to_owned(),
             principal_id: remote_id,
-            grants: vec![Capability::NoteCreate],
+            grants: vec![Capability::KnowledgeCreate],
             pairing_verifier: config
                 .derived_remote_signing_key(remote_id)
                 .verifying_key()
@@ -318,7 +318,7 @@ async fn remote_enrollment_keeps_identity_grants_and_audit_distinct_across_resta
             request_id: remote_correlation,
             principal_id: owner_id.into(),
             operation_id: Uuid::now_v7(),
-            capability: "cortex_note_create".to_owned(),
+            capability: "cortex_knowledge_create".to_owned(),
             payload: json!({"title":"remote", "content":"separate actor"}),
         })
         .await
@@ -343,7 +343,7 @@ async fn remote_enrollment_keeps_identity_grants_and_audit_distinct_across_resta
         .revoke_capability(
             daemon.ownership_workspace_id(),
             remote_id,
-            Capability::NoteCreate,
+            Capability::KnowledgeCreate,
         )
         .await
         .expect("revoke remote grant");
@@ -365,7 +365,7 @@ async fn remote_enrollment_keeps_identity_grants_and_audit_distinct_across_resta
             request_id: Uuid::now_v7(),
             principal_id: owner_id.into(),
             operation_id: Uuid::now_v7(),
-            capability: "cortex_note_create".to_owned(),
+            capability: "cortex_knowledge_create".to_owned(),
             payload: json!({"title":"denied", "content":"revocation persists"}),
         })
         .await
@@ -408,7 +408,7 @@ async fn owner_enrolls_a_paired_remote_principal_over_local_ipc_with_only_reques
             capability: "cortex_remote_enroll".to_owned(),
             payload: json!({
                 "subject": "chatgpt-owner-subject",
-                "grants": ["cortex_note_create"]
+                "grants": ["cortex_knowledge_create"]
             }),
         })
         .await
@@ -444,7 +444,7 @@ async fn owner_enrolls_a_paired_remote_principal_over_local_ipc_with_only_reques
             capability: "cortex_remote_enroll".to_owned(),
             payload: json!({
                 "subject": "chatgpt-owner-subject",
-                "grants": ["cortex_note_create"]
+                "grants": ["cortex_knowledge_create"]
             }),
         })
         .await
@@ -494,7 +494,7 @@ async fn owner_enrolls_a_paired_remote_principal_over_local_ipc_with_only_reques
             request_id: Uuid::now_v7(),
             principal_id: Uuid::now_v7(),
             operation_id: Uuid::now_v7(),
-            capability: "cortex_note_create".to_owned(),
+            capability: "cortex_knowledge_create".to_owned(),
             payload: json!({"title":"remote","content":"paired actor"}),
         })
         .await
@@ -527,7 +527,7 @@ async fn owner_enrolls_a_paired_remote_principal_over_local_ipc_with_only_reques
             capability: "cortex_remote_enroll".to_owned(),
             payload: json!({
                 "subject": "attacker-subject",
-                "grants": ["cortex_note_create"]
+                "grants": ["cortex_knowledge_create"]
             }),
         })
         .await
@@ -653,7 +653,7 @@ async fn denied_mutation_returns_a_safe_policy_result_without_dispatching_state_
     let directory = TempDir::new().expect("temporary directory should be available");
     let daemon = LocalDaemon::start(
         DaemonConfig::for_test(directory.path())
-            .with_bootstrap_grants(vec![Capability::NoteSearch]),
+            .with_bootstrap_grants(vec![Capability::KnowledgeRetrieve]),
     )
     .await
     .expect("daemon should start");
@@ -664,7 +664,7 @@ async fn denied_mutation_returns_a_safe_policy_result_without_dispatching_state_
             request_id: Uuid::now_v7(),
             principal_id: Uuid::now_v7(),
             operation_id: Uuid::now_v7(),
-            capability: "cortex_note_create".to_owned(),
+            capability: "cortex_knowledge_create".to_owned(),
             payload: json!({"title": "must not persist", "content": "denied"}),
         })
         .await
@@ -690,7 +690,7 @@ async fn paired_note_create_is_dispatched_through_the_daemon_owned_application_s
             request_id: Uuid::now_v7(),
             principal_id: Uuid::now_v7(),
             operation_id: Uuid::now_v7(),
-            capability: "cortex_note_create".to_owned(),
+            capability: "cortex_knowledge_create".to_owned(),
             payload: json!({"title": "local", "content": "daemon owned"}),
         })
         .await
