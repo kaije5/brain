@@ -4,12 +4,12 @@
 use std::num::NonZeroUsize;
 
 use cortex_domain::{
-    ContentHash, EntityId, ObservedRevision, ProviderId, ProviderResourceId,
-    ProviderResourceKind, ProviderResourceRef, WorkspaceId,
+    ContentHash, EntityId, ObservedRevision, ProviderId, ProviderResourceId, ProviderResourceKind,
+    ProviderResourceRef, WorkspaceId,
 };
 use cortex_search::{
-    ChunkProvenance, ChunkReference, DerivedVaultIndex, FusedLeg, SearchHit,
-    fuse_with_memories, index_document,
+    ChunkProvenance, ChunkReference, DerivedVaultIndex, FusedLeg, SearchHit, fuse_with_memories,
+    index_document,
 };
 
 fn task_resource(workspace_id: WorkspaceId, resource_id: &str) -> ProviderResourceRef {
