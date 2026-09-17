@@ -36,7 +36,7 @@ async fn vault_survives_adversarial_content_rebuild_and_reports_outage_health() 
     // health snapshot reflects the adversarial files written above.
     let created = harness
         .ipc_call(
-            "cortex_note_create",
+            "cortex_knowledge_create",
             serde_json::json!({ "title": "gate probe", "content": "probe body" }),
         )
         .await;
@@ -88,7 +88,7 @@ async fn vault_survives_adversarial_content_rebuild_and_reports_outage_health() 
     std::fs::create_dir_all(&vault_root).expect("recreate vault root");
     let recovered = harness
         .ipc_call(
-            "cortex_note_create",
+            "cortex_knowledge_create",
             serde_json::json!({ "title": "recovery probe", "content": "recovered" }),
         )
         .await;
